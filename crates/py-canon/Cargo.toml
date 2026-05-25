@@ -1,0 +1,29 @@
+[package]
+name = "py-canon"
+version = "0.1.0"
+description = "Python source → CPython ast.dump-shape canonicalization + module-level definition scan (Ruff parser). The Python frontend for find-dup-defs."
+keywords = ["python", "ast", "canonicalize", "parsing", "clone"]
+categories = ["parser-implementations", "development-tools"]
+readme = "README.md"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "py_canon"
+
+[dependencies]
+# Ruff's Python parser + AST + text-size (vendored as `littrs-*`, lib names `ruff_*`): one fast native
+# parser handling modern syntax (PEP 695 / PEP 701).
+littrs-ruff-python-parser = "0.6.2"
+littrs-ruff-python-ast = "0.6.2"
+littrs-ruff-text-size = "0.6.2"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+walkdir = "2" # examples/verify_golden.rs walks a repo to cross-check canonicals vs the golden corpus
+
+[lints]
+workspace = true

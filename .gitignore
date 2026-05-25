@@ -1,0 +1,9 @@
+# Rust build artifacts
+target/
+
+# profiling output
+*.json.gz
+flame.svg
+
+# macOS
+.DS_Store

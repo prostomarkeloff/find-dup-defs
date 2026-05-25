@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/py-canon", "crates/find-dup-defs"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/prostomarkeloff/find-dup-defs"
+authors = ["prostomarkeloff"]
+
+# Strict clippy across the workspace: all + pedantic denied (priority -1 so crate-local `#[allow]`s
+# on the ported hot paths override specific lints).
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+[profile.release]
+debug = "line-tables-only"
+strip = false
