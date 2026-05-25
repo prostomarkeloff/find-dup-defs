@@ -5,7 +5,7 @@
 //! only** (not nested in any function/class), `UPPER_CASE` constants, decorators excluded from
 //! a def's text (the range starts at the `def`/`async`/`class` keyword, like tree-sitter's
 //! `function_definition`). Emits each def's kind / name / location / source text — the shape
-//! `dup_defs/scan.py` wraps into the existing match dicts.
+//! the cross-file grouping step consumes.
 //!
 //! Parses with **ruff** (same parser the canonicalization uses), so modern syntax — PEP 695
 //! `type` aliases / generics, PEP 701 f-strings — is handled; rustpython silently dropped any

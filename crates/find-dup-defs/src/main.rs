@@ -13,11 +13,12 @@
 mod type3;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use py_canon::{analyze_functions, ast_canonical_many, find_module_defs, ModuleDef};
 use rayon::prelude::*;
+use serde::Serialize;
 use walkdir::WalkDir;
 
 #[global_allocator]
@@ -38,12 +39,6 @@ impl Severity {
         match self {
             Severity::Error => "ERROR",
             Severity::Warning => "WARNING",
-        }
-    }
-    fn rank(self) -> u8 {
-        match self {
-            Severity::Error => 0,
-            Severity::Warning => 1,
         }
     }
 }
@@ -69,8 +64,11 @@ struct Cli {
     #[arg(short, long, default_value_t = 0.5)]
     threshold: f64,
     /// Name-gated ERROR floor: a cluster's min pairwise ratio ≥ this gates as ERROR (else WARNING).
-    #[arg(short, long, default_value_t = 0.9)]
+    #[arg(short, long, default_value_t = 0.85)]
     error_threshold: f64,
+    /// Repo root for relative paths in the report (paths under it are shown repo-relative).
+    #[arg(long, default_value = ".")]
+    repo_root: PathBuf,
     /// Type-3 cosine detection floor (candidate edge when cosine > this).
     #[arg(long, default_value_t = 0.7)]
     type3_theta: f64,
@@ -238,7 +236,6 @@ fn main() {
     // global stable order so every pass's member indices are deterministic (RO ratio is arg-order-
     // sensitive, clustering is single-linkage — a fixed order makes results reproducible).
     defs.sort_by(|a, b| (&a.file, a.line, a.col).cmp(&(&b.file, b.line, b.col)));
-    let total_defs = defs.len();
 
     // names-preserved cluster canonical for body kinds (functions + classes) — the name-gated key.
     let body_idx: Vec<usize> = (0..defs.len()).filter(|&i| is_body_kind(&defs[i].kind)).collect();
@@ -264,96 +261,166 @@ fn main() {
     if cli.errors_only {
         findings.retain(|f| f.severity == Severity::Error);
     }
-    // ERROR first, then larger / more-similar / earlier-named clusters
+    // Detection/section order (constants, fn-name-gated, fn-cross-name, fn-Type-3, classes,
+    // type-aliases), then within a section by name and first member — deterministic + reproducible.
     findings.sort_by(|a, b| {
-        a.severity
-            .rank()
-            .cmp(&b.severity.rank())
-            .then(b.members.len().cmp(&a.members.len()))
-            .then(b.min_sim.unwrap_or(0.0).total_cmp(&a.min_sim.unwrap_or(0.0)))
+        section_index(a)
+            .cmp(&section_index(b))
             .then(a.name.cmp(&b.name))
+            .then(a.members[0].cmp(&b.members[0]))
     });
 
-    if cli.json {
-        print_json(&findings);
-        return;
-    }
+    let report = if cli.json {
+        render_json(&findings, &cli.repo_root)
+    } else {
+        format_report(&findings, cli.threshold, cli.error_threshold, &cli.repo_root)
+    };
+    print!("{report}");
 
-    let (mut errs, mut warns) = (0usize, 0usize);
-    for f in &findings {
-        match f.severity {
-            Severity::Error => errs += 1,
-            Severity::Warning => warns += 1,
-        }
-        let tag = match f.pass {
-            "cross-name" => " (cross-name)",
-            "type-3" => " (type-3)",
-            _ => "",
-        };
-        let sim = f.min_sim.map_or_else(String::new, |s| format!(", min similarity {s:.3}"));
-        println!("\n[{}] {} '{}'{} — {} definitions{}:", f.severity.label(), f.kind, f.name, tag, f.members.len(), sim);
-        for (file, line, col) in &f.members {
-            println!("    {}:{}:{}", rel(file), line, col + 1);
-        }
-    }
-    eprintln!(
-        "\nscanned {} files, {} top-level defs → {} clusters ({} ERROR, {} WARNING)",
-        files.len(),
-        total_defs,
-        findings.len(),
-        errs,
-        warns
-    );
-    if errs > 0 {
+    if findings.iter().any(|f| f.severity == Severity::Error) {
         std::process::exit(1);
     }
 }
 
-/// Display `file` relative to the current directory when it's under it (cosmetic).
-fn rel(file: &str) -> &str {
-    thread_local! {
-        static CWD: String = std::env::current_dir().ok().and_then(|d| d.to_str().map(|s| format!("{s}/"))).unwrap_or_default();
+// ───────────────────────── report (identical to the Python reference) ─────────────────────────
+
+/// Report label for a kind — `DupKind.value` in the reference (uppercase, singular).
+fn dup_kind(kind: &str) -> &'static str {
+    match kind {
+        "functions" => "FUNCTION",
+        "classes" => "CLASS",
+        "constants" => "CONSTANT",
+        "type-aliases" => "TYPE_ALIAS",
+        _ => "UNKNOWN",
     }
-    CWD.with(|cwd| if !cwd.is_empty() && file.starts_with(cwd.as_str()) { &file[cwd.len()..] } else { file })
 }
 
-fn json_escape(s: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
+/// A group is "cross-name" when found by a name-agnostic pass (renamed copy-paste).
+fn is_cross_name(pass: &str) -> bool {
+    pass == "cross-name" || pass == "type-3"
+}
+
+/// Printed-section index, matching the reference's section order.
+fn section_index(f: &Finding) -> usize {
+    match (f.kind.as_str(), f.pass) {
+        ("constants", _) => 0,
+        ("functions", "name") => 1,
+        ("functions", "cross-name") => 2,
+        ("functions", "type-3") => 3,
+        ("classes", _) => 4,
+        ("type-aliases", _) => 5,
+        _ => 6,
+    }
+}
+
+/// Best-effort repo-relative path; raw string when not under `repo_root` (mirrors `short_path`).
+fn short_path(file: &str, repo_root: &Path) -> String {
+    let p = std::fs::canonicalize(file).unwrap_or_else(|_| PathBuf::from(file));
+    let root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    p.strip_prefix(&root).map_or_else(|_| file.to_owned(), |rel| rel.to_string_lossy().into_owned())
+}
+
+/// The trailing marker on a `DUPLICATE` line: `[ast sim X.XX]`, `[normalized-exact]`, or none.
+fn group_suffix(f: &Finding) -> String {
+    if is_cross_name(f.pass) && f.min_sim.is_none() {
+        "  [normalized-exact]".to_owned()
+    } else if let Some(s) = f.min_sim {
+        format!("  [ast sim {s:.2}]")
+    } else {
+        String::new()
+    }
+}
+
+/// Human-readable per-section report — byte-for-byte the Python `format_report`.
+fn format_report(findings: &[Finding], warn: f64, error: f64, repo_root: &Path) -> String {
+    let sim = format!("AST sim warn={warn} error={error}");
+    let sections: [(String, usize); 6] = [
+        ("duplicate constants (cross-file, by name)".to_owned(), 0),
+        (format!("duplicate functions (cross-file, {sim})"), 1),
+        ("duplicate functions (cross-name, exact AST-normalized)".to_owned(), 2),
+        ("duplicate functions (cross-name Type-3, IDF-weighted cosine)".to_owned(), 3),
+        (format!("duplicate classes (cross-file, {sim})"), 4),
+        ("duplicate type aliases (cross-file, by name)".to_owned(), 5),
+    ];
+
+    let mut lines: Vec<String> = Vec::new();
+    for (index, (header, sect)) in sections.iter().enumerate() {
+        if index > 0 {
+            lines.push(String::new());
+        }
+        lines.push(format!("--- {header} ---"));
+        for f in findings.iter().filter(|&f| section_index(f) == *sect) {
+            lines.push(format!("DUPLICATE {} [{}]: {}{}", dup_kind(&f.kind), f.severity.label(), f.name, group_suffix(f)));
+            for (file, line, _col) in &f.members {
+                lines.push(format!("  {}:{}", short_path(file, repo_root), line));
             }
-            c => out.push(c),
+            lines.push(String::new());
         }
     }
-    out
+
+    if findings.is_empty() {
+        lines.push("No cross-file duplicates.".to_owned());
+        return lines.join("\n") + "\n";
+    }
+    let errs = findings.iter().filter(|f| f.severity == Severity::Error).count();
+    let warns = findings.len() - errs;
+    lines.push(format!("# summary: {errs} ERROR, {warns} WARNING groups"));
+    lines.join("\n") + "\n"
 }
 
-fn print_json(findings: &[Finding]) {
-    println!("[");
-    for (fi, f) in findings.iter().enumerate() {
-        let members: Vec<String> = f
-            .members
-            .iter()
-            .map(|(file, line, col)| format!("{{\"file\":\"{}\",\"line\":{line},\"col\":{}}}", json_escape(file), col + 1))
-            .collect();
-        let sim = f.min_sim.map_or_else(|| "null".to_owned(), |s| format!("{s:.6}"));
-        let comma = if fi + 1 < findings.len() { "," } else { "" };
-        println!(
-            "  {{\"pass\":\"{}\",\"severity\":\"{}\",\"kind\":\"{}\",\"name\":\"{}\",\"min_sim\":{sim},\"members\":[{}]}}{comma}",
-            f.pass,
-            f.severity.label(),
-            json_escape(&f.kind),
-            json_escape(&f.name),
-            members.join(",")
-        );
+#[derive(Serialize)]
+struct JsonMember {
+    file: String,
+    line: usize,
+}
+
+#[derive(Serialize)]
+struct JsonGroup {
+    kind: String,
+    name: String,
+    severity: String,
+    min_sim: Option<f64>,
+    cross_name: bool,
+    members: Vec<JsonMember>,
+    allowlist_key: String,
+    notes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct JsonReport {
+    groups: Vec<JsonGroup>,
+    summary: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Machine-readable groups + summary — byte-for-byte the Python `render_json` (indent=2).
+fn render_json(findings: &[Finding], repo_root: &Path) -> String {
+    let groups: Vec<JsonGroup> = findings
+        .iter()
+        .map(|f| {
+            let cross = is_cross_name(f.pass);
+            let rule = if cross { "dup-xname".to_owned() } else { format!("dup-{}", dup_kind(&f.kind).to_ascii_lowercase()) };
+            JsonGroup {
+                kind: dup_kind(&f.kind).to_owned(),
+                name: f.name.clone(),
+                severity: f.severity.label().to_owned(),
+                min_sim: f.min_sim,
+                cross_name: cross,
+                members: f.members.iter().map(|(file, line, _)| JsonMember { file: short_path(file, repo_root), line: *line }).collect(),
+                allowlist_key: format!("{rule} {}", f.name),
+                notes: Vec::new(),
+            }
+        })
+        .collect();
+
+    // summary: counts in first-seen severity order (matches the reference dict), then total.
+    let mut summary = serde_json::Map::new();
+    for f in findings {
+        let key = f.severity.label();
+        let n = summary.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0) + 1;
+        summary.insert(key.to_owned(), serde_json::Value::from(n));
     }
-    println!("]");
+    summary.insert("total".to_owned(), serde_json::Value::from(findings.len()));
+
+    let report = JsonReport { groups, summary };
+    serde_json::to_string_pretty(&report).unwrap_or_default() + "\n"
 }

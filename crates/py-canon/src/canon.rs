@@ -5,8 +5,8 @@
 //! ruff AST: same node names, same ASDL field order, same `show_empty=False` rule (trailing
 //! `None`/`[]` dropped; an emptied field before a present one switches the rest to `name=` keyword
 //! form), and Python `repr` for literals. Reproducing that exact shape is what keeps the downstream
-//! difflib ratios (clustering) and the alpha-renamed equality (cross-name) aligned with the PRM2
-//! reference — a terser form drifts the ratios. Two passes, both off one `Collect` of bound locals:
+//! difflib ratios (clustering) and the alpha-renamed equality (cross-name) aligned with CPython's
+//! `ast` — a terser form drifts the ratios. Two passes, both off one `Collect` of bound locals:
 //! clustering keeps identifiers, cross-name alpha-renames them (`_v{n}`) and blanks the def name.
 #![allow(clippy::doc_markdown)]
 
@@ -1107,7 +1107,7 @@ fn is_docstring(stmt: &Stmt) -> bool {
 // ---------------------------------------------------------------------------
 // Unparse — CPython 3.14 `ast.unparse` (`_ast_unparse.Unparser`) reproduced over the ruff AST.
 // Used ONLY to produce the Type-3 (ECScan) `lines` (= `ast.unparse(normalized_fn).splitlines()`
-// stripped), so the IDF/cosine matches the PRM2 reference exactly. Precedence is threaded as a
+// stripped), so the IDF/cosine matches the CPython `ast` reference exactly. Precedence is threaded as a
 // `ctx` argument (each node is visited once after its parent sets its precedence), reproducing
 // CPython's `set_precedence`/`require_parens` parenthesisation. Indentation is omitted (lines are
 // stripped anyway); newlines fall only at statement/clause boundaries.
@@ -2267,7 +2267,7 @@ fn normalize_one(text: &str) -> Option<(String, Vec<String>, usize)> {
     let size = dump.count;
 
     // Type-3 shingle units: `ast.unparse(normalized_fn).splitlines()` stripped — reproduced exactly
-    // (CPython 3.14 unparse) so the ECScan IDF/cosine matches the PRM2 reference bit-for-bit. The
+    // (CPython 3.14 unparse) so the ECScan IDF/cosine matches the CPython `ast` reference bit-for-bit. The
     // rename map from the dump pass is reused so the `_v{n}` numbering is identical to the canonical.
     let lines = unparse_lines(stmt, text, &locals, dump.map);
     Some((canonical, lines, size))

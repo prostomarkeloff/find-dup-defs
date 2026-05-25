@@ -1,6 +1,6 @@
 [package]
 name = "find-dup-defs"
-version = "0.1.0"
+version = "0.2.0"
 description = "Find duplicate / near-duplicate top-level definitions across a codebase via clone clustering (Python frontend today)."
 keywords = ["duplicate", "clone", "python", "lint", "ast"]
 categories = ["command-line-utilities", "development-tools"]
@@ -25,6 +25,10 @@ rustc-hash = "2" # FxHash for the Type-3 (ECScan) pass's hot token/shingle maps
 walkdir = "2"
 clap = { version = "4", features = ["derive"] }
 mimalloc = { version = "0.1", default-features = false }
+# JSON report. preserve_order → object keys keep insertion order (matches the Python reference's
+# dict order); serde's struct-field order + ryu floats reproduce its output byte-for-byte.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [lints]
 workspace = true

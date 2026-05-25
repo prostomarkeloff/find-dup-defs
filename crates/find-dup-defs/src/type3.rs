@@ -1,54 +1,59 @@
-//! Native compute core for the dup-defs **Type-3** (ECScan) pass — the O(n²) part that hung in
-//! Python. Given each function's name-agnostic normalized lines (produced Python-side by
-//! `normalize.normalized_lines`), this does the whole numeric pipeline natively:
-//!   IDF over line tokens → per-function line-weight vectors → rare-shingle candidate generation →
-//!   IDF-weighted cosine verify → union-find → exact min-cosine per cluster.
-//! It mirrors `type3.py` bit-for-bit (token regex, IDF, sorted-shared dot, insertion-order norm) so
-//! `min_sim` — which drives ERROR/WARNING severity — is identical. The cross-file *policy* (≥2 distinct
-//! names AND files, severity, `DupGroup` building) stays in Python; this returns raw clusters.
+//! **Type-3** (ECScan) cross-name near-copy detection — the O(n²) numeric core.
+//!
+//! Given each function's name-agnostic normalized lines (from `py-canon`) plus its name, this runs the
+//! whole pipeline: IDF over line tokens → per-function line-weight vectors → rare-shingle candidate
+//! generation → IDF-weighted cosine verify → union-find → exact min-cosine per cluster. It reproduces
+//! the Python reference bit-for-bit — same token regex, IDF, sorted-shared dot, insertion-order norm,
+//! and Neumaier-compensated summation — so `min_sim` (which drives ERROR/WARNING severity) is
+//! identical. The cross-file policy (≥2 distinct names AND files) is applied by the caller.
 //!
 //! Perf shape (all results-invariant — clusters + `min_sim` are bit-identical regardless): the setup
-//! (seqs interning, `line_weight`, `FnVec` build) is rayon-parallel; the internal maps use `FxHash`
-//! not SipHash; each `FnVec` is a sorted `Vec` not a per-function `HashMap`; the whole `_native` crate
-//! runs on mimalloc. Profile it with `src/bin/t3prof.rs` + `benchmarks/samply_selftime.py`.
+//! (line interning, `line_weight`, `FnVec` build) is rayon-parallel; the internal maps use `FxHash`
+//! not SipHash; each `FnVec` is a sorted `Vec` not a per-function `HashMap`; the crate runs on mimalloc.
 #![allow(clippy::doc_markdown)]
 
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Tokenize one line like Python's `re.compile(r"[A-Za-z_]\w*|\d+|\S")`: at each position take an
-/// identifier (`[A-Za-z_][A-Za-z0-9_]*`), else a run of digits, else a single non-whitespace char;
-/// whitespace is skipped. Left-to-right, non-overlapping — same matches `findall` yields.
+/// Tokenize one line like Python's `re.compile(r"[A-Za-z_]\w*|\d+|\S")` — Unicode-aware, matching
+/// `findall`. An identifier starts on an ASCII `[A-Za-z_]` then greedily takes Python's `\w`
+/// (Unicode word chars: `is_alphanumeric` or `_` — so an ASCII letter followed by Cyrillic/accented
+/// letters in a string literal, e.g. `nВключи`, stays ONE token, exactly as Python's `\w*` does); a
+/// run of ASCII digits is `\d+`; any other non-whitespace code point is a single `\S`; whitespace
+/// (Unicode `\s`) is skipped. Left-to-right, non-overlapping.
 fn tokenize(line: &str) -> Vec<&str> {
-    let bytes = line.as_bytes();
     let mut out = Vec::new();
-    let mut i = 0;
-    let n = bytes.len();
-    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    while i < n {
-        let b = bytes[i];
-        if b.is_ascii_alphabetic() || b == b'_' {
-            let start = i;
-            i += 1;
-            while i < n && is_word(bytes[i]) {
-                i += 1;
+    let mut it = line.char_indices().peekable();
+    while let Some(&(start, c)) = it.peek() {
+        if c.is_ascii_alphabetic() || c == '_' {
+            it.next();
+            let mut end = start + c.len_utf8();
+            while let Some(&(i, cc)) = it.peek() {
+                if cc.is_alphanumeric() || cc == '_' {
+                    end = i + cc.len_utf8();
+                    it.next();
+                } else {
+                    break;
+                }
             }
-            out.push(&line[start..i]);
-        } else if b.is_ascii_digit() {
-            let start = i;
-            i += 1;
-            while i < n && bytes[i].is_ascii_digit() {
-                i += 1;
+            out.push(&line[start..end]);
+        } else if c.is_ascii_digit() {
+            it.next();
+            let mut end = start + 1;
+            while let Some(&(i, cc)) = it.peek() {
+                if cc.is_ascii_digit() {
+                    end = i + 1;
+                    it.next();
+                } else {
+                    break;
+                }
             }
-            out.push(&line[start..i]);
-        } else if b.is_ascii_whitespace() {
-            i += 1;
+            out.push(&line[start..end]);
+        } else if c.is_whitespace() {
+            it.next();
         } else {
-            // a single non-whitespace, non-word char. Advance by one UTF-8 char so multi-byte
-            // (non-ASCII) symbols are taken whole, matching `\S` (one code point).
-            let ch_len = line[i..].chars().next().map_or(1, char::len_utf8);
-            out.push(&line[i..i + ch_len]);
-            i += ch_len;
+            it.next();
+            out.push(&line[start..start + c.len_utf8()]);
         }
     }
     out
@@ -66,6 +71,25 @@ struct FnVec {
     norm: f64,
 }
 
+/// Kahan–Babuška–**Neumaier** compensated summation — exactly what CPython's `sum()` does for floats
+/// since 3.12. The Python reference sums every float total (line weights, dot, norm) with `sum()`, so
+/// the score is only bit-identical if we compensate the same way; naive left-to-right summation drifts
+/// by ~1 ULP and can flip a cluster across the ERROR/WARNING line.
+fn neumaier_sum(values: impl Iterator<Item = f64>) -> f64 {
+    let mut sum = 0.0f64;
+    let mut c = 0.0f64;
+    for v in values {
+        let t = sum + v;
+        if sum.abs() >= v.abs() {
+            c += (sum - t) + v;
+        } else {
+            c += (v - t) + sum;
+        }
+        sum = t;
+    }
+    sum + c
+}
+
 /// `a == f"a{b}"` or `b == f"a{a}"` — the sync/async naming twin convention (owned by another pass).
 fn is_sync_async(a: &str, b: &str) -> bool {
     (a.len() == b.len() + 1 && a.as_bytes().first() == Some(&b'a') && &a[1..] == b)
@@ -73,30 +97,39 @@ fn is_sync_async(a: &str, b: &str) -> bool {
 }
 
 /// IDF-weighted cosine over two functions' line vectors. Dot is summed over **sorted** shared keys
-/// and each norm over **insertion order** — exactly as `type3.py` does, so the score is reproducible
-/// and bit-identical (it can otherwise flip a cluster across the ERROR/WARNING threshold).
+/// and each norm over **insertion order**, both with Neumaier compensation — exactly as the Python
+/// reference does, so the score is reproducible and bit-identical (it can otherwise flip a cluster
+/// across the ERROR/WARNING threshold).
 fn cosine(a: &FnVec, b: &FnVec) -> f64 {
     if a.norm == 0.0 || b.norm == 0.0 {
         return 0.0;
     }
-    // Dot over shared line ids, summed in ascending-id order — same deterministic float accumulation
-    // as the reference's sorted-shared-keys sum, now via a linear merge of the two sorted vectors.
+    // Dot over shared line ids, summed in ascending-id (= line-text, since ids are assigned in
+    // lexicographic order) order with Neumaier compensation — same keys, same order, same algorithm as
+    // the reference's `sum(a[k]*b[k] for k in sorted(shared))`, so the dot is bit-identical.
     let (mut i, mut j) = (0usize, 0usize);
-    let mut dot = 0.0;
+    let (mut sum, mut comp) = (0.0f64, 0.0f64);
     while i < a.sorted.len() && j < b.sorted.len() {
-        let (ka, va) = a.sorted[i];
-        let (kb, vb) = b.sorted[j];
+        let (ka, wa) = a.sorted[i];
+        let (kb, wb) = b.sorted[j];
         match ka.cmp(&kb) {
             std::cmp::Ordering::Less => i += 1,
             std::cmp::Ordering::Greater => j += 1,
             std::cmp::Ordering::Equal => {
-                dot += va * vb;
+                let prod = wa * wb;
+                let next = sum + prod;
+                if sum.abs() >= prod.abs() {
+                    comp += (sum - next) + prod;
+                } else {
+                    comp += (prod - next) + sum;
+                }
+                sum = next;
                 i += 1;
                 j += 1;
             }
         }
     }
-    dot / (a.norm * b.norm)
+    (sum + comp) / (a.norm * b.norm)
 }
 
 /// Union-find over edge endpoints → connected components (mirrors `type3._cluster`).
@@ -150,21 +183,25 @@ pub fn type3_clusters(
     if n < 2 {
         return Vec::new();
     }
-    // Intern distinct lines → ids. Phase 1 (serial): assign each distinct line a stable id in
-    // first-occurrence order — HashMap inserts only, no per-function allocation, same order as before
-    // so ids are bit-identical. Phase 2 (parallel): build each function's id sequence by lookup. The
-    // 15k per-function `Vec<u32>` allocations are independent, so rayon spreads them over the idle
-    // workers (the profile showed this serial map was ~all on one thread).
-    let mut line_id: FxHashMap<&str, u32> = FxHashMap::default();
-    let mut id_text: Vec<&str> = Vec::new();
-    for lines in line_lists {
-        for line in lines {
-            line_id.entry(line.as_str()).or_insert_with(|| {
-                id_text.push(line.as_str());
-                (id_text.len() - 1) as u32
-            });
+    // Intern distinct lines → ids, assigned in **lexicographic (byte) order of the line text**. For
+    // valid UTF-8 byte order == code-point order == Python's `sorted()`, so when the cosine later sums
+    // the dot by ascending id it sums over shared keys in the exact order Python's `sorted(shared)`
+    // does — making the (order-sensitive) float dot bit-identical. (The norm is summed earlier, in
+    // first-occurrence order, so it is unaffected by this id ordering.)
+    let mut id_text: Vec<&str> = {
+        let mut seen: FxHashSet<&str> = FxHashSet::default();
+        let mut distinct: Vec<&str> = Vec::new();
+        for lines in line_lists {
+            for line in lines {
+                if seen.insert(line.as_str()) {
+                    distinct.push(line.as_str());
+                }
+            }
         }
-    }
+        distinct
+    };
+    id_text.sort_unstable();
+    let line_id: FxHashMap<&str, u32> = id_text.iter().enumerate().map(|(i, &t)| (t, i as u32)).collect();
     // `with_min_len`: each rayon job takes a run of functions, not one — the per-item work (a few
     // HashMap lookups) is tiny, so without this the join/work-steal coordination dwarfs it.
     let seqs: Vec<Vec<u32>> = line_lists
@@ -201,7 +238,7 @@ pub fn type3_clusters(
     let line_weight: Vec<f64> = id_text
         .par_iter()
         .with_min_len(256)
-        .map(|&t| tokenize(t).iter().map(|tok| idf.get(tok).copied().unwrap_or(0.0)).sum())
+        .map(|&t| neumaier_sum(tokenize(t).iter().map(|tok| idf.get(tok).copied().unwrap_or(0.0))))
         .collect();
 
     // Per-function vector: distinct lines in first-occurrence order with weight accumulated by
@@ -225,8 +262,9 @@ pub fn type3_clusters(
                 }
             }
             // norm sums in first-occurrence order — `sorted` is still insertion-ordered here, so this
-            // matches Python's `sum(v*v for v in dict.values())` bit-for-bit; THEN sort for the merge.
-            let norm = sorted.iter().map(|&(_, p)| p * p).sum::<f64>().sqrt();
+            // matches Python's `sqrt(sum(v*v for v in dict.values()))` bit-for-bit (Neumaier); THEN
+            // sort for the merge.
+            let norm = neumaier_sum(sorted.iter().map(|&(_, p)| p * p)).sqrt();
             sorted.sort_unstable_by_key(|&(id, _)| id);
             FnVec { sorted, norm }
         })

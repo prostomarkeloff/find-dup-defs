@@ -25,19 +25,27 @@ edited copies.
 ```console
 $ find-dup-defs mypy --kinds functions
 
-[ERROR] functions 'is_generic/is_generic_instance' (cross-name) — 2 definitions:
-    mypy/stats.py:475:1
-    mypy/types_utils.py:120:1
+--- duplicate functions (cross-file, AST sim warn=0.5 error=0.85) ---
+DUPLICATE FUNCTION [WARNING]: visit_overloaded  [ast sim 0.71]
+  mypy/server/astdiff.py:312
+  mypy/server/astmerge.py:402
 
-[WARNING] functions '_profile_type_check/perform_type_check' (type-3) — 2 definitions, min similarity 0.829:
-    misc/log_trace_check.py:26:1
-    misc/profile_check.py:48:1
+--- duplicate functions (cross-name, exact AST-normalized) ---
+DUPLICATE FUNCTION [ERROR]: is_generic/is_generic_instance  [normalized-exact]
+  mypy/stats.py:475
+  mypy/types_utils.py:120
 
-scanned 437 files, 2201 top-level defs → 46 clusters (13 ERROR, 33 WARNING)
+--- duplicate functions (cross-name Type-3, IDF-weighted cosine) ---
+DUPLICATE FUNCTION [WARNING]: _profile_type_check/perform_type_check  [ast sim 0.83]
+  misc/log_trace_check.py:26
+  misc/profile_check.py:48
+
+# summary: 1 ERROR, 2 WARNING groups
 ```
 
-`(cross-name)` = renamed-identical · `(type-3)` = renamed near-copy · no tag = same-name body cluster.
-Exit code is non-zero when any **ERROR** cluster is found — drop it straight into CI.
+One section per detector. `[normalized-exact]` = byte-identical after renaming locals; `[ast sim X.XX]`
+= the cluster's minimum pairwise similarity. Exit code is non-zero when any **ERROR** cluster is found —
+drop it straight into CI.
 
 ---
 
