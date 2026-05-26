@@ -9,9 +9,13 @@
 [![crates.io](https://img.shields.io/crates/v/find-dup-defs.svg)](https://crates.io/crates/find-dup-defs)
 [![exact difflib](https://img.shields.io/badge/similarity-byte--for--byte%20difflib-blue.svg)](https://crates.io/crates/difflib-fast)
 
-Duplicate & near-duplicate definitions — functions, **methods**, classes, constants, `type` aliases —
-clustered by structural AST canonicalization, ranked by a normalized **Thickness** score, graded
-ERROR / WARNING / INFO, with **auto-suggested project-specific noise filters** out of the box.
+Duplicate & near-duplicate definitions — functions, **methods**, classes, constants, `type` aliases,
+**TypeScript interfaces** — clustered by structural AST canonicalization, ranked by a normalized
+**Thickness** score, graded ERROR / WARNING / INFO, with **auto-suggested project-specific noise
+filters** out of the box.
+
+**Python and TypeScript today** — `--only py,ts` to scope per language. One engine, two
+single-parse native frontends (Ruff for Python, oxc for TypeScript).
 
 **2-12× faster than PMD CPD / jscpd. Calibrates itself on first run.**
 
@@ -98,7 +102,9 @@ cargo install find-dup-defs
 
 ## The three detection passes
 
-Every `.py` file is parsed **once** (Ruff parser, PEP 695 / 701 ready), each callable yielded as top-level functions **and class methods** (`Foo.bar`, `Foo.Inner.baz`):
+Every `.py` / `.ts` / `.tsx` / `.mts` / `.cts` file is parsed **once** (Ruff for Python — PEP 695 /
+701 ready; oxc for TypeScript — TS 5.x, JSX/TSX, decorators), each callable yielded as top-level
+functions **and class methods** (`Foo.bar`, `Foo.Inner.baz`):
 
 1. **name-gated** — same-`(kind, name)` defs clustered by exact Ratcliff–Obershelp similarity on the `ast.dump`-shape canonical.
 2. **cross-name** — renamed copy-paste: alpha-renamed canonical bucketed, ≥2 distinct names across ≥2 sites.
@@ -188,12 +194,27 @@ The `--calibrate` step pattern-matches across findings and surfaces ready-to-pas
 | Pattern | Suggestion |
 |---|---|
 | ≥5 CONSTANT clusters where ≥80% members are in `*/locale*` | `suppress:CONSTANT:*@*locale*` |
-| ≥10 clusters where all members live in test paths | `de-escalate:*:*@*tests/*` |
+| ≥3 clusters where all members live in test paths | `de-escalate:*:*@*/{test,tests,__tests__,test_cases,test-cases,__fixtures__,fixtures,integration,e2e}/*` |
+| ≥3 clusters where all members are `.test.*` / `.spec.*` (jest/vitest/mocha) | `de-escalate:*:*@*.{test,spec}.*` |
+| ≥5 clusters where all members are i18n / translation files | `suppress:*:*@*/{locale,locales,i18n,translations}/*` |
 | ≥3 clusters touching `*_pb2*` / `*_grpc*` files | `suppress:*:*@*_pb2*` |
 | ≥3 clusters all under `*/migrations/*` / `*/alembic/versions/*` | `suppress:*:*@*migrations/*` |
-| ≥5 clusters all under `*/docs_src/*` / `*/examples/*` / `*/tutorial/*` | `de-escalate:*:*@*docs_src/*` |
+| ≥5 clusters all under `*/docs_src/*` / `*/examples/*` / `*/tutorial/*` | `de-escalate:*:*@*/{docs_src,examples,tutorial,samples}/*` |
+| ≥5 clusters all in `.d.ts` declaration files | `suppress:*:*@*.d.ts` |
+| ≥5 clusters all in `*.stories.*` Storybook files | `de-escalate:*:*@*.stories.*` |
+| ≥30 clusters with same-name files across a vendored marker dir (`/util/vs/`, `/fixtures/`, `/vendor/`, `/third_party/`) and a parallel source root | `suppress:*:*@*<vendored-prefix>*` (per-snapshot, auto-derived) |
 
-Verified on real benchmark: **69% noise reduction** across 14 repositories ≥150K Python SLOC each.
+Directive globs support `{a,b,c}` brace alternation so one paste covers every convention of a
+family (`*/{test,tests,__tests__}/*` is one directive, not three).
+
+The vendored-pattern detector is **gated by a marker score** on the longer path — without a
+recognized vendored marker (test/fixtures/vendor/util/vs), same-name files across different
+dirs are treated as architectural duplication (real refactor candidates) rather than auto-
+suppressed. Prevents over-suppression of legitimate cross-layer reuse patterns (e.g. FSD's
+`pages/foo` ↔ `shared/foo`).
+
+Verified on real benchmarks: **67% noise reduction** across 28 large Python repos and
+**~94% average reduction** across 10 production TypeScript repos (≈6M SLOC total).
 
 ---
 
@@ -218,6 +239,29 @@ On `django` (426K SLOC, 2 910 files):
 - jscpd: ~44K SLOC/sec
 
 ---
+
+## Real benchmark — 10 production TypeScript repos
+
+Across vscode, the TypeScript compiler itself, vue, angular, svelte, nest, astro, prisma, next.js,
+excalidraw (≈6M SLOC total), `--calibrate` + auto-inferred directives + balanced thickness cut
+raw ERROR count by **94% on average**:
+
+| Repo               | LOC   | Raw ERROR | After auto-directives | %cut | Top remaining cluster |
+|--------------------|------:|----------:|----------------------:|-----:|-----------------------|
+| microsoft/vscode   | 3.1M  | 5428      | 174                   | **97%** | `registerCLIChatCommands` 771 LOC (copilotCLIChatSessions ↔ copilotCLIChatSessionsContribution) |
+| microsoft/TypeScript | 265k| 1840      | 9                     | **100%** | `NavigationBarItem` interface (protocol.ts ↔ services/types.ts) |
+| vercel/next.js     | 756k  | 489       | 26                    | **95%** | `defaultLoader` 115 LOC (legacy/image.tsx ↔ shared/lib/image-loader.ts) |
+| nestjs/nest        | 112k  | 172       | 10                    | **94%** | `callOperator` × 5 lifecycle hooks |
+| withastro/astro    | 223k  | 135       | 9                     | **93%** | `getFrontmatterLanguagePlugin` 50 LOC (language-server ↔ ts-plugin) |
+| angular/angular    | 1.0M  | 627       | 54                    | **91%** | `templateBase/conditionalCreate/conditionalBranchCreate` cross-name |
+| prisma/prisma      | 222k  | 322       | 68                    | **79%** | `fieldToColumnType` 95 LOC × 3 (adapter-neon / -pg / -ppg) |
+| vuejs/core         | 151k  | 8         | 1                     | **88%** | (clean codebase) |
+| excalidraw         | 170k  | 23        | 5                     | **78%** | `intersectDiamondWithLineSegment/intersectRectanguloidWithLineSegment` |
+| sveltejs/svelte    | 17k   | 3         | 0                     | **100%** | (clean) |
+
+Top remaining clusters on these corpora are textbook PR candidates — the tool is finding the
+architectural duplication a human reviewer would also flag, with the noise (vendored snapshots,
+test fixtures, declaration files, Storybook stories) automatically removed.
 
 ## Real benchmark — 28 large Python repos
 
@@ -293,6 +337,25 @@ DUPLICATE METHOD [ERROR]: For{Async,,Native}Iterable.begin_body
 # summary: 14 ERROR, 47 WARNING groups
 ```
 
+…or on TypeScript:
+
+```console
+$ find-dup-defs ./packages --only ts
+--- duplicate functions (cross-file, AST sim warn=0.5 error=0.85) ---
+DUPLICATE FUNCTION [ERROR]: formatDateTime
+  [ast sim 1.00, T=0.85, n=5, loc=18, args=1]
+  packages/adapter-mariadb/src/conversion.ts:180
+  packages/adapter-mssql/src/conversion.ts:174
+  packages/adapter-neon/src/conversion.ts:433
+  packages/adapter-pg/src/conversion.ts:446
+  packages/adapter-planetscale/src/conversion.ts:155
+
+--- duplicate methods (cross-name, exact AST-normalized) ---
+DUPLICATE FUNCTION [ERROR]: apply{ActivityBar,Explorer,Keybindings,Localization,Profiler,StatusBar}Tools
+  [normalized-exact, T=0.93, n=6, loc=117, args=2]
+  ...
+```
+
 ---
 
 ## CLI reference (essentials)
@@ -300,6 +363,11 @@ DUPLICATE METHOD [ERROR]: For{Async,,Native}Iterable.begin_body
 ```
 USAGE:
   find-dup-defs [OPTIONS] <PATHS>...
+
+LANGUAGES:
+  --only <CODES>             Restrict scan to specific frontends (comma-separated:
+                             py,ts). Default: every supported frontend found in PATHS.
+                             Unknown codes exit non-zero.
 
 THICKNESS LADDER:
   --error-thickness <F>      Demote ERROR → WARNING if T < this (default 0.0 = off)
@@ -312,8 +380,9 @@ SIMILARITY (name-gated):
   --type3-theta <F>          Type-3 cosine threshold (default 0.7)
 
 FILTERS:
-  -D, --directive <S>        ACTION:[KIND:]NAME[@PATH][=NOTE], repeatable
-  --kinds <K1,K2,...>        functions,methods,classes,constants,type-aliases
+  -D, --directive <S>        ACTION:[KIND:]NAME[@PATH][=NOTE], repeatable.
+                             PATH glob supports `{a,b,c}` brace alternation.
+  --kinds <K1,K2,...>        functions,methods,classes,interfaces,constants,type-aliases
   --min-size <N>             Only clusters with ≥ N members (default 2)
   --errors-only              Filter output to ERROR severity
   --show-info                Include INFO in human report (default hidden)
@@ -332,23 +401,27 @@ OUTPUT:
 
 ## Architecture
 
-Two crates, each useful on its own:
+Four crates, each useful on its own:
 
 | crate | role |
 |---|---|
 | [`find-dup-defs`](crates/find-dup-defs) | CLI — three passes, severity, directives, calibration, reports |
+| [`dup-defs-core`](crates/dup-defs-core) | **Shared types** — `ModuleDef` / `AnalyzedFn` / `LineMap` / `Language`. Both frontends emit these; the engine dispatches by `Language` tag. |
 | [`py-canon`](crates/py-canon) | **Python frontend** — Ruff parse → `ast.dump`-shape canonical + def scan |
+| [`ts-canon`](crates/ts-canon) | **TypeScript frontend** — oxc parse → s-expr canonical + def scan |
 
-The name is **language-agnostic on purpose**: Python is the current frontend; other languages can be added later as further frontend crates feeding the same CLI. The similarity engine is the exact Ratcliff–Obershelp port [`difflib-fast`](https://github.com/prostomarkeloff/difflib-fast).
+Adding a new language is one more frontend crate that implements the `find_module_defs` /
+`ast_canonical_many` / `analyze_functions` triplet against `dup-defs-core` types. The similarity
+engine is the exact Ratcliff–Obershelp port [`difflib-fast`](https://github.com/prostomarkeloff/difflib-fast).
 
 ---
 
 ## Limitations
 
-- **Python only** today (frontend crate per language; PRs welcome)
+- **Python + TypeScript** today (frontend crate per language; PRs welcome — Rust / Go / Java would each be a `<lang>-canon` sibling)
 - **Type 4 (semantic equivalence, different syntax → same logic)** — not done; neural-network research territory
 - **Token-level fine-grained duplication** (a 30-token sub-expression copy-pasted around) — out of scope; use jscpd / PMD CPD alongside if you need that
-- **Calibration is heuristic** — formula constants (loc=20, args=5, weight 0.7/0.1/0.2) were tuned on the 28-repo benchmark; your codebase may want different
+- **Calibration is heuristic** — formula constants (loc=20, args=5, weight 0.7/0.1/0.2) were tuned on the 28-Python-repo + 10-TS-repo benchmarks; your codebase may want different
 
 ---
 
