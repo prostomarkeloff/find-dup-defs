@@ -258,7 +258,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "find-dup-defs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "difflib-fast",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "py-canon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "littrs-ruff-python-ast",
  "littrs-ruff-python-parser",

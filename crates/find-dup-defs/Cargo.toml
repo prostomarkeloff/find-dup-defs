@@ -1,6 +1,6 @@
 [package]
 name = "find-dup-defs"
-version = "0.2.0"
+version = "0.3.0"
 description = "Find duplicate / near-duplicate top-level definitions across a codebase via clone clustering (Python frontend today)."
 keywords = ["duplicate", "clone", "python", "lint", "ast"]
 categories = ["command-line-utilities", "development-tools"]
@@ -17,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 # the Python frontend (parse + canonicalize + def scan). path for local dev, version so it resolves
 # from crates.io when published.
-py-canon = { path = "../py-canon", version = "0.1" }
+py-canon = { path = "../py-canon", version = "0.2" }
 # exact difflib Ratcliff–Obershelp ratio + clustering (https://crates.io/crates/difflib-fast)
 difflib-fast = "0.1"
 rayon = "1"
