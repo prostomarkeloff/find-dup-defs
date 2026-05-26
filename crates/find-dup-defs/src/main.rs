@@ -13,6 +13,7 @@
 mod type3;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -102,6 +103,7 @@ struct Finding {
 ///   didn't compare bodies, so the duplicate is unverified).
 ///
 /// Architecture stays extensible: add another dimension + characteristic constant when needed.
+#[allow(clippy::cast_precision_loss)] // loc/args/n_members are always small (line/parameter/cluster sizes).
 fn thickness(loc: usize, args: usize, n_members: usize, sim: f64) -> f64 {
     let volume = (loc as f64) * (n_members.saturating_sub(1) as f64);
     let volume_score = 1.0 - (-volume / 30.0).exp();
@@ -567,7 +569,7 @@ fn pass_type3(defs: &[ModuleDef], fn_idx: &[usize], analyses: &[Option<py_canon:
         .collect()
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn main() {
     let cli = Cli::parse();
     let files = collect_py_files(&cli.paths);
@@ -730,6 +732,11 @@ fn main() {
 /// Linear-interpolated percentile on a value list, *sorted ascending*. `p` in `[0, 1]`. Returns
 /// `0.0` on empty input — the format/JSON paths handle the "no errors to calibrate" case by
 /// reading the list length, so the value here just needs to be a stable sentinel.
+#[allow(
+    clippy::cast_precision_loss, // cluster counts fit in f64 mantissa
+    clippy::cast_possible_truncation, // floor/ceil already discrete and bounded by sorted.len()
+    clippy::cast_sign_loss, // p ∈ [0, 1] and len ≥ 0 → rank is non-negative
+)]
 fn percentile_sorted(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -824,12 +831,12 @@ struct InferredDirective {
 /// thickness never *exceeds* 1, but we collapse the boundary to make the upper-edge bucket
 /// non-empty for huge defs).
 fn thickness_histogram(values: &[f64]) -> Vec<CalibHistBin> {
-    let bins = 10;
-    let step = 1.0 / bins as f64;
+    let bins: i32 = 10;
+    let step = 1.0 / f64::from(bins);
     (0..bins)
         .map(|i| {
-            let lo = i as f64 * step;
-            let hi = (i + 1) as f64 * step;
+            let lo = f64::from(i) * step;
+            let hi = f64::from(i + 1) * step;
             let count = values.iter().filter(|&&v| v >= lo && (v < hi || (i == bins - 1 && v >= hi))).count();
             CalibHistBin { thickness_lo: lo, thickness_hi: hi, count }
         })
@@ -851,7 +858,7 @@ fn calibration_suggestions(errs: &[&Finding], repo_root: &Path) -> Vec<CalibSugg
     [("permissive", 50u8), ("balanced", 75), ("strict", 90)]
         .into_iter()
         .map(|(label, p)| {
-            let t = percentile_sorted(&ts, p as f64 / 100.0);
+            let t = percentile_sorted(&ts, f64::from(p) / 100.0);
             let kept: Vec<&&Finding> = errs.iter().filter(|f| f.thickness >= t).collect();
             let mut locs: Vec<usize> = kept.iter().map(|f| f.loc).collect();
             let mut args: Vec<usize> = kept.iter().map(|f| f.args).collect();
@@ -945,7 +952,7 @@ fn snippet_box(snippet: &str, max_lines: usize) -> String {
         out.push('\n');
     }
     if extra > 0 {
-        out.push_str(&format!("    │ … (+{extra} more lines)\n"));
+        let _ = writeln!(out, "    │ … (+{extra} more lines)");
     }
     out.push_str("    └──");
     out
@@ -1025,9 +1032,12 @@ fn infer_directives(findings: &[Finding]) -> Vec<InferredDirective> {
                 // Majority-in-locale heuristic — Django-style codebases have one canonical
                 // declaration in `global_settings.py` plus the per-locale overrides; requiring
                 // ALL members in locale paths would miss exactly that legit case.
-                let n = f.members.len() as f64;
-                let in_locale = f.members.iter().filter(|(p, _, _)| path_is_i18n(p)).count() as f64;
-                in_locale / n >= 0.8
+                #[allow(clippy::cast_precision_loss)] // member counts always small
+                {
+                    let n = f.members.len() as f64;
+                    let in_locale = f.members.iter().filter(|(p, _, _)| path_is_i18n(p)).count() as f64;
+                    in_locale / n >= 0.8
+                }
             }
         },
         5,
@@ -1101,7 +1111,7 @@ fn fmt_member_locations(members: &[String], max: usize) -> String {
     let mut s = parts.join(", ");
     let extra = members.len() - take;
     if extra > 0 {
-        s.push_str(&format!(" (+{extra} more)"));
+        let _ = write!(s, " (+{extra} more)");
     }
     s
 }
@@ -1137,44 +1147,47 @@ fn format_calibration_tier(
     repo_root: &Path,
 ) {
     if findings.is_empty() {
-        out.push_str(&format!(
-            "=== thickness calibration ({tier_label}): 0 clusters — skip.\n\n"
-        ));
+        let _ = writeln!(out, "=== thickness calibration ({tier_label}): 0 clusters — skip.\n");
         return;
     }
-    out.push_str(&format!(
-        "=== thickness calibration ({tier_label}): {} clusters analyzed ===\n\n",
+    let _ = writeln!(
+        out,
+        "=== thickness calibration ({tier_label}): {} clusters analyzed ===\n",
         findings.len()
-    ));
+    );
     let hist = thickness_histogram(&findings.iter().map(|f| f.thickness).collect::<Vec<_>>());
     let max_count = hist.iter().map(|b| b.count).max().unwrap_or(1).max(1);
     let bar_max = 30usize;
-    out.push_str(&format!("distribution (each ▇ ≈ one {tier_label} cluster, scaled to fit):\n"));
+    let _ = writeln!(out, "distribution (each ▇ ≈ one {tier_label} cluster, scaled to fit):");
     for b in &hist {
         let bar_len = (b.count * bar_max).div_ceil(max_count);
         let bar = "▇".repeat(bar_len);
-        out.push_str(&format!(
-            "  T [{:.1}, {:.1})  {bar} {}\n",
+        let _ = writeln!(
+            out,
+            "  T [{:.1}, {:.1})  {bar} {}",
             b.thickness_lo, b.thickness_hi, b.count
-        ));
+        );
     }
     out.push('\n');
-    out.push_str(&format!(
-        "suggested thresholds (p50/p75/p90 of current {tier_label} thickness distribution):\n"
-    ));
+    let _ = writeln!(
+        out,
+        "suggested thresholds (p50/p75/p90 of current {tier_label} thickness distribution):"
+    );
     for s in calibration_suggestions(findings, repo_root) {
         out.push('\n');
-        out.push_str(&format!(
-            "  {:<11}  --{target_flag} {:.2}  → {} {tier_label} remain  (median dup: {} loc, {} args)\n",
+        let _ = writeln!(
+            out,
+            "  {:<11}  --{target_flag} {:.2}  → {} {tier_label} remain  (median dup: {} loc, {} args)",
             s.label, s.error_thickness, s.errors_kept, s.median_loc, s.median_args
-        ));
-        out.push_str(&format!(
-            "    e.g. {}  [T={:.2}, loc={}, args={}]\n",
+        );
+        let _ = writeln!(
+            out,
+            "    e.g. {}  [T={:.2}, loc={}, args={}]",
             s.example_name, s.example_thickness, s.example_loc, s.example_args
-        ));
+        );
         let locs = fmt_member_locations(&s.example_members, 3);
         if !locs.is_empty() {
-            out.push_str(&format!("         {}\n", locs));
+            let _ = writeln!(out, "         {locs}");
         }
         out.push_str(&snippet_box(&s.example_snippet, 15));
         out.push('\n');
@@ -1194,12 +1207,13 @@ fn format_calibration(errs: &[&Finding], warns: &[&Finding], all: &[Finding], re
     if !inferred.is_empty() {
         out.push_str("=== inferred directives (auto-detected noise patterns) ===\n\n");
         for d in &inferred {
-            out.push_str(&format!("  → -D '{}'\n", d.directive));
-            out.push_str(&format!("    rationale: {}\n", d.rationale));
-            out.push_str(&format!(
-                "    affects: {} total ({} ERROR, {} WARNING, {} INFO)\n",
+            let _ = writeln!(out, "  → -D '{}'", d.directive);
+            let _ = writeln!(out, "    rationale: {}", d.rationale);
+            let _ = writeln!(
+                out,
+                "    affects: {} total ({} ERROR, {} WARNING, {} INFO)",
                 d.affects_total, d.affects_error, d.affects_warning, d.affects_info
-            ));
+            );
             out.push('\n');
         }
         out.push_str("(Paste any of these into your CI invocation — patterns matched repeatably,\n");
