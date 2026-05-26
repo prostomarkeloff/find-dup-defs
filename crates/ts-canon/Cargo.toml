@@ -1,0 +1,32 @@
+[package]
+name = "ts-canon"
+version = "0.1.0"
+description = "TypeScript source → structural canonicalization + module-level definition scan (oxc parser). The TypeScript frontend for find-dup-defs."
+keywords = ["typescript", "ast", "canonicalize", "parsing", "clone"]
+categories = ["parser-implementations", "development-tools"]
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "ts_canon"
+
+[dependencies]
+# Shared types (ModuleDef, AnalyzedFn, Language, LineMap) — same shapes as py-canon emits so the
+# engine treats both languages uniformly and only dispatches canonicalization by Language tag.
+dup-defs-core = { path = "../dup-defs-core", version = "0.1" }
+# oxc: pure-Rust TS/JS parser + AST. Same architectural role for TypeScript that ruff plays for
+# Python in `py-canon` — single-parse native frontend, modern syntax support (TS 5.x, JSX/TSX,
+# decorators), arena-allocated AST. Versions pinned to a tested set; bumping in lockstep is OK
+# but cross-version mismatches (e.g. parser 0.50 + ast 0.51) break at link time.
+oxc_allocator = "0.133"
+oxc_ast = "0.133"
+oxc_parser = "0.133"
+oxc_span = "0.133"
+oxc_syntax = "0.133"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+
+[lints]
+workspace = true

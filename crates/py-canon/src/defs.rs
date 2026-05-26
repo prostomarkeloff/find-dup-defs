@@ -21,40 +21,10 @@
 
 use std::fs;
 
+use dup_defs_core::{Language, LineMap, ModuleDef};
 use rayon::prelude::*;
 use ruff_python_ast::{Expr, Parameters, Stmt};
 use ruff_python_parser::parse_module;
-
-use crate::loc::LineMap;
-
-/// One module-level definition found by the scan (kind = `functions` / `classes` /
-/// `constants` / `type-aliases` / `methods`; `line`/`col` 0-indexed to match the prior ast-grep
-/// range). `loc` and `args` are "how fat is this" signals surfaced in the dup-defs report so a
-/// user reading a flat list of clusters can immediately tell a 50-line copy-paste from a
-/// 3-liner. `loc` is the count of non-blank lines in the def's original source text (including
-/// the signature line); `args` is the parameter count for functions/methods (including `self`
-/// or `cls` — the count the user actually typed) and `0` for non-callable kinds. For methods,
-/// `loc` reflects the original source, NOT the post-strip text — the user is looking up code
-/// they wrote, not the synthetic form we canonicalize against.
-///
-/// `text` is the canonicalization-input form (post-`self`/`cls`-strip for methods); `text_orig`
-/// is what the user actually wrote and is used for snippet display (calibration view, etc).
-/// For every kind other than `methods` the two are identical clones.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct ModuleDef {
-    pub kind: String,
-    pub name: String,
-    pub file: String,
-    pub line: usize,
-    pub col: usize,
-    pub text: String,
-    #[serde(default)]
-    pub text_orig: String,
-    #[serde(default)]
-    pub loc: usize,
-    #[serde(default)]
-    pub args: usize,
-}
 
 /// Non-blank line count of a def's source text — the simplest "how big" metric the report can
 /// surface. Blank/whitespace-only lines (including the line after a multi-line signature) are
@@ -323,6 +293,7 @@ fn class_method_defs(source: &str, stmt: &Stmt, lines: &LineMap, file: &str, par
                     text_orig,
                     loc,
                     args,
+                    lang: Language::Python,
                 });
             }
             Stmt::ClassDef(_) => {
@@ -360,6 +331,7 @@ fn module_defs_from(source: &str, file: &str) -> Vec<ModuleDef> {
             text_orig,
             loc,
             args,
+            lang: Language::Python,
         });
     }
     defs

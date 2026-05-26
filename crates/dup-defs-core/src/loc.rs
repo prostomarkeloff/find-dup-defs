@@ -1,9 +1,8 @@
-//! Byte-offset → line/column mapping. Ruff's parser (unlike rustpython's) ships no bundled
-//! `SourceCode`, so both the dup-defs scan (`defs.rs`) and the symbol graph (`symbols.rs`)
-//! resolve a node's `TextRange` to a human location through this small precomputed index.
+//! Byte-offset → line/column mapping. Used by every frontend (ruff's parser ships no bundled
+//! `SourceCode`, oxc exposes byte spans the same way), so it lives here in the shared core.
 //!
 //! Columns are counted in **characters** (Unicode scalar values), 1-indexed in `loc1` — the
-//! convention rustpython's `SourceLocation` used, so the symbol-space output is unchanged.
+//! convention rustpython's `SourceLocation` used, preserved for backward compatibility.
 
 /// Precomputed line-start offsets for one source string (`starts[i]` = byte offset of line `i`).
 pub struct LineMap<'a> {
@@ -39,7 +38,7 @@ impl<'a> LineMap<'a> {
         (line + 1, col + 1)
     }
 
-    /// 0-indexed `(line, column)` — the ast-grep-parity convention `ModuleDef` reports.
+    /// 0-indexed `(line, column)` — the convention [`crate::ModuleDef`] reports.
     #[must_use]
     pub fn loc0(&self, offset: usize) -> (usize, usize) {
         let line = self.line_index(offset);

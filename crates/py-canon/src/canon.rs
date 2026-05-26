@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
+use dup_defs_core::AnalyzedFn;
 use rayon::prelude::*;
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{
@@ -2279,15 +2280,6 @@ fn normalize_one(text: &str) -> Option<(String, Vec<String>, usize)> {
 pub fn normalize_functions(texts: &[String]) -> Vec<Option<(String, Vec<String>, usize)>> {
     texts.par_iter().map(|text| normalize_one(text)).collect()
 }
-
-/// Everything the dup-defs passes need from one function in a SINGLE parse:
-/// `(cluster_canonical, xname_canonical, lines, size)`, or `None` if not a function def.
-/// `cluster_canonical` (names preserved) feeds the name-gated clustering; `xname_canonical`
-/// (alpha-renamed) + `lines` + `size` feed the cross-name / Type-3 passes. Folding the two former
-/// separate native calls (`ast_canonical_many` + `normalize_functions`) into one removes a redundant
-/// parse of every function.
-/// `(cluster_canonical, xname_canonical, lines, size)` — the full dup-defs analysis of one function.
-pub type AnalyzedFn = (String, String, Vec<String>, usize);
 
 /// Full dup-defs analysis of one function FROM AN AST NODE (no re-parse): `(cluster_canonical,
 /// xname_canonical, lines, size)`, or `None` if `stmt` is not a function def. `src` is the source the

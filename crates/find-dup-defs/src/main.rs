@@ -16,8 +16,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use dup_defs_core::AnalyzedFn;
+
 use clap::Parser;
-use py_canon::{analyze_functions, ast_canonical_many, find_module_defs, ModuleDef};
+use dup_defs_core::{Language, ModuleDef};
 use rayon::prelude::*;
 use serde::Serialize;
 use walkdir::WalkDir;
@@ -156,9 +158,19 @@ struct Cli {
     /// Only report clusters with at least this many definitions.
     #[arg(long, default_value_t = 2)]
     min_size: usize,
-    /// Restrict to these kinds (comma-separated: functions,methods,classes,constants,type-aliases).
+    /// Restrict to these kinds (comma-separated:
+    /// functions,methods,classes,interfaces,constants,type-aliases).
     #[arg(long, value_delimiter = ',')]
     kinds: Option<Vec<String>>,
+    /// Restrict the scan to specific language frontends (comma-separated). Default: every
+    /// supported language found in the target paths. Known codes:
+    ///   `py` — Python via `py-canon` (Ruff parser)
+    ///   `ts` — TypeScript via `ts-canon` (oxc parser)
+    /// Unknown codes exit non-zero. Useful in mixed-language repos where you only care about
+    /// one frontend per CI job (`--only py`, `--only ts`), or when a frontend's parser is
+    /// crashing on bad input and you need to scan around it.
+    #[arg(long, value_delimiter = ',')]
+    only: Option<Vec<String>>,
     /// Skip the cross-name (renamed-identical) pass.
     #[arg(long)]
     no_cross_name: bool,
@@ -313,10 +325,20 @@ fn parse_directive(spec: &str) -> Result<Directive, String> {
     })
 }
 
-/// Minimal glob matcher — `*` (any run), `?` (single char). Recursive-backtracking; cheap for
-/// the short patterns directives carry. No character classes / brace expansion — keep CLI
-/// grammar tiny; users wanting heavier matching can add a second directive.
+/// Minimal glob matcher — `*` (any run), `?` (single char), `{a,b,…}` (alternation, single
+/// level). Recursive-backtracking; cheap for the short patterns directives carry. Alternation
+/// lets one directive cover multiple test-tree conventions (`*/{test,tests,__tests__}/*`) in
+/// one paste, instead of asking the user to chain three `-D` flags.
 fn glob_match(pat: &str, s: &str) -> bool {
+    for expanded in expand_braces(pat) {
+        if glob_match_simple(&expanded, s) {
+            return true;
+        }
+    }
+    false
+}
+
+fn glob_match_simple(pat: &str, s: &str) -> bool {
     fn go(p: &[u8], pi: usize, t: &[u8], ti: usize) -> bool {
         if pi == p.len() {
             return ti == t.len();
@@ -342,31 +364,126 @@ fn glob_match(pat: &str, s: &str) -> bool {
     go(pat.as_bytes(), 0, s.as_bytes(), 0)
 }
 
-/// Directory-name blacklist for `.py` discovery — virtualenvs, package caches, build artefacts
-/// and vendored tooling that's never project source. Matches what `ruff` / `pyright` skip by
-/// default; the goal is "what `cloc`-style tools count as the project" not "every byte on disk".
-/// `.egg-info` matched by suffix, not in the set.
+/// Expand one level of `{a,b,c}` brace alternation, recursively. `{test,tests}` ⇒ two
+/// patterns. Empty alternatives are legal (`{,s}` ⇒ both empty and `s`). Nesting beyond one
+/// `{...}` is supported via recursion — leftmost group is expanded first, the rest of the
+/// pattern is re-expanded on the result. Unmatched / empty braces fall through as literals so a
+/// pattern with no alternation is one-call cheap.
+#[cfg(test)]
+mod glob_tests {
+    use super::{expand_braces, glob_match, vendored_score};
+
+    #[test]
+    fn vendored_score_marks_known_snapshot_paths() {
+        // Strong markers — pair should produce a vendored directive.
+        assert!(vendored_score("extensions/copilot/src/util/vs/base/common") > 0);
+        assert!(vendored_score("extensions/copilot/test/simulation/fixtures/codeMapper") > 0);
+        assert!(vendored_score("packages/third_party/upstream-snapshot") > 0);
+        // No markers — generic project paths, architectural-drift candidates, not vendored.
+        assert_eq!(vendored_score("src/pages/dashboard/analytics/audience/components/tags-table"), 0);
+        assert_eq!(vendored_score("src/shared/ui/lists/tags-table"), 0);
+        assert_eq!(vendored_score("src/features/admin-channel-add/model"), 0);
+        assert_eq!(vendored_score("src/components/Button"), 0);
+    }
+
+
+    #[test]
+    fn brace_expansion_covers_all_test_dir_conventions() {
+        let pat = "*/{test,tests,__tests__}/*";
+        let expanded = expand_braces(pat);
+        assert_eq!(expanded.len(), 3);
+        assert!(expanded.contains(&"*/test/*".to_owned()));
+        assert!(expanded.contains(&"*/tests/*".to_owned()));
+        assert!(expanded.contains(&"*/__tests__/*".to_owned()));
+    }
+
+    #[test]
+    fn glob_match_handles_alternation_in_path() {
+        let pat = "*/{test,tests,__tests__}/*";
+        // `/test/` (singular) — angular convention
+        assert!(glob_match(pat, "packages/compiler-cli/test/compliance/foo.ts"));
+        // `/tests/` (plural) — svelte / standard pytest
+        assert!(glob_match(pat, "packages/svelte/tests/css/test.ts"));
+        // `/__tests__/` — jest / RTL
+        assert!(glob_match(pat, "packages/next/src/__tests__/foo.test.ts"));
+        // Non-test path should NOT match
+        assert!(!glob_match(pat, "src/components/Button.ts"));
+    }
+
+    #[test]
+    fn glob_match_file_extension_alternation() {
+        let pat = "*.{test,spec}.*";
+        assert!(glob_match(pat, "src/foo.test.ts"));
+        assert!(glob_match(pat, "src/foo.spec.ts"));
+        assert!(glob_match(pat, "packages/next/src/server/foo.external.test.ts"));
+        assert!(!glob_match(pat, "src/foo.ts"));
+    }
+
+    #[test]
+    fn empty_alternation_branch_is_legal() {
+        let pat = "*/{,s}post*";
+        let expanded = expand_braces(pat);
+        assert!(expanded.contains(&"*/post*".to_owned()));
+        assert!(expanded.contains(&"*/spost*".to_owned()));
+    }
+
+    #[test]
+    fn no_braces_is_one_pattern() {
+        assert_eq!(expand_braces("*tests/*"), vec!["*tests/*".to_owned()]);
+    }
+}
+
+fn expand_braces(pat: &str) -> Vec<String> {
+    let bytes = pat.as_bytes();
+    let Some(open) = bytes.iter().position(|&b| b == b'{') else {
+        return vec![pat.to_owned()];
+    };
+    let Some(close_rel) = bytes[open + 1..].iter().position(|&b| b == b'}') else {
+        return vec![pat.to_owned()];
+    };
+    let close = open + 1 + close_rel;
+    let prefix = &pat[..open];
+    let alts = &pat[open + 1..close];
+    let suffix = &pat[close + 1..];
+    let mut out = Vec::new();
+    for alt in alts.split(',') {
+        let combined = format!("{prefix}{alt}{suffix}");
+        out.extend(expand_braces(&combined));
+    }
+    out
+}
+
+/// Directory-name blacklist for `.py`/`.ts` discovery — virtualenvs, package caches, build
+/// artefacts, vendored tooling, JS bundler outputs. Matches what `ruff` / `pyright` / `tsc`
+/// skip by default; the goal is "what `cloc`-style tools count as the project" not "every byte
+/// on disk". `.egg-info` matched by suffix, not in the set.
 const SKIP_DIRS: &[&str] = &[
+    // Python ecosystem
     ".venv", "venv", "venv2", "venv3", "env", ".env",
-    "__pycache__", "node_modules", ".git",
-    "build", "dist", ".tox", ".pytest_cache", ".mypy_cache",
-    ".ruff_cache", ".ipynb_checkpoints", "site-packages",
-    "target", ".idea", ".vscode", ".direnv",
+    "__pycache__", ".tox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".ipynb_checkpoints", "site-packages",
+    // JS / TS ecosystem
+    "node_modules", "dist", "out", "build",
+    ".next", ".nuxt", ".turbo", ".cache", "coverage",
+    // Editors / VCS / package caches / Rust target
+    ".git", "target", ".idea", ".vscode", ".direnv",
 ];
 
 fn is_excluded_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name) || name.ends_with(".egg-info")
 }
 
-fn collect_py_files(paths: &[PathBuf]) -> Vec<String> {
+/// Walk `paths` and return every matching source file (extensions chosen by the caller via
+/// `matches`). One pass per language so the per-language driver gets exactly the files it parses,
+/// no cross-language wildcards in the file list.
+fn collect_files(paths: &[PathBuf], matches: impl Fn(&Path) -> bool) -> Vec<String> {
     let mut files: BTreeSet<String> = BTreeSet::new();
     for p in paths {
         if p.is_dir() {
             // `filter_entry` prunes excluded directories from the walk (vs filtering each
-            // file after-the-fact) — a `venv/` with thousands of vendored `.py` files takes
-            // milliseconds to skip this way instead of seconds to walk and discard.
+            // file after-the-fact) — a `node_modules` / `venv/` with thousands of vendored
+            // files takes milliseconds to skip this way instead of seconds to walk and discard.
             let walker = WalkDir::new(p).into_iter().filter_entry(|e| {
-                // Always keep the root entry, otherwise drop directories named like venvs/etc.
                 if e.depth() == 0 {
                     return true;
                 }
@@ -377,19 +494,56 @@ fn collect_py_files(paths: &[PathBuf]) -> Vec<String> {
             });
             for entry in walker.filter_map(Result::ok) {
                 let path = entry.path();
-                if path.extension().is_some_and(|e| e == "py") {
+                if matches(path) {
                     files.insert(path.to_string_lossy().into_owned());
                 }
             }
-        } else if p.extension().is_some_and(|e| e == "py") {
+        } else if matches(p) {
             files.insert(p.to_string_lossy().into_owned());
         }
     }
     files.into_iter().collect()
 }
 
+fn collect_py_files(paths: &[PathBuf]) -> Vec<String> {
+    collect_files(paths, |p| p.extension().is_some_and(|e| e == "py"))
+}
+
+/// TypeScript file collector — surfaces `.ts` / `.tsx` / `.mts` / `.cts`. `.d.ts` files are
+/// included (they parse cleanly as TS) and auto-suppressed via an inferred directive
+/// (`suppress:*:*@*.d.ts`) so the user can override if they want to inspect type-declaration
+/// duplication; the default policy treats them as expected-by-design clones.
+fn collect_ts_files(paths: &[PathBuf]) -> Vec<String> {
+    collect_files(paths, |p| {
+        p.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e, "ts" | "tsx" | "mts" | "cts"))
+    })
+}
+
 fn is_body_kind(kind: &str) -> bool {
-    matches!(kind, "functions" | "classes" | "methods")
+    matches!(kind, "functions" | "classes" | "methods" | "interfaces")
+}
+
+/// Per-language dispatch for the names-preserved cluster canonical. The engine treats every
+/// frontend uniformly via [`Language`] tag; one match drives the canonicalization to the right
+/// implementation per-definition (rayon-parallel via the call site in [`main`]).
+fn cluster_canonical_for(def: &ModuleDef) -> String {
+    match def.lang {
+        Language::Python => py_canon::ast_canonical(&def.text),
+        Language::TypeScript => ts_canon::ast_canonical(&def.text),
+    }
+}
+
+/// Per-language dispatch for the full callable analysis (cluster canonical + xname canonical +
+/// Type-3 lines + node count). Returns `None` if the text doesn't parse as a callable in its
+/// language — same fallback shape both frontends use.
+fn analyze_for(def: &ModuleDef) -> Option<AnalyzedFn> {
+    let texts = [def.text.clone()];
+    match def.lang {
+        Language::Python => py_canon::analyze_functions(&texts).into_iter().next().flatten(),
+        Language::TypeScript => ts_canon::analyze_functions(&texts).into_iter().next().flatten(),
+    }
 }
 
 /// Function-like kinds: drive cross-name and Type-3 passes (both treat any callable body the
@@ -484,7 +638,7 @@ fn pass_name_gated(defs: &[ModuleDef], canon_of: &[Option<String>], threshold: f
 
 /// Pass 2 — cross-name: functions with identical alpha-renamed canonicals but ≥2 distinct names
 /// across ≥2 files (renamed copy-paste the name-gated pass cannot see).
-fn pass_cross_name(defs: &[ModuleDef], fn_idx: &[usize], analyses: &[Option<py_canon::AnalyzedFn>], min_size: usize) -> Vec<Finding> {
+fn pass_cross_name(defs: &[ModuleDef], fn_idx: &[usize], analyses: &[Option<AnalyzedFn>], min_size: usize) -> Vec<Finding> {
     let mut buckets: BTreeMap<&str, Vec<usize>> = BTreeMap::new(); // xname canonical → fn-local positions
     for (p, a) in analyses.iter().enumerate() {
         if let Some((_, xname, _, _)) = a {
@@ -526,7 +680,7 @@ fn pass_cross_name(defs: &[ModuleDef], fn_idx: &[usize], analyses: &[Option<py_c
 
 /// Pass 3 — Type-3 (ECScan): renamed near-copy functions via IDF-weighted cosine over name-agnostic
 /// lines; ≥2 distinct names across ≥2 files.
-fn pass_type3(defs: &[ModuleDef], fn_idx: &[usize], analyses: &[Option<py_canon::AnalyzedFn>], theta: f64) -> Vec<Finding> {
+fn pass_type3(defs: &[ModuleDef], fn_idx: &[usize], analyses: &[Option<AnalyzedFn>], theta: f64) -> Vec<Finding> {
     let (mut line_lists, mut names, mut def_of) = (Vec::new(), Vec::new(), Vec::new());
     for (p, a) in analyses.iter().enumerate() {
         if let Some((_, _, lines, _)) = a {
@@ -572,8 +726,32 @@ fn pass_type3(defs: &[ModuleDef], fn_idx: &[usize], analyses: &[Option<py_canon:
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn main() {
     let cli = Cli::parse();
-    let files = collect_py_files(&cli.paths);
-    let mut defs = find_module_defs(&files);
+    // `--only` validation + scan-flag derivation. Unknown codes are an error (exit 2) rather
+    // than a silent no-op — a typo'd `--only py,rs` should fail loud so a CI job that meant to
+    // include Rust doesn't ship an empty report.
+    const KNOWN_LANGS: &[&str] = &["py", "ts"];
+    let (scan_py, scan_ts) = match &cli.only {
+        None => (true, true),
+        Some(codes) => {
+            for code in codes {
+                if !KNOWN_LANGS.contains(&code.as_str()) {
+                    eprintln!(
+                        "find-dup-defs: unknown language code {code:?} for --only (known: {})",
+                        KNOWN_LANGS.join(", ")
+                    );
+                    std::process::exit(2);
+                }
+            }
+            (codes.iter().any(|s| s == "py"), codes.iter().any(|s| s == "ts"))
+        }
+    };
+    // One file walk per language — both contribute to the same `defs` list. Cross-language
+    // dispatch from here on is by [`Language`] tag stamped during extraction; the engine never
+    // re-derives a language from a path again.
+    let py_files = if scan_py { collect_py_files(&cli.paths) } else { Vec::new() };
+    let ts_files = if scan_ts { collect_ts_files(&cli.paths) } else { Vec::new() };
+    let mut defs = py_canon::find_module_defs(&py_files);
+    defs.extend(ts_canon::find_module_defs(&ts_files));
     if let Some(kinds) = &cli.kinds {
         defs.retain(|d| kinds.iter().any(|k| k == &d.kind));
     }
@@ -581,10 +759,11 @@ fn main() {
     // sensitive, clustering is single-linkage — a fixed order makes results reproducible).
     defs.sort_by(|a, b| (&a.file, a.line, a.col).cmp(&(&b.file, b.line, b.col)));
 
-    // names-preserved cluster canonical for body kinds (functions + classes) — the name-gated key.
+    // names-preserved cluster canonical for body kinds (functions + classes + interfaces) — the
+    // name-gated key. Dispatched per-definition by language so a `.py` file canonicalizes via
+    // ruff and a `.ts` file via oxc, but both produce strings the same difflib similarity ranks.
     let body_idx: Vec<usize> = (0..defs.len()).filter(|&i| is_body_kind(&defs[i].kind)).collect();
-    let body_texts: Vec<String> = body_idx.iter().map(|&i| defs[i].text.clone()).collect();
-    let body_canon = ast_canonical_many(&body_texts);
+    let body_canon: Vec<String> = body_idx.par_iter().map(|&i| cluster_canonical_for(&defs[i])).collect();
     let mut canon_of: Vec<Option<String>> = vec![None; defs.len()];
     for (k, &i) in body_idx.iter().enumerate() {
         canon_of[i] = Some(body_canon[k].clone());
@@ -594,8 +773,7 @@ fn main() {
     // callable body — both top-level functions and class methods, since a method copy-pasted as
     // a free function (or vice versa) is still a duplicate worth flagging.
     let fn_idx: Vec<usize> = (0..defs.len()).filter(|&i| is_fn_like(&defs[i].kind)).collect();
-    let fn_texts: Vec<String> = fn_idx.iter().map(|&i| defs[i].text.clone()).collect();
-    let analyses = analyze_functions(&fn_texts);
+    let analyses: Vec<Option<AnalyzedFn>> = fn_idx.par_iter().map(|&i| analyze_for(&defs[i])).collect();
 
     let mut findings = pass_name_gated(&defs, &canon_of, cli.threshold, cli.error_threshold, cli.min_size);
     if !cli.no_cross_name {
@@ -966,21 +1144,62 @@ fn path_is_i18n(p: &str) -> bool {
 }
 fn path_is_test(p: &str) -> bool {
     let lo = p.to_ascii_lowercase();
-    if lo.contains("/tests/") || lo.contains("/test/") {
+    // Directory markers seen in the wild across languages: pytest's `tests/`, Go-style
+    // `test/`, jest/RTL's `__tests__/`, angular compliance harness `test_cases/`, framework
+    // doc fixtures `__fixtures__/` / `fixtures/`. Any of these in the path makes the file a
+    // test-tree resident.
+    if lo.contains("/tests/")
+        || lo.contains("/test/")
+        || lo.contains("/__tests__/")
+        || lo.contains("/test_cases/")
+        || lo.contains("/test-cases/")
+        || lo.contains("/__fixtures__/")
+        || lo.contains("/fixtures/")
+        || lo.contains("/integration/")
+        || lo.contains("/e2e/")
+    {
         return true;
     }
-    p.rsplit('/').next().is_some_and(|fname| fname.starts_with("test_") || fname.ends_with("_test.py"))
+    let fname = match p.rsplit('/').next() {
+        Some(f) => f,
+        None => return false,
+    };
+    // Python: `test_*.py` / `*_test.py`. TS/JS: `*.test.*` / `*.spec.*`.
+    fname.starts_with("test_")
+        || fname.ends_with("_test.py")
+        || fname.contains(".test.")
+        || fname.contains(".spec.")
 }
 fn path_is_generated(p: &str) -> bool {
+    // Python protobuf / gRPC / hand-rolled `.gen.py`, plus JS/TS conventions for codegen output
+    // (`*.generated.{ts,tsx,…}`, `__generated__/`).
     p.ends_with("_pb2.py")
         || p.ends_with("_pb2_grpc.py")
         || p.ends_with("_grpc.py")
         || p.ends_with(".gen.py")
+        || p.ends_with(".generated.ts")
+        || p.ends_with(".generated.tsx")
+        || p.ends_with(".generated.js")
+        || p.ends_with(".generated.jsx")
         || p.contains("/_generated/")
         || p.contains("/generated/")
+        || p.contains("/__generated__/")
 }
 fn path_is_migration(p: &str) -> bool {
     p.contains("/migrations/") || p.contains("/alembic/versions/")
+}
+/// `.d.ts` declaration files — they parse cleanly as TypeScript and would otherwise inflate
+/// "duplicate interface" / "duplicate type alias" findings with what's by design a type-only
+/// distribution mechanism (each consumer re-declares its slice of an external API).
+fn path_is_dts(p: &str) -> bool {
+    p.ends_with(".d.ts") || p.ends_with(".d.tsx") || p.ends_with(".d.mts") || p.ends_with(".d.cts")
+}
+/// Storybook stories — each `.stories.tsx` typically pastes the same component-wrapping
+/// boilerplate; refactoring it out defeats Storybook's "stories are self-contained examples"
+/// model.
+fn path_is_story(p: &str) -> bool {
+    let fname = p.rsplit('/').next().unwrap_or(p);
+    fname.contains(".stories.")
 }
 /// Tutorial / docs / example code — each snippet is a self-contained illustration that
 /// reasonably shares boilerplate with siblings (same `app = FastAPI()` scaffold, same login
@@ -994,6 +1213,228 @@ fn path_is_doc_example(p: &str) -> bool {
         || p.contains("/tutorial/")
         || p.contains("/tutorials/")
         || p.contains("/samples/")
+}
+
+/// `(filename, dir)` of a member's path. Empty `dir` if the path is bare.
+fn split_path<'a>(file: &'a str) -> (&'a str, &'a str) {
+    match file.rfind('/') {
+        Some(i) => (&file[i + 1..], &file[..i]),
+        None => (file, ""),
+    }
+}
+
+/// True iff every member of the cluster has the same filename, but they live in at least two
+/// distinct directories. This is the **vendored-copy / fork signature**: the same physical file
+/// has been checked into multiple roots (e.g. `src/vs/base/common/async.ts` plus
+/// `extensions/copilot/src/util/vs/base/common/async.ts`), so every definition inside it
+/// produces a "duplicate" cluster that is duplication by design. Real refactor candidates
+/// almost always live in files with *different* names.
+fn cluster_is_same_filename_across_dirs(f: &Finding) -> bool {
+    let mut fnames: BTreeSet<&str> = BTreeSet::new();
+    let mut dirs: BTreeSet<&str> = BTreeSet::new();
+    for (file, _, _) in &f.members {
+        let (fname, dir) = split_path(file);
+        fnames.insert(fname);
+        dirs.insert(dir);
+    }
+    fnames.len() == 1 && dirs.len() >= 2
+}
+
+/// Longest common SUFFIX-paths of `a` and `b` (path components, not raw chars). E.g.
+/// `extensions/copilot/src/util/vs/base/common` vs `src/vs/base/common` ⇒
+/// `("extensions/copilot/src/util", "")` since the trailing `vs/base/common` is shared. The
+/// returned tuple is `(a_unique_prefix, b_unique_prefix)` — whichever is non-empty marks the
+/// "extra" side, which for vendored snapshots is the suppressible vendored root.
+fn split_at_shared_suffix<'a>(a: &'a str, b: &'a str) -> (String, String) {
+    let ap: Vec<&str> = a.split('/').collect();
+    let bp: Vec<&str> = b.split('/').collect();
+    let mut shared = 0;
+    while shared < ap.len() && shared < bp.len()
+        && ap[ap.len() - 1 - shared] == bp[bp.len() - 1 - shared]
+    {
+        shared += 1;
+    }
+    let a_prefix = ap[..ap.len() - shared].join("/");
+    let b_prefix = bp[..bp.len() - shared].join("/");
+    (a_prefix, b_prefix)
+}
+
+/// Heuristic "this path looks like a vendored / fixture / fork copy" score. Higher = more
+/// likely vendored. Used to pick the **source** directory from a same-filename cluster (the
+/// lowest-scoring member) so the vendored-side glob lands on the right dirs.
+///
+/// Pure-shortest-path heuristic doesn't work in practice: e.g. vscode's real
+/// `src/vs/editor/browser/widget/codeEditor` (5 components) is *shorter* than some vendored
+/// counterparts but *longer* than `extensions/copilot/test/simulation/fixtures/vscode`
+/// (5 components, alphabetically smaller), which would mis-identify the source.
+fn vendored_score(dir: &str) -> i32 {
+    let mut score = 0i32;
+    if dir.contains("/fixtures/") || dir.contains("/__fixtures__/") {
+        score += 10;
+    }
+    if dir.contains("/test/") || dir.contains("/tests/") || dir.contains("/__tests__/") {
+        score += 5;
+    }
+    if dir.contains("/vendor/") || dir.contains("/vendored/") || dir.contains("/third_party/") {
+        score += 8;
+    }
+    if dir.contains("/util/vs/") || dir.contains("/util/") {
+        // `util/vs/` is the specific copilot-vendoring shape; `/util/` is a weaker generic
+        // signal that some "utility" snapshot might live here.
+        score += if dir.contains("/util/vs/") { 5 } else { 1 };
+    }
+    if dir.contains("/extensions/") || dir.contains("/extension/") {
+        score += 1; // weak — extension dirs commonly mirror core source
+    }
+    score
+}
+
+/// Auto-detect "vendored / fork" patterns: clusters whose members all share a filename but
+/// live in different directories. For each cluster the **lowest-scoring member directory** is
+/// treated as the source (vendored-marker score from [`vendored_score`]); every other
+/// directory contributes a `(vendored_dir, source_dir)` pair. The
+/// longer path's unique prefix (divergent portion above any shared trailing components) is the
+/// vendored root, and findings are aggregated under that root + rolled up to the deepest
+/// ancestor whose total finding count clears the `MIN_CLUSTERS` floor — so we emit one
+/// directive per *snapshot* root, not one per leaf-dir.
+///
+/// Handles both 2-dir clusters (one source, one vendored copy) and N-way snapshots (one source
+/// + several vendored copies in different roots — common for test fixtures that mirror the
+/// real source in multiple locations).
+fn infer_vendored_directives(findings: &[Finding], repo_root: &Path) -> Vec<InferredDirective> {
+    use std::collections::HashMap;
+    let mut by_prefix: HashMap<String, (Vec<&Finding>, BTreeSet<String>)> = HashMap::new();
+    for f in findings {
+        if !cluster_is_same_filename_across_dirs(f) {
+            continue;
+        }
+        let mut dirs: BTreeSet<&str> = BTreeSet::new();
+        for (file, _, _) in &f.members {
+            dirs.insert(split_path(file).1);
+        }
+        // Pick source by lowest vendored-marker score (ties → shortest path → lex order). This
+        // beats pure shortest-path: a `src/vs/editor/...` source is correctly preferred over a
+        // similarly-deep `extensions/.../fixtures/vscode` vendored copy.
+        let source_dir: String = dirs
+            .iter()
+            .min_by(|a, b| {
+                vendored_score(a)
+                    .cmp(&vendored_score(b))
+                    .then_with(|| a.split('/').count().cmp(&b.split('/').count()))
+                    .then_with(|| a.cmp(b))
+            })
+            .map(|s| (*s).to_owned())
+            .unwrap_or_default();
+        for &dir in &dirs {
+            if dir == source_dir {
+                continue;
+            }
+            // Gating signal: only treat a pair as "vendored" when the longer-pathed side
+            // actually carries a vendored-marker (`/fixtures/`, `/vendor/`, `/util/vs/`,
+            // `/test/`, etc. — see [`vendored_score`]). Without a marker, two same-named files
+            // across different dirs more often signal architectural duplication (a generic
+            // utility re-implemented for a specific call site) than a fork snapshot — emitting
+            // a broad `suppress` glob over those paths silently hides real refactor candidates
+            // and is over-broad enough to catch unrelated clusters that happen to have one
+            // member in the same subtree. Architectural-drift findings still surface as
+            // regular ERRORs; we just don't auto-suppress them.
+            if vendored_score(dir) == 0 {
+                continue;
+            }
+            let (vendored_prefix, _) = split_at_shared_suffix(dir, &source_dir);
+            let key = if vendored_prefix.is_empty() { dir.to_owned() } else { vendored_prefix };
+            let entry = by_prefix.entry(key).or_default();
+            entry.0.push(f);
+            entry.1.insert(source_dir.clone());
+        }
+    }
+
+    // Build "anchor → all findings under it" by rolling each leaf-prefix up through every
+    // ancestor path. Then for each leaf-prefix pick its DEEPEST ancestor whose total finding
+    // count clears `MIN_CLUSTERS`. That gives one directive per distinct vendored *root* (the
+    // copilot `src/util/vs` snapshot, the copilot `test/simulation/fixtures` snapshot, …)
+    // without rolling up so far that the glob becomes "anything in the repo".
+    const MIN_CLUSTERS: usize = 30;
+    let mut by_anchor: HashMap<String, Vec<&Finding>> = HashMap::new();
+    for (prefix, (fs, _)) in &by_prefix {
+        if prefix.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = prefix.split('/').collect();
+        for end in 1..=parts.len() {
+            let ancestor = parts[..end].join("/");
+            // Dedup findings within an ancestor's list: a single finding might roll into
+            // multiple ancestors (always its own chain), but per-ancestor we want a set.
+            let entry = by_anchor.entry(ancestor).or_default();
+            for f in fs {
+                entry.push(*f);
+            }
+        }
+    }
+    // For each leaf-prefix pick the deepest ancestor whose finding count clears the floor.
+    // Collect the chosen anchors into a set so two leaves under the same anchor only produce
+    // one directive (their findings are already aggregated into `by_anchor`).
+    let mut chosen: BTreeMap<String, Vec<&Finding>> = BTreeMap::new();
+    for prefix in by_prefix.keys() {
+        let parts: Vec<&str> = prefix.split('/').collect();
+        for end in (1..=parts.len()).rev() {
+            let ancestor = parts[..end].join("/");
+            if let Some(fs) = by_anchor.get(&ancestor) {
+                if fs.len() >= MIN_CLUSTERS {
+                    chosen.insert(ancestor, fs.clone());
+                    break;
+                }
+            }
+        }
+    }
+    // Drop ancestors that are *parents* of another chosen ancestor — the deeper one is more
+    // specific and already covers the same findings; keeping both would emit duplicate
+    // directives at different granularities.
+    let chosen_keys: Vec<String> = chosen.keys().cloned().collect();
+    chosen.retain(|k, _| {
+        !chosen_keys.iter().any(|other| other != k && other.starts_with(&format!("{k}/")))
+    });
+    let mut directives: Vec<(String, Vec<&Finding>, BTreeSet<String>)> = chosen
+        .into_iter()
+        .map(|(anchor, fs)| {
+            let srcs: BTreeSet<String> = by_prefix
+                .iter()
+                .filter(|(k, _)| k.starts_with(&anchor))
+                .flat_map(|(_, (_, s))| s.iter().cloned())
+                .collect();
+            (anchor, fs, srcs)
+        })
+        .collect();
+    directives.sort_by_key(|(_, fs, _)| std::cmp::Reverse(fs.len()));
+
+    directives.into_iter()
+        .take(5)
+        .map(|(prefix, fs, sources)| {
+            let n = fs.len();
+            let by_sev = |s: Severity| fs.iter().filter(|f| f.severity == s).count();
+            // Strip the repo root so the emitted glob is portable across machines — same
+            // policy the rest of the report uses via `short_path`.
+            let short_prefix = short_path(&prefix, repo_root);
+            let glob = format!("*{short_prefix}*");
+            let one_source: String = sources
+                .into_iter()
+                .next()
+                .map(|s| short_path(&s, repo_root))
+                .unwrap_or_default();
+            InferredDirective {
+                directive: format!(
+                    "suppress:*:*@{glob}=likely vendored / fork snapshot mirroring {one_source}"
+                ),
+                rationale: format!(
+                    "{n} clusters have all members in same-named files across `{short_prefix}` and a parallel source root"
+                ),
+                affects_total: n,
+                affects_error: by_sev(Severity::Error),
+                affects_warning: by_sev(Severity::Warning),
+                affects_info: by_sev(Severity::Info),
+            }
+        })
+        .collect()
 }
 
 /// Build one suggestion from findings matching `predicate`; returns `None` below `min_clusters`
@@ -1023,7 +1464,7 @@ fn build_suggestion(
 /// Pattern-match across findings to emit ready-to-paste `-D` directives for the recurring noise
 /// shapes (i18n locales, all-test clusters, generated `_pb2`/`_grpc`, schema migrations). The
 /// user still owns the final list; we shortcut the first 80% of project-specific tuning.
-fn infer_directives(findings: &[Finding]) -> Vec<InferredDirective> {
+fn infer_directives(findings: &[Finding], repo_root: &Path) -> Vec<InferredDirective> {
     let mut out: Vec<InferredDirective> = Vec::new();
     if let Some(s) = build_suggestion(
         findings,
@@ -1046,12 +1487,44 @@ fn infer_directives(findings: &[Finding]) -> Vec<InferredDirective> {
     ) {
         out.push(s);
     }
+    // i18n locale / translation files for ANY kind — per-locale function families (Angular's
+    // `plural_locale_*` rules, Django-style translation modules) are duplication-by-design;
+    // each locale has its own near-identical implementation.
+    if let Some(s) = build_suggestion(
+        findings,
+        |f| f.members.iter().all(|(p, _, _)| path_is_i18n(p)),
+        5,
+        "suppress:*:*@*/{locale,locales,i18n,translations}/*=i18n / translation tables — per-locale near-duplicates are by design",
+        |n| format!("{n} clusters live entirely in locale / i18n / translation paths"),
+    ) {
+        out.push(s);
+    }
     if let Some(s) = build_suggestion(
         findings,
         |f| f.members.iter().all(|(p, _, _)| path_is_test(p)),
-        10,
-        "de-escalate:*:*@*tests/*=test parametrize/fixture candidates — review for conftest",
+        3,
+        // Brace alternation expands to every test-tree convention `path_is_test` recognizes,
+        // so one paste covers `/test/`, `/tests/`, `/__tests__/`, `/test_cases/`, `/integration/`,
+        // `/e2e/`, etc., without catching unrelated words like `/testimony/`.
+        "de-escalate:*:*@*/{test,tests,__tests__,test_cases,test-cases,__fixtures__,fixtures,integration,e2e}/*=test parametrize/fixture candidates — review for conftest",
         |n| format!("{n} clusters live entirely in test paths — parametrize/conftest candidates"),
+    ) {
+        out.push(s);
+    }
+    // TS/JS files using the `.test.*` / `.spec.*` naming convention (jest, vitest, mocha) that
+    // live OUTSIDE a `/test/` directory — the file-extension test marker is independent of the
+    // directory marker, so we emit it as a parallel directive.
+    if let Some(s) = build_suggestion(
+        findings,
+        |f| {
+            f.members.iter().all(|(p, _, _)| {
+                let fname = p.rsplit('/').next().unwrap_or(p);
+                fname.contains(".test.") || fname.contains(".spec.")
+            })
+        },
+        3,
+        "de-escalate:*:*@*.{test,spec}.*=test files by .test.* / .spec.* naming",
+        |n| format!("{n} clusters live entirely in `*.test.*` / `*.spec.*` files (jest/vitest/mocha)"),
     ) {
         out.push(s);
     }
@@ -1073,16 +1546,46 @@ fn infer_directives(findings: &[Finding]) -> Vec<InferredDirective> {
     ) {
         out.push(s);
     }
-    // Tutorial / docs / example code — fastapi/docs_src, sklearn/examples, etc.
+    // Tutorial / docs / example code — fastapi/docs_src, sklearn/examples, angular/adev
+    // examples, etc. Brace alternation covers every convention `path_is_doc_example` recognizes
+    // so users don't have to chain multiple `-D` flags for the same pattern family.
     if let Some(s) = build_suggestion(
         findings,
         |f| f.members.iter().all(|(p, _, _)| path_is_doc_example(p)),
         5,
-        "de-escalate:*:*@*docs_src/*=tutorial/doc-example code — snippet duplication is expected",
+        "de-escalate:*:*@*/{docs_src,docs/src,examples,example,tutorial,tutorials,samples}/*=tutorial/doc-example code — snippet duplication is expected",
         |n| format!("{n} clusters live entirely under docs_src/ / examples/ / tutorial/ paths"),
     ) {
         out.push(s);
     }
+    // TS-specific: `.d.ts` type declarations — distribution mechanism for type-only API
+    // surface; cross-package duplication is intentional. Suppress wholesale unless overridden.
+    if let Some(s) = build_suggestion(
+        findings,
+        |f| f.members.iter().all(|(p, _, _)| path_is_dts(p)),
+        3,
+        "suppress:*:*@*.d.ts=TypeScript declaration files, type-only duplication is by design",
+        |n| format!("{n} clusters live entirely in `.d.ts` declaration files"),
+    ) {
+        out.push(s);
+    }
+    // TS-specific: Storybook stories. Each `.stories.tsx` deliberately repeats render
+    // boilerplate; the per-story scaffolding is the API, not a refactor target.
+    if let Some(s) = build_suggestion(
+        findings,
+        |f| f.members.iter().all(|(p, _, _)| path_is_story(p)),
+        5,
+        "de-escalate:*:*@*.stories.*=Storybook stories — boilerplate duplication is the docstring",
+        |n| format!("{n} clusters live entirely in `*.stories.*` Storybook files"),
+    ) {
+        out.push(s);
+    }
+    // Vendored / fork pattern — same filename across multiple dir roots. Dominates large
+    // codebases that include forked snapshots of upstream sources (e.g. vscode's
+    // `extensions/copilot/src/util/vs/*` mirroring `src/vs/*`). Path-glob suggestions land here
+    // because the heuristic is non-obvious from a single cluster — only the aggregate reveals
+    // the snapshot root.
+    out.extend(infer_vendored_directives(findings, repo_root));
     out
 }
 
@@ -1130,7 +1633,7 @@ fn render_calibration_json(errs: &[&Finding], warns: &[&Finding], all: &[Finding
             histogram: thickness_histogram(&warns.iter().map(|f| f.thickness).collect::<Vec<_>>()),
             suggestions: calibration_suggestions(warns, repo_root),
         },
-        inferred_directives: infer_directives(all),
+        inferred_directives: infer_directives(all, repo_root),
     };
     serde_json::to_string_pretty(&report).unwrap_or_default() + "\n"
 }
@@ -1203,7 +1706,7 @@ fn format_calibration(errs: &[&Finding], warns: &[&Finding], all: &[Finding], re
     format_calibration_tier(&mut out, "ERROR", "error-thickness", errs, repo_root);
     format_calibration_tier(&mut out, "WARNING", "warning-thickness", warns, repo_root);
 
-    let inferred = infer_directives(all);
+    let inferred = infer_directives(all, repo_root);
     if !inferred.is_empty() {
         out.push_str("=== inferred directives (auto-detected noise patterns) ===\n\n");
         for d in &inferred {
@@ -1232,6 +1735,7 @@ fn dup_kind(kind: &str) -> &'static str {
         "functions" => "FUNCTION",
         "methods" => "METHOD",
         "classes" => "CLASS",
+        "interfaces" => "INTERFACE",
         "constants" => "CONSTANT",
         "type-aliases" => "TYPE_ALIAS",
         _ => "UNKNOWN",
@@ -1244,8 +1748,9 @@ fn is_cross_name(pass: &str) -> bool {
 }
 
 /// Printed-section index — functions come first by pass, then methods by pass (same three-pass
-/// order), then classes / type-aliases. Keeping methods adjacent to functions reads naturally
-/// since both pass families are callable-body comparisons.
+/// order), then classes, interfaces (TS-only kind, slotted right after classes since both are
+/// body-bearing nominal types), type-aliases. Keeping methods adjacent to functions reads
+/// naturally since both pass families are callable-body comparisons.
 fn section_index(f: &Finding) -> usize {
     match (f.kind.as_str(), f.pass) {
         ("constants", _) => 0,
@@ -1256,8 +1761,9 @@ fn section_index(f: &Finding) -> usize {
         ("methods", "cross-name") => 5,
         ("methods", "type-3") => 6,
         ("classes", _) => 7,
-        ("type-aliases", _) => 8,
-        _ => 9,
+        ("interfaces", _) => 8,
+        ("type-aliases", _) => 9,
+        _ => 10,
     }
 }
 
@@ -1301,7 +1807,7 @@ fn group_suffix(f: &Finding) -> String {
 /// Human-readable per-section report — byte-for-byte the Python `format_report`.
 fn format_report(findings: &[Finding], warn: f64, error: f64, repo_root: &Path) -> String {
     let sim = format!("AST sim warn={warn} error={error}");
-    let sections: [(String, usize); 9] = [
+    let sections: [(String, usize); 10] = [
         ("duplicate constants (cross-file, by name)".to_owned(), 0),
         (format!("duplicate functions (cross-file, {sim})"), 1),
         ("duplicate functions (cross-name, exact AST-normalized)".to_owned(), 2),
@@ -1310,7 +1816,8 @@ fn format_report(findings: &[Finding], warn: f64, error: f64, repo_root: &Path) 
         ("duplicate methods (cross-name, exact AST-normalized)".to_owned(), 5),
         ("duplicate methods (cross-name Type-3, IDF-weighted cosine)".to_owned(), 6),
         (format!("duplicate classes (cross-file, {sim})"), 7),
-        ("duplicate type aliases (cross-file, by name)".to_owned(), 8),
+        (format!("duplicate interfaces (cross-file, {sim})"), 8),
+        ("duplicate type aliases (cross-file, by name)".to_owned(), 9),
     ];
 
     let mut lines: Vec<String> = Vec::new();
