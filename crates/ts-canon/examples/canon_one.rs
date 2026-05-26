@@ -7,7 +7,7 @@ use ts_canon::{ast_canonical, find_module_defs};
 
 fn main() {
     let file = env::args().nth(1).expect("usage: canon_one <file>");
-    let defs = find_module_defs(&[file.clone()]);
+    let defs = find_module_defs(std::slice::from_ref(&file));
     eprintln!("found {} defs in {}", defs.len(), file);
     for (i, d) in defs.iter().enumerate() {
         eprintln!("[{i}] {} {} {}:{} loc={}", d.kind, d.name, d.file, d.line + 1, d.loc);

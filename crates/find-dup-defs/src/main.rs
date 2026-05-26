@@ -723,13 +723,16 @@ fn pass_type3(defs: &[ModuleDef], fn_idx: &[usize], analyses: &[Option<AnalyzedF
         .collect()
 }
 
+/// Frontends `--only` can restrict to. Kept at module scope so it doesn't trip
+/// `clippy::items_after_statements` from inside `main`'s body.
+const KNOWN_LANGS: &[&str] = &["py", "ts"];
+
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn main() {
     let cli = Cli::parse();
     // `--only` validation + scan-flag derivation. Unknown codes are an error (exit 2) rather
     // than a silent no-op — a typo'd `--only py,rs` should fail loud so a CI job that meant to
     // include Rust doesn't ship an empty report.
-    const KNOWN_LANGS: &[&str] = &["py", "ts"];
     let (scan_py, scan_ts) = match &cli.only {
         None => (true, true),
         Some(codes) => {
@@ -1160,10 +1163,7 @@ fn path_is_test(p: &str) -> bool {
     {
         return true;
     }
-    let fname = match p.rsplit('/').next() {
-        Some(f) => f,
-        None => return false,
-    };
+    let Some(fname) = p.rsplit('/').next() else { return false };
     // Python: `test_*.py` / `*_test.py`. TS/JS: `*.test.*` / `*.spec.*`.
     fname.starts_with("test_")
         || fname.ends_with("_test.py")
@@ -1216,7 +1216,7 @@ fn path_is_doc_example(p: &str) -> bool {
 }
 
 /// `(filename, dir)` of a member's path. Empty `dir` if the path is bare.
-fn split_path<'a>(file: &'a str) -> (&'a str, &'a str) {
+fn split_path(file: &str) -> (&str, &str) {
     match file.rfind('/') {
         Some(i) => (&file[i + 1..], &file[..i]),
         None => (file, ""),
@@ -1298,9 +1298,15 @@ fn vendored_score(dir: &str) -> i32 {
 /// ancestor whose total finding count clears the `MIN_CLUSTERS` floor — so we emit one
 /// directive per *snapshot* root, not one per leaf-dir.
 ///
-/// Handles both 2-dir clusters (one source, one vendored copy) and N-way snapshots (one source
-/// + several vendored copies in different roots — common for test fixtures that mirror the
-/// real source in multiple locations).
+/// Handles both 2-dir clusters (one source, one vendored copy) and N-way snapshots (one
+/// source + several vendored copies in different roots — common for test fixtures that mirror
+/// the real source in multiple locations).
+///
+/// Findings clusters short-circuit to `>= MIN_CLUSTERS` after rollup — emit one directive per
+/// distinct vendored *root*, not one per leaf-dir.
+const VENDORED_MIN_CLUSTERS: usize = 30;
+
+#[allow(clippy::too_many_lines)] // multi-stage pipeline (per-pair grouping, anchor rollup, parent-drop, directive emission) reads more clearly straight-through than broken across helpers
 fn infer_vendored_directives(findings: &[Finding], repo_root: &Path) -> Vec<InferredDirective> {
     use std::collections::HashMap;
     let mut by_prefix: HashMap<String, (Vec<&Finding>, BTreeSet<String>)> = HashMap::new();
@@ -1351,10 +1357,9 @@ fn infer_vendored_directives(findings: &[Finding], repo_root: &Path) -> Vec<Infe
 
     // Build "anchor → all findings under it" by rolling each leaf-prefix up through every
     // ancestor path. Then for each leaf-prefix pick its DEEPEST ancestor whose total finding
-    // count clears `MIN_CLUSTERS`. That gives one directive per distinct vendored *root* (the
-    // copilot `src/util/vs` snapshot, the copilot `test/simulation/fixtures` snapshot, …)
-    // without rolling up so far that the glob becomes "anything in the repo".
-    const MIN_CLUSTERS: usize = 30;
+    // count clears `VENDORED_MIN_CLUSTERS`. That gives one directive per distinct vendored
+    // *root* (the copilot `src/util/vs` snapshot, the copilot `test/simulation/fixtures`
+    // snapshot, …) without rolling up so far that the glob becomes "anything in the repo".
     let mut by_anchor: HashMap<String, Vec<&Finding>> = HashMap::new();
     for (prefix, (fs, _)) in &by_prefix {
         if prefix.is_empty() {
@@ -1380,7 +1385,7 @@ fn infer_vendored_directives(findings: &[Finding], repo_root: &Path) -> Vec<Infe
         for end in (1..=parts.len()).rev() {
             let ancestor = parts[..end].join("/");
             if let Some(fs) = by_anchor.get(&ancestor) {
-                if fs.len() >= MIN_CLUSTERS {
+                if fs.len() >= VENDORED_MIN_CLUSTERS {
                     chosen.insert(ancestor, fs.clone());
                     break;
                 }

@@ -6,7 +6,7 @@
 //! pass over body kinds).
 //!
 //! Unlike `py-canon`, the canonical here doesn't have a byte-exact external reference to match
-//! (CPython's `ast.dump` shaped Python; there's no equivalent published reference for TS). We
+//! (`CPython`'s `ast.dump` shaped Python; there's no equivalent published reference for TS). We
 //! emit a compact, internally-consistent **s-expr** (node name + relevant child fields), which
 //! is what difflib's Ratcliff–Obershelp ratio compares for name-gated similarity, and what the
 //! cross-name pass's `Eq` checks once locals have been alpha-renamed. Concrete consequences:
@@ -29,7 +29,14 @@
 //!
 //! Type-3 lines are per-statement renamed s-expr strings (one statement → one line); the engine
 //! tokenizes them via the same regex as `py-canon`'s lines and the IDF/cosine works unchanged.
-#![allow(clippy::too_many_lines)] // top-level match arms enumerate AST variants — splitting them just spreads the same shape over more files
+#![allow(
+    clippy::too_many_lines, // top-level match arms enumerate AST variants — splitting them just spreads the same shape over more files
+    clippy::doc_markdown, // CPython, TSAs etc. read fine in prose without backticks; clippy is over-eager
+    clippy::doc_lazy_continuation, // module docstrings use loose list continuation, intentional
+    clippy::self_only_used_in_recursion, // Collect::collect_expr is a visitor — calls into itself, mutation happens via add_binding called from outer dispatch
+    clippy::match_same_arms, // visitor's no-op arms enumerate AST variants for clarity
+    clippy::needless_pass_by_value, // helpers accept owned Vec<String> by value to consume one allocation
+)]
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -54,8 +61,8 @@ use rayon::prelude::*;
 /// Collect names *bound* anywhere inside the top callable — the rename set for xname mode.
 /// Mirrors `py-canon::Collect`: params + var declarations + function/class declarations + catch
 /// + for-of/in + destructuring + import bindings. Nested defs' *params* are NOT collected
-/// (CPython behavior, preserved for TS), only the top function's params plus arrow-fn / inner-fn
-/// declared *names* (which ARE bindings in the outer scope).
+/// (`CPython` behavior, preserved for TS), only the top function's params plus arrow-fn /
+/// inner-fn declared *names* (which ARE bindings in the outer scope).
 #[derive(Default)]
 struct Collect {
     bound: HashSet<String>,
@@ -68,10 +75,8 @@ impl Collect {
                 self.bound.insert(id.name.to_string());
             }
             BindingPattern::ArrayPattern(arr) => {
-                for elt in &arr.elements {
-                    if let Some(p) = elt {
-                        self.add_binding(p);
-                    }
+                for p in arr.elements.iter().flatten() {
+                    self.add_binding(p);
                 }
                 if let Some(rest) = &arr.rest {
                     self.add_binding_rest(rest);
@@ -642,10 +647,7 @@ impl<'a> Dump<'a> {
             (None, _) => "<anon>".to_owned(),
         };
         let params = self.formal_params(&f.params);
-        let body = f.body.as_deref().map_or_else(
-            || String::new(),
-            |b| self.block_body(&b.statements),
-        );
+        let body = f.body.as_deref().map_or_else(String::new, |b| self.block_body(&b.statements));
         let async_g = format!("async={} gen={}", f.r#async, f.generator);
         self.node("Func", &[Self::lit_str(&name), params, body, async_g])
     }

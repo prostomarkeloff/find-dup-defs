@@ -19,6 +19,10 @@
 //! `export` / `export default` are transparent wrappers: the inner declaration is what's
 //! surfaced, with its own decorator-stripped text and span — keeping the canonical comparable
 //! across `function foo()` and `export function foo()`.
+#![allow(
+    clippy::unnecessary_wraps, // type_alias_def / interface_def return Option<ModuleDef> for call-site symmetry with function_def / class_def (which DO conditionally return None); the symmetry pays for the lint.
+    clippy::needless_raw_string_hashes, // test-fixture raw strings keep `r#"..."#` for visual consistency; some contain `"` literals and need the hashes anyway.
+)]
 
 use std::fs;
 use std::path::Path;

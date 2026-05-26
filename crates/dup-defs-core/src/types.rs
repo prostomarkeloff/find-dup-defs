@@ -60,7 +60,7 @@ pub struct ModuleDef {
 /// * `xname_canonical` — alpha-renamed structural canonical (bound locals → positional `_v{n}`,
 ///   top def name blanked to `_fn`), used by the cross-name pass.
 /// * `lines` — per-statement renamed lines (one logical line per statement, equivalent to
-///   `ast.unparse` line splits in Python), used by the Type-3 (ECScan) cosine pass.
+///   `ast.unparse` line splits in Python), used by the Type-3 (`ECScan`) cosine pass.
 /// * `size` — node count of the alpha-renamed canonical, used as a "substance" gate so a
 ///   3-line accessor doesn't escalate to ERROR purely on a renamed-exact match.
 pub type AnalyzedFn = (String, String, Vec<String>, usize);

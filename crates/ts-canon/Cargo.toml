@@ -1,6 +1,6 @@
 [package]
 name = "ts-canon"
-version = "0.1.0"
+version = "0.1.1"
 description = "TypeScript source → structural canonicalization + module-level definition scan (oxc parser). The TypeScript frontend for find-dup-defs."
 keywords = ["typescript", "ast", "canonicalize", "parsing", "clone"]
 categories = ["parser-implementations", "development-tools"]
