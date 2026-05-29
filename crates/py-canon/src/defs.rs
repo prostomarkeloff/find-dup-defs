@@ -21,7 +21,7 @@
 
 use std::fs;
 
-use dup_defs_core::{Language, LineMap, ModuleDef};
+use dup_defs_core::{LineMap, ModuleDef};
 use rayon::prelude::*;
 use ruff_python_ast::{Expr, Parameters, Stmt};
 use ruff_python_parser::parse_module;
@@ -293,7 +293,6 @@ fn class_method_defs(source: &str, stmt: &Stmt, lines: &LineMap, file: &str, par
                     text_orig,
                     loc,
                     args,
-                    lang: Language::Python,
                 });
             }
             Stmt::ClassDef(_) => {
@@ -305,7 +304,7 @@ fn class_method_defs(source: &str, stmt: &Stmt, lines: &LineMap, file: &str, par
     out
 }
 
-fn module_defs_from(source: &str, file: &str) -> Vec<ModuleDef> {
+pub(crate) fn module_defs_from(source: &str, file: &str) -> Vec<ModuleDef> {
     let Ok(parsed) = parse_module(source) else { return Vec::new() };
     let module = parsed.into_syntax();
     let lines = LineMap::new(source);
@@ -331,7 +330,6 @@ fn module_defs_from(source: &str, file: &str) -> Vec<ModuleDef> {
             text_orig,
             loc,
             args,
-            lang: Language::Python,
         });
     }
     defs

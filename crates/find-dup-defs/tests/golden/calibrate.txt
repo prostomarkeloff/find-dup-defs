@@ -1,0 +1,115 @@
+=== thickness calibration (ERROR): 12 clusters analyzed ===
+
+distribution (each ▇ ≈ one ERROR cluster, scaled to fit):
+  T [0.0, 0.1)   0
+  T [0.1, 0.2)   0
+  T [0.2, 0.3)  ▇▇▇▇▇▇▇▇▇▇▇▇ 3
+  T [0.3, 0.4)  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 8
+  T [0.4, 0.5)  ▇▇▇▇ 1
+  T [0.5, 0.6)   0
+  T [0.6, 0.7)   0
+  T [0.7, 0.8)   0
+  T [0.8, 0.9)   0
+  T [0.9, 1.0)   0
+
+suggested thresholds (p50/p75/p90 of current ERROR thickness distribution):
+
+  permissive   --error-thickness 0.34  → 8 ERROR remain  (median dup: 7 loc, 2 args)
+    e.g. Repository.fetch_item  [T=0.34, loc=5, args=2]
+         py/core_a.py:21, py/core_b.py:21
+    ┌──
+    │ def fetch_item(self, item_id):
+    │     record = self.store.get(item_id)
+    │     if record is None:
+    │         raise KeyError(item_id)
+    │     return record
+    └──
+
+  balanced     --error-thickness 0.38  → 3 ERROR remain  (median dup: 9 loc, 0 args)
+    e.g. Repository  [T=0.38, loc=9, args=0]
+         ts/core_a.ts:25, ts/core_b.ts:25
+    ┌──
+    │ class Repository {
+    │     fetchItem(itemId: number): number {
+    │         const record = this.store.get(itemId);
+    │         if (record === undefined) {
+    │             throw new Error("missing");
+    │         }
+    │         return record;
+    │     }
+    │ }
+    └──
+
+  strict       --error-thickness 0.40  → 2 ERROR remain  (median dup: 10 loc, 2 args)
+    e.g. Repository  [T=0.40, loc=10, args=0]
+         py/core_a.py:20, py/core_b.py:20
+    ┌──
+    │ class Repository:
+    │     def fetch_item(self, item_id):
+    │         record = self.store.get(item_id)
+    │         if record is None:
+    │             raise KeyError(item_id)
+    │         return record
+    │ 
+    │     @staticmethod
+    │     def normalize(name):
+    │         cleaned = name.strip().lower()
+    │         return cleaned.replace(" ", "_")
+    └──
+
+=== thickness calibration (WARNING): 3 clusters analyzed ===
+
+distribution (each ▇ ≈ one WARNING cluster, scaled to fit):
+  T [0.0, 0.1)   0
+  T [0.1, 0.2)   0
+  T [0.2, 0.3)  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 2
+  T [0.3, 0.4)  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 1
+  T [0.4, 0.5)   0
+  T [0.5, 0.6)   0
+  T [0.6, 0.7)   0
+  T [0.7, 0.8)   0
+  T [0.8, 0.9)   0
+  T [0.9, 1.0)   0
+
+suggested thresholds (p50/p75/p90 of current WARNING thickness distribution):
+
+  permissive   --warning-thickness 0.30  → 2 WARNING remain  (median dup: 4 loc, 2 args)
+    e.g. add_numbers/plus_numbers  [T=0.30, loc=3, args=2]
+         py/core_a.py:15, py/core_b.py:15
+    ┌──
+    │ def add_numbers(a, b):
+    │     result = a + b
+    │     return result * 2
+    └──
+
+  balanced     --warning-thickness 0.31  → 1 WARNING remain  (median dup: 4 loc, 2 args)
+    e.g. addNumbers/plusNumbers  [T=0.32, loc=4, args=2]
+         ts/core_a.ts:20, ts/core_b.ts:20
+    ┌──
+    │ function addNumbers(a: number, b: number): number {
+    │     const result = a + b;
+    │     return result * 2;
+    │ }
+    └──
+
+  strict       --warning-thickness 0.32  → 1 WARNING remain  (median dup: 4 loc, 2 args)
+    e.g. addNumbers/plusNumbers  [T=0.32, loc=4, args=2]
+         ts/core_a.ts:20, ts/core_b.ts:20
+    ┌──
+    │ function addNumbers(a: number, b: number): number {
+    │     const result = a + b;
+    │     return result * 2;
+    │ }
+    └──
+
+=== inferred directives (auto-detected noise patterns) ===
+
+  → -D 'de-escalate:*:*@*/{test,tests,__tests__,test_cases,test-cases,__fixtures__,fixtures,integration,e2e}/*=test parametrize/fixture candidates — review for conftest'
+    rationale: 15 clusters live entirely in test paths — parametrize/conftest candidates
+    affects: 15 total (12 ERROR, 3 WARNING, 0 INFO)
+
+(Paste any of these into your CI invocation — patterns matched repeatably,
+not heuristics on individual clusters. Review the rationale before applying.)
+
+workflow: dial `--error-thickness` to focus the gate; dial `--warning-thickness`
+to control how much low-confidence noise stays in WARNING vs falls to INFO.

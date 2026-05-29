@@ -1,12 +1,14 @@
-//! `find-dup-defs` library — the cross-file duplicate-definition detection pipeline
-//! exposed as a Rust API (consumed by the `find-dup-defs` CLI binary AND by
-//! `iilint._native` via the iilint-py PyO3 bindings).
+//! `find-dup-defs` library — the cross-file duplicate-definition detection pipeline.
+//!
+//! The engine is **frontend-agnostic**: it consumes a `Vec<`[`Def`]`>` (each carrying its
+//! precomputed canonical strings and a `&'static `[`KindSpec`]) and never names a concrete
+//! language crate. The binary owns the [`Frontend`] registry and passes `&[&dyn Frontend]` in;
+//! adding a language is a new frontend crate, not an engine edit.
 #![allow(
-    clippy::doc_markdown, // PyO3 etc. mentioned in prose
     clippy::struct_excessive_bools // PipelineOpts mirrors CLI flags, not a state machine
 )]
 //!
-//! Three complementary passes (all over one native parse per definition):
+//! Three complementary passes (all over the canon the frontend computed in one parse per file):
 //!   1. **name-gated** — same-`(kind, name)` defs clustered by exact
 //!      Ratcliff–Obershelp similarity (via `difflib-fast`).
 //!   2. **cross-name** — renamed copy-paste: alpha-renamed canonical bucketed
@@ -21,8 +23,9 @@ pub mod type3;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use dup_defs_core::{AnalyzedFn, Language, ModuleDef};
+use dup_defs_core::{Def, Frontend, KindSpec};
 use rayon::prelude::*;
 use serde::Serialize;
 use walkdir::WalkDir;
@@ -39,10 +42,8 @@ pub const SHINGLE_LINES: usize = 3;
 pub const COMMON_RATIO: f64 = 0.007;
 /// Type-3 cluster's min-cosine ≥ this → ERROR (else WARNING).
 pub const TYPE3_ERROR_THETA: f64 = 0.9;
-/// Language codes accepted by the CLI's `--only` (and the Python wrapper).
-pub const KNOWN_LANGS: &[&str] = &["py", "ts"];
 
-/// Directory-name blacklist for `.py`/`.ts` discovery — virtualenvs, package
+/// Directory-name blacklist for source discovery — virtualenvs, package
 /// caches, build artefacts, vendored tooling, JS bundler outputs.
 const SKIP_DIRS: &[&str] = &[
     // Python ecosystem
@@ -112,9 +113,8 @@ impl Severity {
 pub struct Finding {
     /// Which pass produced the finding: `"name"` / `"cross-name"` / `"type-3"`.
     pub pass: &'static str,
-    /// Definition kind: `"functions"` / `"methods"` / `"classes"` /
-    /// `"interfaces"` / `"constants"` / `"type-aliases"`.
-    pub kind: String,
+    /// The kind of the clustered definitions, as declared by the frontend.
+    pub kind: &'static KindSpec,
     pub name: String,
     pub severity: Severity,
     /// Min pairwise similarity inside the cluster. `None` for name-only kinds.
@@ -152,10 +152,25 @@ pub fn thickness(loc: usize, args: usize, n_members: usize, sim: f64) -> f64 {
 
 // ── File collection ────────────────────────────────────────────────────────
 
-/// Walk `paths` and return every matching source file. `matches` decides which
-/// extensions count for one language frontend.
-pub fn collect_files(paths: &[PathBuf], matches: impl Fn(&Path) -> bool) -> Vec<String> {
-    let mut files: BTreeSet<String> = BTreeSet::new();
+/// Index of the first frontend that claims `path`'s extension, if any.
+fn frontend_for(frontends: &[&dyn Frontend], path: &Path) -> Option<usize> {
+    let ext = path.extension()?.to_str()?;
+    frontends.iter().position(|f| f.extensions().contains(&ext))
+}
+
+/// Walk `paths` once, route each file to the frontend that claims its extension, and scan.
+/// Replaces the per-language `WalkDir` passes: the tree is traversed a single time regardless
+/// of how many frontends are active. Per-frontend file lists are gathered into a `BTreeSet` so
+/// they are deduplicated and sorted before scanning (the engine re-sorts defs afterwards, so
+/// this is defense-in-depth for determinism).
+#[must_use]
+pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf]) -> Vec<Def> {
+    let mut per_frontend: Vec<BTreeSet<Arc<str>>> = vec![BTreeSet::new(); frontends.len()];
+    let mut route = |path: &Path| {
+        if let Some(fi) = frontend_for(frontends, path) {
+            per_frontend[fi].insert(Arc::from(path.to_string_lossy().as_ref()));
+        }
+    };
     for p in paths {
         if p.is_dir() {
             let walker = WalkDir::new(p).into_iter().filter_entry(|e| {
@@ -168,94 +183,81 @@ pub fn collect_files(paths: &[PathBuf], matches: impl Fn(&Path) -> bool) -> Vec<
                 true
             });
             for entry in walker.filter_map(Result::ok) {
-                let path = entry.path();
-                if matches(path) {
-                    files.insert(path.to_string_lossy().into_owned());
-                }
+                route(entry.path());
             }
-        } else if matches(p) {
-            files.insert(p.to_string_lossy().into_owned());
+        } else {
+            route(p);
         }
     }
-    files.into_iter().collect()
+    let mut defs = Vec::new();
+    for (fi, files) in per_frontend.into_iter().enumerate() {
+        let files: Vec<Arc<str>> = files.into_iter().collect();
+        defs.extend(frontends[fi].scan(&files));
+    }
+    defs
 }
 
-/// Walk for `.py` files under `paths`.
+// ── Cluster helpers ─────────────────────────────────────────────────────────
+
+/// `(file, line 1-indexed, col 0-indexed)` for a def member of a cluster.
 #[must_use]
-pub fn collect_py_files(paths: &[PathBuf]) -> Vec<String> {
-    collect_files(paths, |p| p.extension().is_some_and(|e| e == "py"))
+pub fn member(defs: &[Def], i: usize) -> (String, usize, usize) {
+    (defs[i].file.to_string(), defs[i].line + 1, defs[i].col)
 }
 
-/// Walk for `.ts` / `.tsx` / `.mts` / `.cts` files under `paths`.
-#[must_use]
-pub fn collect_ts_files(paths: &[PathBuf]) -> Vec<String> {
-    collect_files(paths, |p| {
-        p.extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| matches!(e, "ts" | "tsx" | "mts" | "cts"))
-    })
-}
-
-// ── Kind helpers ───────────────────────────────────────────────────────────
-
-#[must_use]
-pub fn is_body_kind(kind: &str) -> bool {
-    matches!(kind, "functions" | "classes" | "methods" | "interfaces")
-}
-
-#[must_use]
-pub fn is_fn_like(kind: &str) -> bool {
-    matches!(kind, "functions" | "methods")
-}
-
-/// Per-language dispatch for the names-preserved cluster canonical.
-#[must_use]
-pub fn cluster_canonical_for(def: &ModuleDef) -> String {
-    match def.lang {
-        Language::Python => py_canon::ast_canonical(&def.text),
-        Language::TypeScript => ts_canon::ast_canonical(&def.text),
+/// Pick the `&'static KindSpec` to label a cross-name / Type-3 cluster of callables: METHOD if
+/// every member is a method, otherwise FUNCTION (a mixed function/method cluster reports as a
+/// function, matching the historical behavior). All frontends use identical `KindSpec` fields
+/// for a given `id`, so taking a member's own spec is correct regardless of language.
+fn callable_kind(defs: &[Def], members: &[usize]) -> &'static KindSpec {
+    if members.iter().all(|&p| defs[p].kind.id == "methods") {
+        defs[members[0]].kind
+    } else {
+        let p = members.iter().copied().find(|&p| defs[p].kind.id == "functions").unwrap_or(members[0]);
+        defs[p].kind
     }
 }
 
-/// Per-language dispatch for the full callable analysis.
-#[must_use]
-pub fn analyze_for(def: &ModuleDef) -> Option<AnalyzedFn> {
-    let texts = [def.text.clone()];
-    match def.lang {
-        Language::Python => py_canon::analyze_functions(&texts).into_iter().next().flatten(),
-        Language::TypeScript => ts_canon::analyze_functions(&texts).into_iter().next().flatten(),
-    }
-}
+// ── Section index (for stable, reproducible cluster sort) ──────────────────
 
+/// Printed-section index — a kind's `section` base plus a per-pass offset for callables
+/// (`name` 0 / `cross-name` 1 / `type-3` 2). Reproduces the historical fixed ordering:
+/// constants 0, functions 1/2/3, methods 4/5/6, classes 7, interfaces 8, type-aliases 9.
 #[must_use]
-pub fn member(defs: &[ModuleDef], i: usize) -> (String, usize, usize) {
-    (defs[i].file.clone(), defs[i].line + 1, defs[i].col)
+pub fn section_index(f: &Finding) -> usize {
+    let base = f.kind.section as usize;
+    let offset = if f.kind.fn_like {
+        match f.pass {
+            "cross-name" => 1,
+            "type-3" => 2,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    base + offset
 }
 
 // ── Passes ─────────────────────────────────────────────────────────────────
 
-/// Pass 1 — name-gated: same-named functions/classes clustered by body
-/// similarity; same-named constants/type-aliases compared by raw text.
+/// Pass 1 — name-gated: same-named body-kind defs clustered by structural-canonical
+/// similarity; same-named raw-text kinds (constants / type-aliases) compared by `text_orig`.
 #[must_use]
-pub fn pass_name_gated(
-    defs: &[ModuleDef],
-    canon_of: &[Option<String>],
-    threshold: f64,
-    error: f64,
-    min_size: usize,
-) -> Vec<Finding> {
+pub fn pass_name_gated(defs: &[Def], threshold: f64, error: f64, min_size: usize) -> Vec<Finding> {
     let mut groups: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
     for (i, d) in defs.iter().enumerate() {
-        groups.entry((d.kind.as_str(), d.name.as_str())).or_default().push(i);
+        groups.entry((d.kind.id, d.name.as_str())).or_default().push(i);
     }
     let groups: Vec<((&str, &str), Vec<usize>)> =
         groups.into_iter().filter(|(_, v)| v.len() >= 2).collect();
 
     groups
         .par_iter()
-        .flat_map_iter(|((kind, name), idxs)| {
-            if !is_body_kind(kind) {
-                let canons: Vec<String> = idxs.iter().map(|&i| defs[i].text.clone()).collect();
+        .flat_map_iter(|((_, name), idxs)| {
+            // All members of a `(kind.id, name)` group share a kind; any member's spec labels it.
+            let kind = defs[idxs[0]].kind;
+            if !kind.body {
+                let canons: Vec<String> = idxs.iter().map(|&i| defs[i].text_orig.clone()).collect();
                 let clusters = difflib_fast::cluster_canonicals(&canons, 0.0);
                 return clusters
                     .into_iter()
@@ -272,7 +274,7 @@ pub fn pass_name_gated(
                         };
                         Finding {
                             pass: "name",
-                            kind: (*kind).to_owned(),
+                            kind,
                             name: (*name).to_owned(),
                             severity,
                             min_sim: Some(min_sim),
@@ -287,7 +289,7 @@ pub fn pass_name_gated(
                     .collect::<Vec<_>>();
             }
             let canons: Vec<String> =
-                idxs.iter().map(|&i| canon_of[i].clone().unwrap_or_default()).collect();
+                idxs.iter().map(|&i| defs[i].cluster_canonical.clone().unwrap_or_default()).collect();
             difflib_fast::cluster_canonicals(&canons, threshold)
                 .into_iter()
                 .filter(|(c, _)| c.len() >= min_size)
@@ -296,7 +298,7 @@ pub fn pass_name_gated(
                     let args = c.iter().map(|&k| defs[idxs[k]].args).max().unwrap_or(0);
                     Finding {
                         pass: "name",
-                        kind: (*kind).to_owned(),
+                        kind,
                         name: (*name).to_owned(),
                         severity: if min_sim >= error { Severity::Error } else { Severity::Warning },
                         min_sim: Some(min_sim),
@@ -313,19 +315,16 @@ pub fn pass_name_gated(
         .collect()
 }
 
-/// Pass 2 — cross-name: functions with identical alpha-renamed canonicals but
+/// Pass 2 — cross-name: callables with identical alpha-renamed canonicals but
 /// ≥2 distinct names across ≥2 files.
 #[must_use]
-pub fn pass_cross_name(
-    defs: &[ModuleDef],
-    fn_idx: &[usize],
-    analyses: &[Option<AnalyzedFn>],
-    min_size: usize,
-) -> Vec<Finding> {
+pub fn pass_cross_name(defs: &[Def], min_size: usize) -> Vec<Finding> {
     let mut buckets: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-    for (p, a) in analyses.iter().enumerate() {
-        if let Some((_, xname, _, _)) = a {
-            buckets.entry(xname.as_str()).or_default().push(p);
+    for (i, d) in defs.iter().enumerate() {
+        if d.kind.fn_like {
+            if let Some(a) = &d.analysis {
+                buckets.entry(a.xname_canonical.as_str()).or_default().push(i);
+            }
         }
     }
     let mut out = Vec::new();
@@ -333,51 +332,44 @@ pub fn pass_cross_name(
         if ps.len() < min_size {
             continue;
         }
-        let names: BTreeSet<&str> = ps.iter().map(|&p| defs[fn_idx[p]].name.as_str()).collect();
+        let names: BTreeSet<&str> = ps.iter().map(|&p| defs[p].name.as_str()).collect();
         if names.len() < 2 {
             continue;
         }
-        let size = analyses[ps[0]].as_ref().map_or(0, |a| a.3);
-        let kind = if ps.iter().all(|&p| defs[fn_idx[p]].kind == "methods") {
-            "methods"
-        } else {
-            "functions"
-        };
-        let loc = ps.iter().map(|&p| defs[fn_idx[p]].loc).max().unwrap_or(0);
-        let args = ps.iter().map(|&p| defs[fn_idx[p]].args).max().unwrap_or(0);
+        let size = defs[ps[0]].analysis.as_ref().map_or(0, |a| a.size);
+        let kind = callable_kind(defs, &ps);
+        let loc = ps.iter().map(|&p| defs[p].loc).max().unwrap_or(0);
+        let args = ps.iter().map(|&p| defs[p].args).max().unwrap_or(0);
         out.push(Finding {
             pass: "cross-name",
-            kind: kind.to_owned(),
+            kind,
             name: names.iter().copied().collect::<Vec<_>>().join("/"),
             severity: if size >= SUBSTANCE_NODES { Severity::Error } else { Severity::Warning },
             min_sim: None,
             loc,
             args,
             thickness: thickness(loc, args, ps.len(), 1.0),
-            snippet: defs[fn_idx[ps[0]]].text_orig.clone(),
+            snippet: defs[ps[0]].text_orig.clone(),
             notes: Vec::new(),
-            members: ps.iter().map(|&p| member(defs, fn_idx[p])).collect(),
+            members: ps.iter().map(|&p| member(defs, p)).collect(),
         });
     }
     out
 }
 
-/// Pass 3 — Type-3 (`ECScan`): renamed near-copy functions via IDF-weighted
+/// Pass 3 — Type-3 (`ECScan`): renamed near-copy callables via IDF-weighted
 /// cosine over name-agnostic lines.
 #[must_use]
-pub fn pass_type3(
-    defs: &[ModuleDef],
-    fn_idx: &[usize],
-    analyses: &[Option<AnalyzedFn>],
-    theta: f64,
-) -> Vec<Finding> {
+pub fn pass_type3(defs: &[Def], theta: f64) -> Vec<Finding> {
     let (mut line_lists, mut names, mut def_of) = (Vec::new(), Vec::new(), Vec::new());
-    for (p, a) in analyses.iter().enumerate() {
-        if let Some((_, _, lines, _)) = a {
-            if lines.len() >= SHINGLE_LINES {
-                line_lists.push(lines.clone());
-                names.push(defs[fn_idx[p]].name.clone());
-                def_of.push(fn_idx[p]);
+    for (i, d) in defs.iter().enumerate() {
+        if d.kind.fn_like {
+            if let Some(a) = &d.analysis {
+                if a.type3_lines.len() >= SHINGLE_LINES {
+                    line_lists.push(a.type3_lines.clone());
+                    names.push(d.name.clone());
+                    def_of.push(i);
+                }
             }
         }
     }
@@ -391,16 +383,13 @@ pub fn pass_type3(
             if distinct.len() < 2 {
                 return None;
             }
-            let kind = if cluster.iter().all(|&c| defs[def_of[c]].kind == "methods") {
-                "methods"
-            } else {
-                "functions"
-            };
-            let loc = cluster.iter().map(|&c| defs[def_of[c]].loc).max().unwrap_or(0);
-            let args = cluster.iter().map(|&c| defs[def_of[c]].args).max().unwrap_or(0);
+            let members: Vec<usize> = cluster.iter().map(|&c| def_of[c]).collect();
+            let kind = callable_kind(defs, &members);
+            let loc = members.iter().map(|&i| defs[i].loc).max().unwrap_or(0);
+            let args = members.iter().map(|&i| defs[i].args).max().unwrap_or(0);
             Some(Finding {
                 pass: "type-3",
-                kind: kind.to_owned(),
+                kind,
                 name: distinct.iter().copied().collect::<Vec<_>>().join("/"),
                 severity: if min_sim >= TYPE3_ERROR_THETA { Severity::Error } else { Severity::Warning },
                 min_sim: Some(min_sim),
@@ -409,33 +398,10 @@ pub fn pass_type3(
                 thickness: thickness(loc, args, cluster.len(), min_sim),
                 snippet: defs[def_of[cluster[0]]].text_orig.clone(),
                 notes: Vec::new(),
-                members: cluster.iter().map(|&c| member(defs, def_of[c])).collect(),
+                members: members.iter().map(|&i| member(defs, i)).collect(),
             })
         })
         .collect()
-}
-
-// ── Section index (for stable, reproducible cluster sort) ──────────────────
-
-/// Printed-section index — functions come first by pass, then methods by pass
-/// (same three-pass order), then classes, interfaces (TS-only kind, slotted
-/// right after classes since both are body-bearing nominal types),
-/// type-aliases.
-#[must_use]
-pub fn section_index(f: &Finding) -> usize {
-    match (f.kind.as_str(), f.pass) {
-        ("constants", _) => 0,
-        ("functions", "name") => 1,
-        ("functions", "cross-name") => 2,
-        ("functions", "type-3") => 3,
-        ("methods", "name") => 4,
-        ("methods", "cross-name") => 5,
-        ("methods", "type-3") => 6,
-        ("classes", _) => 7,
-        ("interfaces", _) => 8,
-        ("type-aliases", _) => 9,
-        _ => 10,
-    }
 }
 
 // ── Pipeline orchestration ────────────────────────────────────────────────
@@ -461,13 +427,8 @@ pub struct PipelineOpts {
     /// Escalate non-ERROR clusters whose `thickness` ≥ this to ERROR. Applied
     /// after the de-escalation knobs (default `0.0` = off).
     pub escalate_thickness: f64,
-    /// Restrict to a specific subset of definition kinds (functions / methods /
-    /// classes / interfaces / constants / type-aliases). `None` = all.
+    /// Restrict to a specific subset of definition kinds, by `KindSpec::id`. `None` = all.
     pub kinds: Option<Vec<String>>,
-    /// Scan Python files (default `true`).
-    pub scan_py: bool,
-    /// Scan TypeScript files (default `true`).
-    pub scan_ts: bool,
     /// Skip the cross-name pass (default `false`).
     pub no_cross_name: bool,
     /// Skip the Type-3 pass (default `false`).
@@ -488,8 +449,6 @@ impl PipelineOpts {
             warning_thickness: 0.0,
             escalate_thickness: 0.0,
             kinds: None,
-            scan_py: true,
-            scan_ts: true,
             no_cross_name: false,
             no_type3: false,
         }
@@ -498,47 +457,32 @@ impl PipelineOpts {
 
 /// Run the whole detection pipeline end-to-end:
 ///
-/// 1. Walk `paths` for `.py` (if `scan_py`) and `.ts`/`.tsx`/`.mts`/`.cts`
-///    (if `scan_ts`) and parse each via py-canon / ts-canon.
-/// 2. Compute the names-preserved cluster canonical for every body-kind def
-///    (rayon-parallel).
-/// 3. Run name-gated, cross-name (unless `no_cross_name`), and Type-3 (unless
-///    `no_type3`) passes.
-/// 4. Apply `error_thickness` / `warning_thickness` demotion and
+/// 1. Walk `paths` once and scan every file via the matching `frontend` (single parse per file;
+///    canon precomputed inside `scan`).
+/// 2. Run name-gated, cross-name (unless `no_cross_name`), and Type-3 (unless
+///    `no_type3`) passes over the resulting `Def`s.
+/// 3. Apply `error_thickness` / `warning_thickness` demotion and
 ///    `escalate_thickness` escalation, if any is non-zero.
 ///
 /// Returns the unsorted findings. The caller sorts (typically by
 /// [`section_index`] + name + first member) and renders.
 #[must_use]
-pub fn scan_and_cluster(opts: &PipelineOpts) -> Vec<Finding> {
-    let py_files = if opts.scan_py { collect_py_files(&opts.paths) } else { Vec::new() };
-    let ts_files = if opts.scan_ts { collect_ts_files(&opts.paths) } else { Vec::new() };
-    let mut defs = py_canon::find_module_defs(&py_files);
-    defs.extend(ts_canon::find_module_defs(&ts_files));
+pub fn scan_and_cluster(opts: &PipelineOpts, frontends: &[&dyn Frontend]) -> Vec<Finding> {
+    let mut defs = collect_defs(frontends, &opts.paths);
     if let Some(kinds) = &opts.kinds {
-        defs.retain(|d| kinds.iter().any(|k| k == &d.kind));
+        defs.retain(|d| kinds.iter().any(|k| k == d.kind.id));
     }
-    defs.sort_by(|a, b| (&a.file, a.line, a.col).cmp(&(&b.file, b.line, b.col)));
-
-    let body_idx: Vec<usize> = (0..defs.len()).filter(|&i| is_body_kind(&defs[i].kind)).collect();
-    let body_canon: Vec<String> =
-        body_idx.par_iter().map(|&i| cluster_canonical_for(&defs[i])).collect();
-    let mut canon_of: Vec<Option<String>> = vec![None; defs.len()];
-    for (k, &i) in body_idx.iter().enumerate() {
-        canon_of[i] = Some(body_canon[k].clone());
-    }
-
-    let fn_idx: Vec<usize> = (0..defs.len()).filter(|&i| is_fn_like(&defs[i].kind)).collect();
-    let analyses: Vec<Option<AnalyzedFn>> =
-        fn_idx.par_iter().map(|&i| analyze_for(&defs[i])).collect();
+    defs.sort_by(|a, b| {
+        (a.file.as_ref(), a.line, a.col).cmp(&(b.file.as_ref(), b.line, b.col))
+    });
 
     let mut findings =
-        pass_name_gated(&defs, &canon_of, opts.threshold, opts.error_threshold, opts.min_size);
+        pass_name_gated(&defs, opts.threshold, opts.error_threshold, opts.min_size);
     if !opts.no_cross_name {
-        findings.extend(pass_cross_name(&defs, &fn_idx, &analyses, opts.min_size));
+        findings.extend(pass_cross_name(&defs, opts.min_size));
     }
     if !opts.no_type3 {
-        findings.extend(pass_type3(&defs, &fn_idx, &analyses, opts.type3_theta));
+        findings.extend(pass_type3(&defs, opts.type3_theta));
     }
 
     if opts.error_thickness > 0.0 {

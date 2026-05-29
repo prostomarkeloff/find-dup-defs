@@ -1,0 +1,56 @@
+--- duplicate constants (cross-file, by name) ---
+DUPLICATE CONSTANT [ERROR]: DEFAULT_TIMEOUT  [ast sim 1.00, T=0.22, n=2, loc=1]
+  ts/core_a.ts:2
+  ts/core_b.ts:2
+
+DUPLICATE CONSTANT [ERROR]: MAX_RETRIES  [ast sim 1.00, T=0.22, n=2, loc=1]
+  ts/core_a.ts:1
+  ts/core_b.ts:1
+
+
+--- duplicate functions (cross-file, AST sim warn=0.5 error=0.85) ---
+DUPLICATE FUNCTION [ERROR]: computeScore  [ast sim 1.00, T=0.38, n=2, loc=7, args=2]
+  ts/core_a.ts:12
+  ts/core_b.ts:12
+
+DUPLICATE FUNCTION [ERROR]: renderBadge  [ast sim 1.00, T=0.34, n=2, loc=5, args=2]
+  ts/widget_a.tsx:1
+  ts/widget_b.tsx:1
+
+
+--- duplicate functions (cross-name, exact AST-normalized) ---
+DUPLICATE FUNCTION [WARNING]: addNumbers/plusNumbers  [normalized-exact, T=0.32, n=2, loc=4, args=2]
+  ts/core_a.ts:20
+  ts/core_b.ts:20
+
+
+--- duplicate functions (cross-name Type-3, IDF-weighted cosine) ---
+
+--- duplicate methods (cross-file, AST sim warn=0.5 error=0.85) ---
+DUPLICATE METHOD [ERROR]: Repository.fetchItem  [ast sim 1.00, T=0.36, n=2, loc=7, args=1]
+  ts/core_a.ts:26
+  ts/core_b.ts:26
+
+
+--- duplicate methods (cross-name, exact AST-normalized) ---
+
+--- duplicate methods (cross-name Type-3, IDF-weighted cosine) ---
+
+--- duplicate classes (cross-file, AST sim warn=0.5 error=0.85) ---
+DUPLICATE CLASS [ERROR]: Repository  [ast sim 1.00, T=0.38, n=2, loc=9]
+  ts/core_a.ts:25
+  ts/core_b.ts:25
+
+
+--- duplicate interfaces (cross-file, AST sim warn=0.5 error=0.85) ---
+DUPLICATE INTERFACE [ERROR]: Repo  [ast sim 1.00, T=0.31, n=2, loc=5]
+  ts/core_a.ts:6
+  ts/core_b.ts:6
+
+
+--- duplicate type aliases (cross-file, by name) ---
+DUPLICATE TYPE_ALIAS [ERROR]: UserIds  [ast sim 1.00, T=0.22, n=2, loc=1]
+  ts/core_a.ts:4
+  ts/core_b.ts:4
+
+# summary: 8 ERROR, 1 WARNING groups

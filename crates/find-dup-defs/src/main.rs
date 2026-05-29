@@ -9,6 +9,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use dup_defs_core::{Frontend, KindSpec};
 use find_dup_defs::{Finding, PipelineOpts, Severity, scan_and_cluster, section_index};
 use serde::Serialize;
 
@@ -146,7 +147,7 @@ struct Directive {
 impl Directive {
     fn matches(&self, f: &Finding) -> bool {
         if let Some(k) = self.kind {
-            if f.kind != k {
+            if f.kind.id != k {
                 return false;
             }
         }
@@ -355,27 +356,31 @@ fn expand_braces(pat: &str) -> Vec<String> {
     out
 }
 
-use find_dup_defs::KNOWN_LANGS;
-
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn main() {
     let cli = Cli::parse();
-    // `--only` validation + scan-flag derivation. Unknown codes are an error (exit 2) rather
+    // Frontend registry — the binary is the composition root that knows every language; the
+    // engine itself is frontend-agnostic. Bound to locals so the `&dyn Frontend` refs outlive
+    // the whole run.
+    let (py, ts) = (py_canon::Python, ts_canon::TypeScript);
+    let registry: Vec<&dyn Frontend> = vec![&py, &ts];
+    // `--only` selects a subset by language code. Unknown codes are an error (exit 2) rather
     // than a silent no-op — a typo'd `--only py,rs` should fail loud so a CI job that meant to
     // include Rust doesn't ship an empty report.
-    let (scan_py, scan_ts) = match &cli.only {
-        None => (true, true),
+    let selected: Vec<&dyn Frontend> = match &cli.only {
+        None => registry.clone(),
         Some(codes) => {
             for code in codes {
-                if !KNOWN_LANGS.contains(&code.as_str()) {
+                if !registry.iter().any(|f| f.lang() == code) {
+                    let known: Vec<&str> = registry.iter().map(|f| f.lang()).collect();
                     eprintln!(
                         "find-dup-defs: unknown language code {code:?} for --only (known: {})",
-                        KNOWN_LANGS.join(", ")
+                        known.join(", ")
                     );
                     std::process::exit(2);
                 }
             }
-            (codes.iter().any(|s| s == "py"), codes.iter().any(|s| s == "ts"))
+            registry.iter().copied().filter(|f| codes.iter().any(|c| c == f.lang())).collect()
         }
     };
     // The whole detection pipeline — file walk, parse, 3 passes, thickness
@@ -390,12 +395,10 @@ fn main() {
         warning_thickness: cli.warning_thickness,
         escalate_thickness: cli.escalate_thickness,
         kinds: cli.kinds.clone(),
-        scan_py,
-        scan_ts,
         no_cross_name: cli.no_cross_name,
         no_type3: cli.no_type3,
     };
-    let mut findings = scan_and_cluster(&opts);
+    let mut findings = scan_and_cluster(&opts, &selected);
     // User-authored directives (the manual override layer). Parsed once; mismatched action /
     // kind tokens fail loud with exit-2 so a typo in CI doesn't silently keep emitting errors.
     let directives: Vec<Directive> = cli
@@ -485,7 +488,7 @@ fn main() {
         } else {
             findings.iter().filter(|f| f.severity != Severity::Info).cloned().collect()
         };
-        format_report(&visible, cli.threshold, cli.error_threshold, &cli.repo_root)
+        format_report(&visible, &selected, cli.threshold, cli.error_threshold, &cli.repo_root)
     };
     print!("{report}");
 
@@ -1060,7 +1063,7 @@ fn infer_directives(findings: &[Finding], repo_root: &Path) -> Vec<InferredDirec
     if let Some(s) = build_suggestion(
         findings,
         |f| {
-            f.kind == "constants" && {
+            f.kind.id == "constants" && {
                 // Majority-in-locale heuristic — Django-style codebases have one canonical
                 // declaration in `global_settings.py` plus the per-locale overrides; requiring
                 // ALL members in locale paths would miss exactly that legit case.
@@ -1320,19 +1323,6 @@ fn format_calibration(errs: &[&Finding], warns: &[&Finding], all: &[Finding], re
 
 // ───────────────────────── report (identical to the Python reference) ─────────────────────────
 
-/// Report label for a kind — `DupKind.value` in the reference (uppercase, singular).
-fn dup_kind(kind: &str) -> &'static str {
-    match kind {
-        "functions" => "FUNCTION",
-        "methods" => "METHOD",
-        "classes" => "CLASS",
-        "interfaces" => "INTERFACE",
-        "constants" => "CONSTANT",
-        "type-aliases" => "TYPE_ALIAS",
-        _ => "UNKNOWN",
-    }
-}
-
 /// A group is "cross-name" when found by a name-agnostic pass (renamed copy-paste).
 fn is_cross_name(pass: &str) -> bool {
     pass == "cross-name" || pass == "type-3"
@@ -1377,30 +1367,48 @@ fn group_suffix(f: &Finding) -> String {
     }
 }
 
-/// Human-readable per-section report — byte-for-byte the Python `format_report`.
-fn format_report(findings: &[Finding], warn: f64, error: f64, repo_root: &Path) -> String {
+/// Build the ordered report sections `(section_index, header)` for the active frontends. Each
+/// kind contributes its name-pass section (`cross-file, {sim}` for body kinds, `cross-file, by
+/// name` for raw-text kinds) plus, for callables, its cross-name and Type-3 sections. The list
+/// is the union of the selected frontends' kinds, deduped by `id` and sorted by section index —
+/// so the default run reproduces the historical 10-section layout, while `--only py` prints only
+/// Python's sections (no empty `interfaces`).
+fn report_sections(frontends: &[&dyn Frontend], warn: f64, error: f64) -> Vec<(usize, String)> {
     let sim = format!("AST sim warn={warn} error={error}");
-    let sections: [(String, usize); 10] = [
-        ("duplicate constants (cross-file, by name)".to_owned(), 0),
-        (format!("duplicate functions (cross-file, {sim})"), 1),
-        ("duplicate functions (cross-name, exact AST-normalized)".to_owned(), 2),
-        ("duplicate functions (cross-name Type-3, IDF-weighted cosine)".to_owned(), 3),
-        (format!("duplicate methods (cross-file, {sim})"), 4),
-        ("duplicate methods (cross-name, exact AST-normalized)".to_owned(), 5),
-        ("duplicate methods (cross-name Type-3, IDF-weighted cosine)".to_owned(), 6),
-        (format!("duplicate classes (cross-file, {sim})"), 7),
-        (format!("duplicate interfaces (cross-file, {sim})"), 8),
-        ("duplicate type aliases (cross-file, by name)".to_owned(), 9),
-    ];
+    let mut kinds: Vec<&'static KindSpec> = Vec::new();
+    for f in frontends {
+        for &k in f.kinds() {
+            if !kinds.iter().any(|e| e.id == k.id) {
+                kinds.push(k);
+            }
+        }
+    }
+    let mut rows: Vec<(usize, String)> = Vec::new();
+    for k in kinds {
+        let base = k.section as usize;
+        let name_desc = if k.body { format!("cross-file, {sim}") } else { "cross-file, by name".to_owned() };
+        rows.push((base, format!("duplicate {} ({name_desc})", k.noun_plural)));
+        if k.fn_like {
+            rows.push((base + 1, format!("duplicate {} (cross-name, exact AST-normalized)", k.noun_plural)));
+            rows.push((base + 2, format!("duplicate {} (cross-name Type-3, IDF-weighted cosine)", k.noun_plural)));
+        }
+    }
+    rows.sort_by_key(|(idx, _)| *idx);
+    rows
+}
+
+/// Human-readable per-section report — byte-for-byte the Python `format_report`.
+fn format_report(findings: &[Finding], frontends: &[&dyn Frontend], warn: f64, error: f64, repo_root: &Path) -> String {
+    let sections = report_sections(frontends, warn, error);
 
     let mut lines: Vec<String> = Vec::new();
-    for (index, (header, sect)) in sections.iter().enumerate() {
+    for (index, (sect, header)) in sections.iter().enumerate() {
         if index > 0 {
             lines.push(String::new());
         }
         lines.push(format!("--- {header} ---"));
         for f in findings.iter().filter(|&f| section_index(f) == *sect) {
-            lines.push(format!("DUPLICATE {} [{}]: {}{}", dup_kind(&f.kind), f.severity.label(), f.name, group_suffix(f)));
+            lines.push(format!("DUPLICATE {} [{}]: {}{}", f.kind.label, f.severity.label(), f.name, group_suffix(f)));
             for (file, line, _col) in &f.members {
                 lines.push(format!("  {}:{}", short_path(file, repo_root), line));
             }
@@ -1454,9 +1462,9 @@ fn render_json(findings: &[Finding], repo_root: &Path) -> String {
         .iter()
         .map(|f| {
             let cross = is_cross_name(f.pass);
-            let rule = if cross { "dup-xname".to_owned() } else { format!("dup-{}", dup_kind(&f.kind).to_ascii_lowercase()) };
+            let rule = if cross { "dup-xname".to_owned() } else { format!("dup-{}", f.kind.label.to_ascii_lowercase()) };
             JsonGroup {
-                kind: dup_kind(&f.kind).to_owned(),
+                kind: f.kind.label.to_owned(),
                 name: f.name.clone(),
                 severity: f.severity.label().to_owned(),
                 min_sim: f.min_sim,
