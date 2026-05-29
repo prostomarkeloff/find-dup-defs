@@ -405,14 +405,15 @@ Four crates, each useful on its own:
 
 | crate | role |
 |---|---|
-| [`find-dup-defs`](crates/find-dup-defs) | CLI — three passes, severity, directives, calibration, reports |
-| [`dup-defs-core`](crates/dup-defs-core) | **Shared types** — `ModuleDef` / `AnalyzedFn` / `LineMap` / `Language`. Both frontends emit these; the engine dispatches by `Language` tag. |
+| [`find-dup-defs`](crates/find-dup-defs) | Engine + CLI — three passes, severity, directives, calibration, reports. Frontend-agnostic: clusters a `Vec<Def>` and never names a language crate. |
+| [`dup-defs-core`](crates/dup-defs-core) | **Engine contract** — `Def` / `KindSpec` / `Analysis` / the `Frontend` trait (+ `LineMap`). Each frontend declares its own open kind vocabulary and lowers definitions to `Def` with canon precomputed. |
 | [`py-canon`](crates/py-canon) | **Python frontend** — Ruff parse → `ast.dump`-shape canonical + def scan |
 | [`ts-canon`](crates/ts-canon) | **TypeScript frontend** — oxc parse → s-expr canonical + def scan |
 
-Adding a new language is one more frontend crate that implements the `find_module_defs` /
-`ast_canonical_many` / `analyze_functions` triplet against `dup-defs-core` types. The similarity
-engine is the exact Ratcliff–Obershelp port [`difflib-fast`](https://github.com/prostomarkeloff/difflib-fast).
+Adding a new language is one more frontend crate that implements the `Frontend` trait against
+`dup-defs-core` (`scan` → `Vec<Def>`, each definition's canonical strings precomputed in the
+single parse) — no engine changes. The similarity engine is the exact Ratcliff–Obershelp port
+[`difflib-fast`](https://github.com/prostomarkeloff/difflib-fast).
 
 ---
 

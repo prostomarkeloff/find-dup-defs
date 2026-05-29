@@ -1,7 +1,7 @@
 //! Module-level definition scan for TypeScript — the "find-*" step of `find-dup-defs`,
 //! parallel + native, mirroring `py-canon::defs` over [`oxc_parser`].
 //!
-//! Surfaces these top-level kinds, each tagged with [`Language::TypeScript`]:
+//! Surfaces these top-level kinds (the frontend lowers each to the engine's `Def`):
 //!
 //! * **`functions`** — `function foo()` / `async function`, plus module-level `const foo =
 //!   (...) => {}` / `const foo = function(){}` (arrow / function-expression assigned to a `const`
@@ -27,7 +27,7 @@
 use std::fs;
 use std::path::Path;
 
-use dup_defs_core::{Language, LineMap, ModuleDef};
+use dup_defs_core::{LineMap, ModuleDef};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BindingPattern, Class, ClassElement, Declaration, Decorator, ExportDefaultDeclarationKind,
@@ -163,7 +163,6 @@ fn function_def(f: &Function<'_>, source: &str, lines: &LineMap, file: &str) -> 
         text_orig: text,
         loc,
         args: count_args(&f.params),
-        lang: Language::TypeScript,
     })
 }
 
@@ -184,7 +183,6 @@ fn class_def(c: &Class<'_>, source: &str, lines: &LineMap, file: &str) -> Option
         text_orig: text,
         loc,
         args: 0,
-        lang: Language::TypeScript,
     })
 }
 
@@ -209,7 +207,6 @@ fn type_alias_def(
         text_orig: text,
         loc,
         args: 0,
-        lang: Language::TypeScript,
     })
 }
 
@@ -234,7 +231,6 @@ fn interface_def(
         text_orig: text,
         loc,
         args: 0,
-        lang: Language::TypeScript,
     })
 }
 
@@ -278,7 +274,6 @@ fn variable_decls(
                     text_orig: text,
                     loc,
                     args: count_args(&arrow.params),
-                    lang: Language::TypeScript,
                 });
             }
             Expression::FunctionExpression(fexpr) => {
@@ -299,7 +294,6 @@ fn variable_decls(
                     text_orig: text,
                     loc,
                     args: count_args(&fexpr.params),
-                    lang: Language::TypeScript,
                 });
             }
             _ if is_const && is_upper_snake(&name) => {
@@ -317,7 +311,6 @@ fn variable_decls(
                     text_orig: text,
                     loc,
                     args: 0,
-                    lang: Language::TypeScript,
                 });
             }
             _ => {}
@@ -387,7 +380,6 @@ fn class_method_defs(
                 text_orig: text,
                 loc,
                 args,
-                lang: Language::TypeScript,
             });
         }
     }

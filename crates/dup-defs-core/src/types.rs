@@ -1,48 +1,28 @@
-//! Definition records and analysis tuple shared by every frontend.
+//! The frontend↔engine contract, plus the frontends' shared extraction intermediate.
 //!
-//! Two generations of the frontend↔engine contract live here side by side during the
-//! migration to the [`Frontend`] trait:
-//!
-//! * **New ([`Def`] / [`KindSpec`] / [`Analysis`] / [`Frontend`]).** A frontend parses each
-//!   file once, classifies its definitions, and lowers each to a [`Def`] — a flat *feature
-//!   record* carrying the precomputed canonical strings the clustering engine consumes. The
-//!   engine never sees a frontend's rich per-language representation and never matches on a
+//! * **Engine contract — [`Def`] / [`KindSpec`] / [`Analysis`] / [`Frontend`].** A frontend
+//!   parses each file once, classifies its definitions, and lowers each to a [`Def`] — a flat
+//!   *feature record* carrying the precomputed canonical strings the clustering engine consumes.
+//!   The engine never sees a frontend's rich per-language representation and never matches on a
 //!   fixed kind vocabulary: each frontend declares its own kinds as `&'static` [`KindSpec`]s.
-//! * **Old ([`ModuleDef`] / [`AnalyzedFn`] / [`Language`]).** The pre-trait shape, where the
-//!   engine held `Vec<ModuleDef>` and dispatched canonicalization back to a frontend by the
-//!   [`ModuleDef::lang`] tag. Retained until every frontend and the engine are ported, then
-//!   removed.
+//! * **Extraction intermediate — [`ModuleDef`] / [`AnalyzedFn`].** The shape each `*-canon`
+//!   crate's scan builds before lowering to [`Def`]. NOT part of the engine contract; kept here
+//!   because both the Python and TypeScript frontends share the identical intermediate.
 
 use std::sync::Arc;
 
-/// Source language of a [`ModuleDef`]. Stamped by the frontend during extraction so the engine
-/// can route canonicalization back to the right per-language implementation without re-deriving
-/// from the file extension. Default = [`Language::Python`] so existing JSON dumps and
-/// `ModuleDef`-typed APIs created before the multi-language split still deserialize cleanly.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum Language {
-    #[default]
-    #[serde(rename = "python")]
-    Python,
-    #[serde(rename = "typescript")]
-    TypeScript,
-}
-
-/// One module-level definition found by a frontend scan (kind = `functions` / `classes` /
-/// `constants` / `type-aliases` / `interfaces` / `methods`; `line`/`col` 0-indexed). `loc` and
-/// `args` are "how fat is this" signals surfaced in the dup-defs report so a user reading a flat
-/// list of clusters can immediately tell a 50-line copy-paste from a 3-liner. `loc` is the count
-/// of non-blank lines in the def's original source text (including the signature line); `args`
-/// is the parameter count for functions/methods (including a `self`/`cls` receiver in Python or
-/// a `this` parameter in TypeScript — the count the user actually typed) and `0` for
-/// non-callable kinds. For methods, `loc` reflects the **original** source, NOT the
-/// post-receiver-strip text — the user is looking up code they wrote, not the synthetic form
-/// the canonicalizer ingests.
+/// One module-level definition produced by a frontend's extraction pass — the shared
+/// **intermediate** each `*-canon` crate builds before lowering to a [`Def`]. `kind` uses the
+/// frontend's own string vocabulary (`functions` / `methods` / `classes` / …); `line`/`col` are
+/// 0-indexed. `loc` and `args` are "how fat is this" signals: `loc` counts non-blank lines of
+/// the **original** source (for methods, NOT the receiver-stripped form); `args` is the
+/// user-visible parameter count (including a `self`/`cls` receiver in Python) and `0` for
+/// non-callable kinds.
 ///
-/// `text` is the canonicalization-input form (post-`self`/`cls`/`this`-strip for methods);
-/// `text_orig` is what the user actually wrote and is used for snippet display (calibration
-/// view, etc). For every kind other than `methods` the two are identical clones.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// `text` is the canonicalization input (receiver-stripped for Python methods); `text_orig` is
+/// what the user actually wrote, used for snippet display. For every kind other than Python
+/// methods the two are identical clones. Not engine-facing — the engine consumes [`Def`].
+#[derive(Clone, Debug)]
 pub struct ModuleDef {
     pub kind: String,
     pub name: String,
@@ -50,16 +30,9 @@ pub struct ModuleDef {
     pub line: usize,
     pub col: usize,
     pub text: String,
-    #[serde(default)]
     pub text_orig: String,
-    #[serde(default)]
     pub loc: usize,
-    #[serde(default)]
     pub args: usize,
-    /// Source language — drives engine-side dispatch of per-language canonicalization. Defaults
-    /// to [`Language::Python`] for backward compatibility with pre-multi-language JSON dumps.
-    #[serde(default)]
-    pub lang: Language,
 }
 
 /// Full dup-defs analysis of one callable definition:

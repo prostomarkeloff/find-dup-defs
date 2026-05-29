@@ -12,8 +12,5 @@ authors.workspace = true
 [lib]
 name = "dup_defs_core"
 
-[dependencies]
-serde = { version = "1", features = ["derive"] }
-
 [lints]
 workspace = true
