@@ -1,15 +1,15 @@
-//! `ts-canon` — TypeScript frontend for `find-dup-defs`. Mirrors `py-canon`'s contract over
-//! [`oxc_parser`]: file walking + module-level definition scan (`.ts` / `.tsx` / `.mts` / `.cts`)
-//! plus a structural canonicalization of each definition's source. The same shapes
-//! ([`ModuleDef`], [`AnalyzedFn`]) feed the engine's three duplicate-detection passes uniformly.
+//! `ts-canon` — the TypeScript [`Frontend`](dup_defs_core::Frontend) for `find-dup-defs`, over
+//! [`oxc_parser`]. [`TypeScript`] scans `.ts` / `.tsx` / `.mts` / `.cts` files and lowers every
+//! definition to a [`Def`](dup_defs_core::Def) with a structural s-expr canonical precomputed.
+//! [`ast_canonical`] / [`analyze_functions`] expose that canonicalization over a source string;
+//! [`AnalyzedFn`] is the supporting analysis tuple.
 
 mod canon;
 mod defs;
 mod frontend;
 
-pub use canon::{analyze_functions, ast_canonical, ast_canonical_many};
-pub use defs::find_module_defs;
-pub use dup_defs_core::{AnalyzedFn, LineMap, ModuleDef};
+pub use canon::{analyze_functions, ast_canonical, ast_canonical_many, AnalyzedFn};
+pub use dup_defs_core::LineMap;
 pub use frontend::{TypeScript, CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
 
 #[cfg(test)]

@@ -1,26 +1,34 @@
 //! Cross-check: the function canonicals this (ported) crate produces must match, byte-for-byte, the
 //! golden corpus dumped by the original iilint `canon.rs` (same source, pyo3 stripped). Validates the
-//! port didn't change canonicalization.
+//! port didn't change canonicalization — and, since the scan now canonicalizes functions off the AST
+//! node (no re-parse), that the node-based path equals the original text-based golden.
 //!
 //! Usage: `cargo run --release --example verify_golden -- <repo_dir> <golden.canon.bin>`
-use py_canon::{ast_canonical_many, find_module_defs};
+use std::sync::Arc;
+
+use dup_defs_core::Frontend;
+use py_canon::Python;
 use walkdir::WalkDir;
 
 fn main() {
     let repo = std::env::args().nth(1).expect("usage: verify_golden <repo_dir> <golden.canon.bin>");
     let golden_path = std::env::args().nth(2).expect("usage: verify_golden <repo_dir> <golden.canon.bin>");
 
-    let mut files: Vec<String> = WalkDir::new(&repo)
+    let mut files: Vec<Arc<str>> = WalkDir::new(&repo)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|x| x == "py"))
-        .map(|e| e.path().to_string_lossy().into_owned())
+        .map(|e| Arc::from(e.path().to_string_lossy().as_ref()))
         .collect();
     files.sort();
 
-    let defs = find_module_defs(&files);
-    let texts: Vec<String> = defs.iter().filter(|d| d.kind == "functions").map(|d| d.text.clone()).collect();
-    let mut canon: Vec<String> = ast_canonical_many(&texts).into_iter().filter(|c| !c.is_empty()).collect();
+    let defs = Python.scan(&files);
+    let mut canon: Vec<String> = defs
+        .iter()
+        .filter(|d| d.kind.id == "functions")
+        .filter_map(|d| d.cluster_canonical.clone())
+        .filter(|c| !c.is_empty())
+        .collect();
 
     let golden_bytes = std::fs::read(&golden_path).expect("read golden");
     let mut golden: Vec<String> = golden_bytes

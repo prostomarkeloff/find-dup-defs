@@ -1,6 +1,13 @@
 //! Module-level definition scan for TypeScript — the "find-*" step of `find-dup-defs`,
 //! parallel + native, mirroring `py-canon::defs` over [`oxc_parser`].
 //!
+//! Walks each file's oxc AST **once** and lowers every definition straight to the engine's
+//! [`Def`], with its canonical strings precomputed. Unlike `py-canon`, the canonical is computed
+//! by re-parsing the def's source slice (TypeScript method slices and `.tsx`/JSX bodies parse
+//! differently as the in-file node vs. a standalone slice, so a node-based canon would diverge);
+//! for `fn_like` defs the cluster canonical is taken from the same single `analyze_functions`
+//! call, so a function costs one re-parse rather than two.
+//!
 //! Surfaces these top-level kinds (the frontend lowers each to the engine's `Def`):
 //!
 //! * **`functions`** — `function foo()` / `async function`, plus module-level `const foo =
@@ -20,14 +27,14 @@
 //! surfaced, with its own decorator-stripped text and span — keeping the canonical comparable
 //! across `function foo()` and `export function foo()`.
 #![allow(
-    clippy::unnecessary_wraps, // type_alias_def / interface_def return Option<ModuleDef> for call-site symmetry with function_def / class_def (which DO conditionally return None); the symmetry pays for the lint.
+    clippy::unnecessary_wraps, // type_alias_def / interface_def return Option<Def> for call-site symmetry with function_def / class_def (which DO conditionally return None); the symmetry pays for the lint.
     clippy::needless_raw_string_hashes, // test-fixture raw strings keep `r#"..."#` for visual consistency; some contain `"` literals and need the hashes anyway.
 )]
 
-use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
-use dup_defs_core::{LineMap, ModuleDef};
+use dup_defs_core::{Analysis, Def, KindSpec, LineMap};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BindingPattern, Class, ClassElement, Declaration, Decorator, ExportDefaultDeclarationKind,
@@ -37,7 +44,9 @@ use oxc_ast::ast::{
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
-use rayon::prelude::*;
+
+use crate::canon::{analyze_functions, ast_canonical};
+use crate::frontend::{CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
 
 #[inline]
 fn u(x: u32) -> usize {
@@ -134,104 +143,88 @@ fn is_trivial_function_body(body: Option<&FunctionBody<'_>>) -> bool {
     })
 }
 
-/// `text_orig` slice + non-blank-line count for the def's user-visible source.
-fn slice_text(source: &str, start: usize, end: usize) -> (String, usize) {
+/// Precompute the canonical strings from a def's source slice. Non-body kinds (constants /
+/// type-aliases) carry no canonical — the engine clusters them on `text_orig`. For `fn_like`
+/// defs the cluster canonical is taken from the `analyze_functions` tuple (`.0`, identical to
+/// `ast_canonical`), so a function re-parses once instead of twice; class methods (whose slice
+/// doesn't re-parse as a standalone function) and non-callable body kinds fall back to
+/// `ast_canonical`.
+fn canon_for(kind: &KindSpec, text: &str) -> (Option<String>, Option<Analysis>) {
+    if !kind.body {
+        return (None, None);
+    }
+    if kind.fn_like {
+        match analyze_functions(&[text.to_owned()]).into_iter().next().flatten() {
+            Some((cc, xname, lines, size)) => {
+                (Some(cc), Some(Analysis { xname_canonical: xname, type3_lines: lines, size }))
+            }
+            None => (Some(ast_canonical(text)), None),
+        }
+    } else {
+        (Some(ast_canonical(text)), None)
+    }
+}
+
+/// Build a [`Def`] for the definition spanning `source[start..end]` (TypeScript has no receiver
+/// strip, so the canon input equals `text_orig`).
+fn build_def(
+    kind: &'static KindSpec,
+    name: String,
+    file: &Arc<str>,
+    lines: &LineMap,
+    source: &str,
+    (start, end): (usize, usize),
+    args: usize,
+) -> Def {
     let text = source[start..end].to_owned();
     let loc = count_loc(&text);
-    (text, loc)
+    let (line, col) = lines.loc0(start);
+    let (cluster_canonical, analysis) = canon_for(kind, &text);
+    Def {
+        lang: "ts",
+        kind,
+        name,
+        file: Arc::clone(file),
+        line,
+        col,
+        loc,
+        args,
+        text_orig: text,
+        cluster_canonical,
+        analysis,
+    }
 }
 
 // ─────────────────────────── per-kind extractors ───────────────────────────
 
 /// `function foo(...) { ... }` — top-level. Returns `None` for trivial-body / anonymous fns.
-fn function_def(f: &Function<'_>, source: &str, lines: &LineMap, file: &str) -> Option<ModuleDef> {
+fn function_def(f: &Function<'_>, source: &str, lines: &LineMap, file: &Arc<str>) -> Option<Def> {
     let id = f.id.as_ref()?;
     if is_trivial_function_body(f.body.as_deref()) {
         return None;
     }
-    let start = u(f.span.start);
-    let end = u(f.span.end);
-    let (text, loc) = slice_text(source, start, end);
-    let (line, col) = lines.loc0(start);
-    Some(ModuleDef {
-        kind: "functions".to_owned(),
-        name: id.name.to_string(),
-        file: file.to_owned(),
-        line,
-        col,
-        text: text.clone(),
-        text_orig: text,
-        loc,
-        args: count_args(&f.params),
-    })
+    let (start, end) = (u(f.span.start), u(f.span.end));
+    Some(build_def(&FUNCTIONS, id.name.to_string(), file, lines, source, (start, end), count_args(&f.params)))
 }
 
 /// A class declaration as a whole — `class Foo { ... }`, decorators excluded.
-fn class_def(c: &Class<'_>, source: &str, lines: &LineMap, file: &str) -> Option<ModuleDef> {
+fn class_def(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>) -> Option<Def> {
     let id = c.id.as_ref()?;
     let start = keyword_start(source, u(c.span.start), last_decorator_end(&c.decorators));
     let end = u(c.span.end);
-    let (text, loc) = slice_text(source, start, end);
-    let (line, col) = lines.loc0(start);
-    Some(ModuleDef {
-        kind: "classes".to_owned(),
-        name: id.name.to_string(),
-        file: file.to_owned(),
-        line,
-        col,
-        text: text.clone(),
-        text_orig: text,
-        loc,
-        args: 0,
-    })
+    Some(build_def(&CLASSES, id.name.to_string(), file, lines, source, (start, end), 0))
 }
 
 /// `type X = ...`.
-fn type_alias_def(
-    t: &TSTypeAliasDeclaration<'_>,
-    source: &str,
-    lines: &LineMap,
-    file: &str,
-) -> Option<ModuleDef> {
-    let start = u(t.span.start);
-    let end = u(t.span.end);
-    let (text, loc) = slice_text(source, start, end);
-    let (line, col) = lines.loc0(start);
-    Some(ModuleDef {
-        kind: "type-aliases".to_owned(),
-        name: t.id.name.to_string(),
-        file: file.to_owned(),
-        line,
-        col,
-        text: text.clone(),
-        text_orig: text,
-        loc,
-        args: 0,
-    })
+fn type_alias_def(t: &TSTypeAliasDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>) -> Option<Def> {
+    let (start, end) = (u(t.span.start), u(t.span.end));
+    Some(build_def(&TYPE_ALIASES, t.id.name.to_string(), file, lines, source, (start, end), 0))
 }
 
 /// `interface X { ... }`.
-fn interface_def(
-    i: &TSInterfaceDeclaration<'_>,
-    source: &str,
-    lines: &LineMap,
-    file: &str,
-) -> Option<ModuleDef> {
-    let start = u(i.span.start);
-    let end = u(i.span.end);
-    let (text, loc) = slice_text(source, start, end);
-    let (line, col) = lines.loc0(start);
-    Some(ModuleDef {
-        kind: "interfaces".to_owned(),
-        name: i.id.name.to_string(),
-        file: file.to_owned(),
-        line,
-        col,
-        text: text.clone(),
-        text_orig: text,
-        loc,
-        args: 0,
-    })
+fn interface_def(i: &TSInterfaceDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>) -> Option<Def> {
+    let (start, end) = (u(i.span.start), u(i.span.end));
+    Some(build_def(&INTERFACES, i.id.name.to_string(), file, lines, source, (start, end), 0))
 }
 
 /// A `const`/`let`/`var` declaration may carry several declarators (`const a = 1, b = 2`).
@@ -239,13 +232,7 @@ fn interface_def(
 /// - arrow / function-expression initializer ⇒ `functions` (dominant TS form).
 /// - `const NAME` with `UPPER_SNAKE_CASE` name + non-function initializer ⇒ `constants`.
 /// - destructuring patterns bind nothing nameable ⇒ skipped.
-fn variable_decls(
-    v: &VariableDeclaration<'_>,
-    source: &str,
-    lines: &LineMap,
-    file: &str,
-    out: &mut Vec<ModuleDef>,
-) {
+fn variable_decls(v: &VariableDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, out: &mut Vec<Def>) {
     let is_const = matches!(v.kind, VariableDeclarationKind::Const);
     for decl in &v.declarations {
         let BindingPattern::BindingIdentifier(id) = &decl.id else { continue };
@@ -262,19 +249,7 @@ fn variable_decls(
                 }
                 let start = u(v.span.start); // include the `const`/`let`/`var` keyword
                 let end = u(decl.span.end);
-                let (text, loc) = slice_text(source, start, end);
-                let (line, col) = lines.loc0(start);
-                out.push(ModuleDef {
-                    kind: "functions".to_owned(),
-                    name,
-                    file: file.to_owned(),
-                    line,
-                    col,
-                    text: text.clone(),
-                    text_orig: text,
-                    loc,
-                    args: count_args(&arrow.params),
-                });
+                out.push(build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&arrow.params)));
             }
             Expression::FunctionExpression(fexpr) => {
                 if is_trivial_function_body(fexpr.body.as_deref()) {
@@ -282,36 +257,12 @@ fn variable_decls(
                 }
                 let start = u(v.span.start);
                 let end = u(decl.span.end);
-                let (text, loc) = slice_text(source, start, end);
-                let (line, col) = lines.loc0(start);
-                out.push(ModuleDef {
-                    kind: "functions".to_owned(),
-                    name,
-                    file: file.to_owned(),
-                    line,
-                    col,
-                    text: text.clone(),
-                    text_orig: text,
-                    loc,
-                    args: count_args(&fexpr.params),
-                });
+                out.push(build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&fexpr.params)));
             }
             _ if is_const && is_upper_snake(&name) => {
                 let start = u(decl.span.start);
                 let end = u(decl.span.end);
-                let (text, loc) = slice_text(source, start, end);
-                let (line, col) = lines.loc0(start);
-                out.push(ModuleDef {
-                    kind: "constants".to_owned(),
-                    name,
-                    file: file.to_owned(),
-                    line,
-                    col,
-                    text: text.clone(),
-                    text_orig: text,
-                    loc,
-                    args: 0,
-                });
+                out.push(build_def(&CONSTANTS, name, file, lines, source, (start, end), 0));
             }
             _ => {}
         }
@@ -340,14 +291,7 @@ fn property_key_name(key: &PropertyKey<'_>) -> String {
 }
 
 /// Methods of one class, surfaced as `kind = "methods"` with class-qualified names.
-fn class_method_defs(
-    c: &Class<'_>,
-    source: &str,
-    lines: &LineMap,
-    file: &str,
-    parent_chain: &str,
-    out: &mut Vec<ModuleDef>,
-) {
+fn class_method_defs(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>, parent_chain: &str, out: &mut Vec<Def>) {
     let Some(class_id) = c.id.as_ref() else { return };
     let class_name = class_id.name.as_str();
     let parent = if parent_chain.is_empty() {
@@ -362,38 +306,20 @@ fn class_method_defs(
             }
             let start = keyword_start(source, u(m.span.start), last_decorator_end(&m.decorators));
             let end = u(m.span.end);
-            let (text, loc) = slice_text(source, start, end);
-            let (line, col) = lines.loc0(start);
             let key_name = property_key_name(&m.key);
             let name = match method_kind_suffix(m.kind) {
                 Some(role) => format!("{parent}.{key_name}.{role}"),
                 None => format!("{parent}.{key_name}"),
             };
             let args = count_args(&m.value.params);
-            out.push(ModuleDef {
-                kind: "methods".to_owned(),
-                name,
-                file: file.to_owned(),
-                line,
-                col,
-                text: text.clone(),
-                text_orig: text,
-                loc,
-                args,
-            });
+            out.push(build_def(&METHODS, name, file, lines, source, (start, end), args));
         }
     }
 }
 
 // ─────────────────────────── per-statement dispatch ───────────────────────────
 
-fn process_top_stmt(
-    stmt: &Statement<'_>,
-    source: &str,
-    lines: &LineMap,
-    file: &str,
-    out: &mut Vec<ModuleDef>,
-) {
+fn process_top_stmt(stmt: &Statement<'_>, source: &str, lines: &LineMap, file: &Arc<str>, out: &mut Vec<Def>) {
     match stmt {
         Statement::FunctionDeclaration(f) => {
             if let Some(def) = function_def(f, source, lines, file) {
@@ -441,13 +367,7 @@ fn process_top_stmt(
 }
 
 /// Inner-declaration walker — same cases as [`process_top_stmt`] minus the export wrappers.
-fn process_declaration(
-    decl: &Declaration<'_>,
-    source: &str,
-    lines: &LineMap,
-    file: &str,
-    out: &mut Vec<ModuleDef>,
-) {
+fn process_declaration(decl: &Declaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, out: &mut Vec<Def>) {
     match decl {
         Declaration::FunctionDeclaration(f) => {
             if let Some(def) = function_def(f, source, lines, file) {
@@ -477,43 +397,32 @@ fn process_declaration(
 
 // ─────────────────────────── parsing + driver ───────────────────────────
 
-pub(crate) fn module_defs_from(source: &str, file: &str) -> Vec<ModuleDef> {
+/// Scan one TypeScript source string → its definitions as [`Def`]s with canon precomputed. The
+/// `file` path drives the parse mode (`.tsx` enables JSX) and is the shared `Arc` stamped onto
+/// every def.
+pub(crate) fn scan_source(source: &str, file: &Arc<str>) -> Vec<Def> {
     let allocator = Allocator::default();
-    let path = Path::new(file);
-    let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());
+    let source_type = SourceType::from_path(Path::new(&**file)).unwrap_or_else(|_| SourceType::ts());
     let ret = Parser::new(&allocator, source, source_type).parse();
     if ret.panicked {
         return Vec::new();
     }
     let lines = LineMap::new(source);
-    let mut defs: Vec<ModuleDef> = Vec::new();
+    let mut defs: Vec<Def> = Vec::new();
     for stmt in &ret.program.body {
         process_top_stmt(stmt, source, &lines, file, &mut defs);
     }
     defs
 }
 
-fn module_defs_in(file: &str) -> Vec<ModuleDef> {
-    match fs::read_to_string(file) {
-        Ok(source) => module_defs_from(&source, file),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// `find_module_defs(files) -> Vec<ModuleDef>`: the dup-defs find step for TypeScript, native +
-/// parallel.
-#[must_use]
-pub fn find_module_defs(files: &[String]) -> Vec<ModuleDef> {
-    let per_file: Vec<Vec<ModuleDef>> = files.par_iter().map(|f| module_defs_in(f)).collect();
-    per_file.into_iter().flatten().collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::module_defs_from;
+    use super::scan_source;
+    use std::sync::Arc;
 
     fn triples(src: &str, file: &str) -> Vec<(String, String, String)> {
-        module_defs_from(src, file).into_iter().map(|d| (d.kind, d.name, d.text)).collect()
+        let f: Arc<str> = Arc::from(file);
+        scan_source(src, &f).into_iter().map(|d| (d.kind.id.to_owned(), d.name, d.text_orig)).collect()
     }
 
     #[test]
@@ -557,9 +466,10 @@ const fetch = async (x: number): Promise<number> => {
     return x + 1;
 };
 "#;
-        let got = module_defs_from(src, "test.ts");
+        let f: Arc<str> = Arc::from("test.ts");
+        let got = scan_source(src, &f);
         let fetch = got.iter().find(|d| d.name == "fetch").expect("fetch arrow");
-        assert_eq!(fetch.kind, "functions");
+        assert_eq!(fetch.kind.id, "functions");
         assert_eq!(fetch.args, 1);
     }
 
@@ -632,9 +542,10 @@ class Service {
     do(x: number) { return x + 1; }
 }
 "#;
-        let got = module_defs_from(src, "test.ts");
+        let f: Arc<str> = Arc::from("test.ts");
+        let got = scan_source(src, &f);
         let svc = got.iter().find(|d| d.name == "Service").expect("Service class");
-        assert!(svc.text.trim_start().starts_with("class "), "got: {:?}", svc.text);
+        assert!(svc.text_orig.trim_start().starts_with("class "), "got: {:?}", svc.text_orig);
     }
 
     #[test]
@@ -651,5 +562,20 @@ function factory() {
         let methods: Vec<&str> =
             got.iter().filter(|(k, _, _)| k == "methods").map(|(_, n, _)| n.as_str()).collect();
         assert!(methods.is_empty(), "no methods expected, got: {methods:?}");
+    }
+
+    #[test]
+    fn node_kinds_and_canon_presence() {
+        // Body kinds carry a cluster canonical; raw-text kinds do not; callables carry analysis
+        // (methods analyze to None — their slice isn't a standalone function — which is fine).
+        let src = "export function f(x: number) { const y = x + 1; return y * 2; }\nexport const MAX_N = 7;\nexport interface I { a(): number; }\n";
+        let f: Arc<str> = Arc::from("t.ts");
+        let defs = scan_source(src, &f);
+        let func = defs.iter().find(|d| d.name == "f").expect("fn");
+        assert!(func.cluster_canonical.is_some() && func.analysis.is_some());
+        let iface = defs.iter().find(|d| d.name == "I").expect("iface");
+        assert!(iface.cluster_canonical.is_some() && iface.analysis.is_none());
+        let konst = defs.iter().find(|d| d.name == "MAX_N").expect("const");
+        assert!(konst.cluster_canonical.is_none() && konst.analysis.is_none());
     }
 }

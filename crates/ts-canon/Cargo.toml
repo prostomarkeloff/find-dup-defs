@@ -13,8 +13,8 @@ authors.workspace = true
 name = "ts_canon"
 
 [dependencies]
-# Shared types (ModuleDef, AnalyzedFn, Language, LineMap) — same shapes as py-canon emits so the
-# engine treats both languages uniformly and only dispatches canonicalization by Language tag.
+# The frontend↔engine contract (Def / KindSpec / Analysis / Frontend / LineMap) this crate
+# implements — same as py-canon, so the engine treats both languages uniformly via Def.
 dup-defs-core = { path = "../dup-defs-core", version = "0.1" }
 # oxc: pure-Rust TS/JS parser + AST. Same architectural role for TypeScript that ruff plays for
 # Python in `py-canon` — single-parse native frontend, modern syntax support (TS 5.x, JSX/TSX,

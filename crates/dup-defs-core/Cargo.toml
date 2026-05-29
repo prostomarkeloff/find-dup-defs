@@ -1,7 +1,7 @@
 [package]
 name = "dup-defs-core"
 version = "0.1.1"
-description = "Shared types (ModuleDef, AnalyzedFn) and source-location utilities (LineMap) for find-dup-defs frontends. Language-agnostic — both py-canon and ts-canon depend on it."
+description = "The find-dup-defs frontend↔engine contract — Def / KindSpec / Analysis / the Frontend trait (+ LineMap). Frontend-agnostic; both py-canon and ts-canon depend on it."
 keywords = ["ast", "canonicalize", "parsing", "clone", "duplicate"]
 categories = ["development-tools"]
 edition.workspace = true

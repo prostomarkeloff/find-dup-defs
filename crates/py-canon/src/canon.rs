@@ -13,7 +13,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-use dup_defs_core::AnalyzedFn;
+/// `(cluster_canonical, xname_canonical, type3_lines, node_count)` — the analysis tuple the scan
+/// reads to build a `Def`'s cluster canonical + `Analysis`. `py-canon`'s own type (was shared via
+/// `dup-defs-core`, now local since the engine consumes `Def`, not this tuple).
+pub type AnalyzedFn = (String, String, Vec<String>, usize);
 use rayon::prelude::*;
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{
@@ -2305,8 +2308,8 @@ pub(crate) fn analyze_stmt(stmt: &Stmt, src: &str) -> Option<AnalyzedFn> {
 }
 
 /// Names-preserved cluster canonical of any def node (functions AND classes), decorators of the top
-/// node excluded. Node-based counterpart of `cluster_canonical` (the index canonicalizes classes too).
-#[allow(dead_code)] // used by the incremental index (src/index.rs), wired next
+/// node excluded. Node-based counterpart of `cluster_canonical`, used by the scan to canonicalize
+/// classes without a re-parse.
 pub(crate) fn cluster_canonical_node(stmt: &Stmt, src: &str) -> String {
     Dump::new(src, None).stmt(stmt)
 }

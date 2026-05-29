@@ -15,7 +15,7 @@ name = "find-dup-defs"
 path = "src/main.rs"
 
 [dependencies]
-# Shared types so the engine speaks the same ModuleDef/AnalyzedFn vocabulary as every frontend.
+# The frontend↔engine contract (Def / KindSpec / Frontend) the engine clusters over.
 dup-defs-core = { path = "../dup-defs-core", version = "0.1" }
 # Python frontend — parse + canonicalize + def scan over ruff. `path` for local dev, `version` so
 # it resolves from crates.io when published.
