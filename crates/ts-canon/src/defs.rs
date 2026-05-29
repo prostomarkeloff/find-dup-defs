@@ -485,7 +485,7 @@ fn process_declaration(
 
 // ─────────────────────────── parsing + driver ───────────────────────────
 
-fn module_defs_from(source: &str, file: &str) -> Vec<ModuleDef> {
+pub(crate) fn module_defs_from(source: &str, file: &str) -> Vec<ModuleDef> {
     let allocator = Allocator::default();
     let path = Path::new(file);
     let source_type = SourceType::from_path(path).unwrap_or_else(|_| SourceType::ts());

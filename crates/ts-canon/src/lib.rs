@@ -5,10 +5,12 @@
 
 mod canon;
 mod defs;
+mod frontend;
 
 pub use canon::{analyze_functions, ast_canonical, ast_canonical_many};
 pub use defs::find_module_defs;
 pub use dup_defs_core::{AnalyzedFn, Language, LineMap, ModuleDef};
+pub use frontend::{TypeScript, CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
 
 #[cfg(test)]
 mod test_helpers {
