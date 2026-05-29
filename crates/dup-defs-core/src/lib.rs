@@ -7,4 +7,4 @@ mod loc;
 mod types;
 
 pub use loc::LineMap;
-pub use types::{AnalyzedFn, Language, ModuleDef};
+pub use types::{Analysis, AnalyzedFn, Def, Frontend, KindSpec, Language, ModuleDef};
