@@ -4,26 +4,28 @@ The **Python frontend** for [`find-dup-defs`](https://github.com/prostomarkeloff
 Python source → a CPython `ast.dump`-shape **canonical form** plus a **top-level definition scan**.
 
 Parses with the [Ruff](https://github.com/astral-sh/ruff) Python parser (modern syntax — PEP 695 /
-PEP 701). Two layers:
+PEP 701). It implements `find-dup-defs`'s `Frontend` trait:
 
-- **`find_module_defs`** scans files for each module-level definition (function, class, `UPPER_CASE`
-  constant, `type` alias) → `ModuleDef { kind, name, file, line, col, text }`.
-- **canonicalization** of a definition's source text: `ast_canonical` (a structural canonical matching
-  CPython's `ast.dump` shape, docstrings stripped — the input to byte-for-byte Ratcliff–Obershelp
-  similarity), plus `normalize_functions` / `analyze_functions` for the alpha-renamed and
-  name-agnostic forms used to detect *renamed* copy-paste.
+- **`Python::scan`** walks each file once and lowers every module-level definition (function, class,
+  `UPPER_CASE` constant, `type` alias) and class method to a `Def`, with its canonical strings
+  precomputed off the AST node.
+- The **canonical** is a structural form matching CPython's `ast.dump` shape (docstrings stripped) —
+  the input to byte-for-byte Ratcliff–Obershelp similarity. `ast_canonical` / `analyze_functions`
+  expose it over a source string (used for tooling / golden checks).
 
 The canonicalization is validated **byte-for-byte** against a golden corpus produced by CPython's own
 `ast` module (`examples/verify_golden.rs`).
 
 ```rust
-use py_canon::{find_module_defs, ast_canonical};
+use std::sync::Arc;
+use dup_defs_core::Frontend;
+use py_canon::Python;
 
-let defs = find_module_defs(&["m.py".to_string()]);   // reads the files, returns top-level defs
+let files = [Arc::<str>::from("m.py")];
+let defs = Python.scan(&files);               // reads the files, returns Defs with canon precomputed
 for d in &defs {
-    println!("{} {} @ {}:{}", d.kind, d.name, d.file, d.line);
-    let canonical = ast_canonical(&d.text);           // ast.dump-shape structural canonical
-    // → feed canonicals to difflib-fast::cluster_canonicals to find near-duplicates
+    println!("{} {} @ {}:{}", d.kind.id, d.name, d.file, d.line);
+    // d.cluster_canonical / d.analysis are ready for difflib-fast::cluster_canonicals
 }
 ```
 

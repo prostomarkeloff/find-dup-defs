@@ -1,53 +1,11 @@
-//! The frontend↔engine contract, plus the frontends' shared extraction intermediate.
-//!
-//! * **Engine contract — [`Def`] / [`KindSpec`] / [`Analysis`] / [`Frontend`].** A frontend
-//!   parses each file once, classifies its definitions, and lowers each to a [`Def`] — a flat
-//!   *feature record* carrying the precomputed canonical strings the clustering engine consumes.
-//!   The engine never sees a frontend's rich per-language representation and never matches on a
-//!   fixed kind vocabulary: each frontend declares its own kinds as `&'static` [`KindSpec`]s.
-//! * **Extraction intermediate — [`ModuleDef`] / [`AnalyzedFn`].** The shape each `*-canon`
-//!   crate's scan builds before lowering to [`Def`]. NOT part of the engine contract; kept here
-//!   because both the Python and TypeScript frontends share the identical intermediate.
+//! The frontend↔engine contract: [`Def`] / [`KindSpec`] / [`Analysis`] / [`Frontend`]. A
+//! frontend parses each file once, classifies its definitions, and lowers each to a [`Def`] — a
+//! flat *feature record* carrying the precomputed canonical strings the clustering engine
+//! consumes. The engine never sees a frontend's rich per-language representation and never
+//! matches on a fixed kind vocabulary: each frontend declares its own kinds as `&'static`
+//! [`KindSpec`]s. (Each `*-canon` crate keeps its own extraction intermediate internally.)
 
 use std::sync::Arc;
-
-/// One module-level definition produced by a frontend's extraction pass — the shared
-/// **intermediate** each `*-canon` crate builds before lowering to a [`Def`]. `kind` uses the
-/// frontend's own string vocabulary (`functions` / `methods` / `classes` / …); `line`/`col` are
-/// 0-indexed. `loc` and `args` are "how fat is this" signals: `loc` counts non-blank lines of
-/// the **original** source (for methods, NOT the receiver-stripped form); `args` is the
-/// user-visible parameter count (including a `self`/`cls` receiver in Python) and `0` for
-/// non-callable kinds.
-///
-/// `text` is the canonicalization input (receiver-stripped for Python methods); `text_orig` is
-/// what the user actually wrote, used for snippet display. For every kind other than Python
-/// methods the two are identical clones. Not engine-facing — the engine consumes [`Def`].
-#[derive(Clone, Debug)]
-pub struct ModuleDef {
-    pub kind: String,
-    pub name: String,
-    pub file: String,
-    pub line: usize,
-    pub col: usize,
-    pub text: String,
-    pub text_orig: String,
-    pub loc: usize,
-    pub args: usize,
-}
-
-/// Full dup-defs analysis of one callable definition:
-/// `(cluster_canonical, xname_canonical, lines, size)`.
-///
-/// * `cluster_canonical` — names-preserved structural canonical, used by the name-gated pass.
-/// * `xname_canonical` — alpha-renamed structural canonical (bound locals → positional `_v{n}`,
-///   top def name blanked to `_fn`), used by the cross-name pass.
-/// * `lines` — per-statement renamed lines (one logical line per statement, equivalent to
-///   `ast.unparse` line splits in Python), used by the Type-3 (`ECScan`) cosine pass.
-/// * `size` — node count of the alpha-renamed canonical, used as a "substance" gate so a
-///   3-line accessor doesn't escalate to ERROR purely on a renamed-exact match.
-pub type AnalyzedFn = (String, String, Vec<String>, usize);
-
-// ── New frontend↔engine contract (Frontend trait) ───────────────────────────
 
 /// Engine-facing metadata about one *kind* of definition. Each frontend declares its own kinds
 /// as `&'static` consts (e.g. `py_canon::FUNCTIONS`, `ts_canon::INTERFACES`) and stamps the
@@ -76,8 +34,7 @@ pub struct KindSpec {
 }
 
 /// Full callable analysis precomputed by the frontend — the cross-name + Type-3 inputs the
-/// engine needs. Named replacement for the legacy [`AnalyzedFn`] tuple's last three fields
-/// (the cluster canonical now lives on [`Def::cluster_canonical`]).
+/// engine needs (the cluster canonical lives separately on [`Def::cluster_canonical`]).
 ///
 /// * `xname_canonical` — alpha-renamed structural canonical (bound locals → positional
 ///   `_v{n}`, top def name blanked); the cross-name pass buckets on this.

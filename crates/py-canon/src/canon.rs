@@ -13,7 +13,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
-use dup_defs_core::AnalyzedFn;
+/// `(cluster_canonical, xname_canonical, type3_lines, node_count)` — the analysis tuple the scan
+/// reads to build a `Def`'s cluster canonical + `Analysis`. `py-canon`'s own type (was shared via
+/// `dup-defs-core`, now local since the engine consumes `Def`, not this tuple).
+pub type AnalyzedFn = (String, String, Vec<String>, usize);
 use rayon::prelude::*;
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{

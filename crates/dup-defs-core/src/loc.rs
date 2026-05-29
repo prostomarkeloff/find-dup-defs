@@ -38,7 +38,7 @@ impl<'a> LineMap<'a> {
         (line + 1, col + 1)
     }
 
-    /// 0-indexed `(line, column)` — the convention [`crate::ModuleDef`] reports.
+    /// 0-indexed `(line, column)` — the convention [`crate::Def`] reports.
     #[must_use]
     pub fn loc0(&self, offset: usize) -> (usize, usize) {
         let line = self.line_index(offset);
