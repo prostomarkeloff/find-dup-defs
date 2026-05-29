@@ -148,6 +148,9 @@ pub trait Frontend: Sync {
     fn lang(&self) -> &'static str;
     /// File extensions this frontend claims (without the dot), e.g. `["ts", "tsx"]`.
     fn extensions(&self) -> &'static [&'static str];
+    /// Every kind this frontend can emit. The binary unions these across the selected frontends
+    /// to build the report's section list, so `--only py` prints only Python's sections.
+    fn kinds(&self) -> &'static [&'static KindSpec];
     /// Parse each file once and return its definitions as [`Def`]s with canon precomputed.
     fn scan(&self, files: &[Arc<str>]) -> Vec<Def>;
 }

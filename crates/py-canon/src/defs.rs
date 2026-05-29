@@ -305,7 +305,7 @@ fn class_method_defs(source: &str, stmt: &Stmt, lines: &LineMap, file: &str, par
     out
 }
 
-fn module_defs_from(source: &str, file: &str) -> Vec<ModuleDef> {
+pub(crate) fn module_defs_from(source: &str, file: &str) -> Vec<ModuleDef> {
     let Ok(parsed) = parse_module(source) else { return Vec::new() };
     let module = parsed.into_syntax();
     let lines = LineMap::new(source);
