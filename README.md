@@ -102,9 +102,9 @@ cargo install find-dup-defs
 
 ## The three detection passes
 
-Every `.py` / `.ts` / `.tsx` / `.mts` / `.cts` / `.rs` file is parsed **once** (Ruff for Python — PEP
-695 / 701 ready; oxc for TypeScript — TS 5.x, JSX/TSX, decorators; syn for Rust — full item grammar),
-each callable yielded as top-level functions **and methods** (`Foo.bar` / `Type::method`):
+Every `.py` / `.ts` / `.tsx` / `.mts` / `.cts` / `.rs` file is parsed **once** — Python is PEP 695 /
+701-ready, TypeScript covers TS 5.x / JSX / TSX / decorators, Rust the full item grammar — each
+callable yielded as top-level functions **and methods** (`Foo.bar` / `Type::method`):
 
 1. **name-gated** — same-`(kind, name)` defs clustered by exact Ratcliff–Obershelp similarity on the `ast.dump`-shape canonical.
 2. **cross-name** — renamed copy-paste: alpha-renamed canonical bucketed, ≥2 distinct names across ≥2 sites.
@@ -112,11 +112,11 @@ each callable yielded as top-level functions **and methods** (`Foo.bar` / `Type:
 
 ### Smart filters (no false-positives from these patterns)
 
-- `@overload` / `@abstractmethod` / Protocol stubs — bodies of `...` / `pass` / docstring filtered at extraction
-- `raise NotImplementedError` ABC declarations
-- `return False / None / 0 / "x"` dispatch overrides (huge cross-name FP source — gone)
-- `@property` + `@x.setter` / `.deleter` — accessor role baked into the name
-- `self` / `cls` receivers — stripped so methods can match equivalent free functions
+Trivial / boilerplate bodies are dropped at extraction, so they never form a phantom cluster:
+
+- **Python & TypeScript** — `@overload` / `@abstractmethod` / Protocol stubs (`...` / `pass` / docstring-only); `raise NotImplementedError` ABC declarations; `return False / None / 0 / "x"` dispatch overrides (a huge cross-name FP source); `@property` + `@x.setter` / `.deleter` (accessor role baked into the name)
+- **Rust** — one-line `write!` / `writeln!` `Display`/`Debug` impls, `matches!` predicates, and `todo!` / `panic!` stubs (the `*::fmt` / `is_*` floods); `#[cfg(...)]`-gated same-name siblings (`#[cfg(unix)]` + `#[cfg(windows)]`) collapse to one logical item, not an N-member "duplicate"
+- **All languages** — method receivers (`self` / `cls`, `&self`) stripped, so a method can match an equivalent free function
 
 ---
 
@@ -158,12 +158,16 @@ User-authored overrides for repo-specific intentional duplication.
 ACTION : [KIND:] NAME [@PATH] [=NOTE]
 ```
 
+`KIND` (optional) restricts a rule to one vocabulary: `FUNCTION` `METHOD` `CLASS` `INTERFACE`
+`CONSTANT` `TYPE_ALIAS`.
+
 | Action | Effect | Severity |
 |---|---|---|
 | `suppress` | Drop entirely | gone |
 | `de-escalate` | One step down | ERROR→WARNING→INFO |
 | `escalate` | One step up | INFO→WARNING→ERROR |
 | `note` | Annotate only | unchanged |
+| `settings` | Pipeline config (`settings:KEY=VALUE`), applied before the scan — not a finding filter | n/a |
 
 ```bash
 # Plugin no-op API: intentional, don't gate
@@ -177,6 +181,9 @@ ACTION : [KIND:] NAME [@PATH] [=NOTE]
 
 # Just leave a note
 -D 'note:METHOD:For*.begin_body=v2 refactor target (see issue #42)'
+
+# Pipeline config through the same channel — cap O(n²) clustering on huge shared-name groups
+-D 'settings:max-name-group=256'
 ```
 
 Notes show up inline:
@@ -203,6 +210,7 @@ The `--calibrate` step pattern-matches across findings and surfaces ready-to-pas
 | ≥5 clusters all in `.d.ts` declaration files | `suppress:*:*@*.d.ts` |
 | ≥5 clusters all in `*.stories.*` Storybook files | `de-escalate:*:*@*.stories.*` |
 | ≥30 clusters with same-name files across a vendored marker dir (`/util/vs/`, `/fixtures/`, `/vendor/`, `/third_party/`) and a parallel source root | `suppress:*:*@*<vendored-prefix>*` (per-snapshot, auto-derived) |
+| ≥1 `(kind, name)` group above 256 members — shared / entry-point names (`fn main` across fixtures, `new` / `default`), not duplication | `settings:max-name-group=256` (skips their O(n²) name-gated clustering; cross-name still catches renamed copies) |
 
 Directive globs support `{a,b,c}` brace alternation so one paste covers every convention of a
 family (`*/{test,tests,__tests__}/*` is one directive, not three).
@@ -213,8 +221,8 @@ dirs are treated as architectural duplication (real refactor candidates) rather 
 suppressed. Prevents over-suppression of legitimate cross-layer reuse patterns (e.g. FSD's
 `pages/foo` ↔ `shared/foo`).
 
-Verified on real benchmarks: **67% noise reduction** across 28 large Python repos and
-**~94% average reduction** across 10 production TypeScript repos (≈6M SLOC total).
+On real codebases these suggestions do the heavy lifting — auto-inferred directives alone account
+for most of the raw-ERROR cut measured in the benchmark sections below.
 
 ---
 
@@ -277,7 +285,7 @@ Across 14 repos with ≥150K SLOC + 14 with 50K-150K each (≈8M SLOC total), `f
 | scipy/scipy        | 492       | 140                            | 71%  | `dct/dst/idct/idst` (n=4) |
 | numpy/numpy        | 316       | 96                             | 69%  | `std/var` (n=2) |
 
-Top findings on this corpus are textbook PR candidates:
+Concrete wins from this corpus:
 - **`pip`** Version `__lt__/__le__/__eq__/__ge__/__gt__` × 6 — minus 130 lines via one `_compare` helper
 - **`scipy`** `dct/dst/idct/idst` × 4 — minus ~330 lines via factory generator
 - **`django`** `TupleGreaterThan/...` × 4 — minus ~75 lines via a `TupleLookupMixin` method
@@ -398,10 +406,14 @@ SIMILARITY (name-gated):
   --type3-theta <F>          Type-3 cosine threshold (default 0.7)
 
 FILTERS:
-  -D, --directive <S>        ACTION:[KIND:]NAME[@PATH][=NOTE], repeatable.
+  -D, --directive <S>        ACTION:[KIND:]NAME[@PATH][=NOTE], repeatable. ACTION ∈ suppress
+                             / de-escalate / escalate / note / settings:KEY=VALUE.
                              PATH glob supports `{a,b,c}` brace alternation.
   --kinds <K1,K2,...>        functions,methods,classes,interfaces,constants,type-aliases
   --min-size <N>             Only clusters with ≥ N members (default 2)
+  --max-name-group <N>       Skip name-gated clustering for (kind,name) groups > N members
+                             (shared/entry-point names; O(n²) compare dominates on monorepos).
+                             Off by default; cross-name still catches renamed copies.
   --errors-only              Filter output to ERROR severity
   --show-info                Include INFO in human report (default hidden)
 
