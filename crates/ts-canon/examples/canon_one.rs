@@ -1,18 +1,20 @@
-//! Run `find_module_defs` + `ast_canonical` on each emitted def's text, printing per-def
-//! progress so a segfault narrows to a specific def.
+//! Scan one file and print per-def progress (kind / name / location / canon length), so a
+//! segfault or panic narrows to a specific definition.
 
 use std::env;
+use std::sync::Arc;
 
-use ts_canon::{ast_canonical, find_module_defs};
+use dup_defs_core::Frontend;
+use ts_canon::TypeScript;
 
 fn main() {
     let file = env::args().nth(1).expect("usage: canon_one <file>");
-    let defs = find_module_defs(std::slice::from_ref(&file));
-    eprintln!("found {} defs in {}", defs.len(), file);
+    let files = vec![Arc::<str>::from(file.as_str())];
+    let defs = TypeScript.scan(&files);
+    eprintln!("found {} defs in {file}", defs.len());
     for (i, d) in defs.iter().enumerate() {
-        eprintln!("[{i}] {} {} {}:{} loc={}", d.kind, d.name, d.file, d.line + 1, d.loc);
-        let c = ast_canonical(&d.text);
-        eprintln!("    canon_len={}", c.len());
+        let canon_len = d.cluster_canonical.as_deref().map_or(0, str::len);
+        eprintln!("[{i}] {} {} {}:{} loc={} canon_len={canon_len}", d.kind.id, d.name, d.file, d.line + 1, d.loc);
     }
     eprintln!("done");
 }
