@@ -18,6 +18,5 @@ mod defs;
 mod frontend;
 
 pub use canon::{analyze_functions, ast_canonical, ast_canonical_many, normalize_functions};
-pub use defs::find_module_defs;
-pub use dup_defs_core::{AnalyzedFn, LineMap, ModuleDef};
+pub use dup_defs_core::{AnalyzedFn, LineMap};
 pub use frontend::{Python, CLASSES, CONSTANTS, FUNCTIONS, METHODS, TYPE_ALIASES};

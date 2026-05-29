@@ -2305,8 +2305,8 @@ pub(crate) fn analyze_stmt(stmt: &Stmt, src: &str) -> Option<AnalyzedFn> {
 }
 
 /// Names-preserved cluster canonical of any def node (functions AND classes), decorators of the top
-/// node excluded. Node-based counterpart of `cluster_canonical` (the index canonicalizes classes too).
-#[allow(dead_code)] // used by the incremental index (src/index.rs), wired next
+/// node excluded. Node-based counterpart of `cluster_canonical`, used by the scan to canonicalize
+/// classes without a re-parse.
 pub(crate) fn cluster_canonical_node(stmt: &Stmt, src: &str) -> String {
     Dump::new(src, None).stmt(stmt)
 }
