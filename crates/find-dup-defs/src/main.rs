@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use dup_defs_core::{Frontend, KindSpec};
-use find_dup_defs::{Finding, PipelineOpts, Severity, scan_and_cluster, section_index};
+use find_dup_defs::{cluster, collect_defs, large_name_groups, section_index, Finding, PipelineOpts, Severity};
 use serde::Serialize;
 
 #[global_allocator]
@@ -61,6 +61,14 @@ struct Cli {
     /// Only report clusters with at least this many definitions.
     #[arg(long, default_value_t = 2)]
     min_size: usize,
+    /// Skip name-gated clustering for any (kind, name) group with more than N members. A name
+    /// shared by hundreds of definitions — `fn main` across thousands of test fixtures,
+    /// `new` / `default` — is a convention or entry point, not a refactor cluster, and the
+    /// within-group O(n²) Ratcliff–Obershelp comparison can dominate runtime on huge monorepos
+    /// (it was ~90% of CPU on the full rust compiler tree). Off by default (no cap); renamed-
+    /// identical copies among the members still surface via the cross-name pass.
+    #[arg(long)]
+    max_name_group: Option<usize>,
     /// Restrict to these kinds (comma-separated:
     /// functions,methods,classes,interfaces,constants,type-aliases).
     #[arg(long, value_delimiter = ',')]
@@ -69,6 +77,7 @@ struct Cli {
     /// supported language found in the target paths. Known codes:
     ///   `py` — Python via `py-canon` (Ruff parser)
     ///   `ts` — TypeScript via `ts-canon` (oxc parser)
+    ///   `rs` — Rust via `rs-canon` (syn parser)
     /// Unknown codes exit non-zero. Useful in mixed-language repos where you only care about
     /// one frontend per CI job (`--only py`, `--only ts`), or when a frontend's parser is
     /// crashing on bad input and you need to scan around it.
@@ -117,7 +126,7 @@ struct Cli {
 
 // ───────────────────────────── directives (glob filters) ─────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum DirectiveAction {
     /// Drop the finding from the report entirely.
     Suppress,
@@ -127,10 +136,15 @@ enum DirectiveAction {
     Escalate,
     /// Pure annotation — attach a note to the finding, no severity change.
     Note,
+    /// Pipeline configuration, not a finding filter: `settings:KEY=VALUE` (e.g.
+    /// `settings:max-name-group=256`). Applied to [`PipelineOpts`] before the scan; arbitrary
+    /// keys, so new knobs can be configured through the same `-D` channel CI already passes.
+    Settings,
 }
 
 /// One compact directive: `ACTION:[KIND:]NAME[@PATH]`. See the `--directive` CLI doc for the
 /// grammar and examples. Parsed once into globs + a kind filter; matched against each Finding.
+#[derive(Debug)]
 struct Directive {
     action: DirectiveAction,
     /// Internal kind tag (`functions` / `methods` / `classes` / `constants` / `type-aliases`).
@@ -146,6 +160,10 @@ struct Directive {
 
 impl Directive {
     fn matches(&self, f: &Finding) -> bool {
+        // `settings:` is pipeline config, applied before the scan — it never filters findings.
+        if self.action == DirectiveAction::Settings {
+            return false;
+        }
         if let Some(k) = self.kind {
             if f.kind.id != k {
                 return false;
@@ -184,16 +202,18 @@ fn parse_directive(spec: &str) -> Result<Directive, String> {
         "deescalate" => DirectiveAction::Deescalate,
         "escalate" => DirectiveAction::Escalate,
         "note" => DirectiveAction::Note,
+        "settings" => DirectiveAction::Settings,
         other => {
             return Err(format!(
                 "unknown action {other:?} in directive {spec:?} \
-                 (expected `suppress` / `de-escalate` / `escalate` / `note`)"
+                 (expected `suppress` / `de-escalate` / `escalate` / `note` / `settings`)"
             ));
         }
     };
-    if action == DirectiveAction::Note && note.is_none() {
+    if matches!(action, DirectiveAction::Note | DirectiveAction::Settings) && note.is_none() {
         return Err(format!(
-            "`note` directive requires note text after `=` (directive: {spec:?})"
+            "`{action_str}` directive requires `=…` ({}) (directive: {spec:?})",
+            if action == DirectiveAction::Settings { "the setting value, e.g. settings:max-name-group=256" } else { "note text" }
         ));
     }
     let (kind, after_kind) = match rest.split_once(':') {
@@ -205,6 +225,7 @@ fn parse_directive(spec: &str) -> Result<Directive, String> {
                 "METHOD" | "METHODS" => (Some("methods"), after),
                 "FUNCTION" | "FUNCTIONS" => (Some("functions"), after),
                 "CLASS" | "CLASSES" => (Some("classes"), after),
+                "INTERFACE" | "INTERFACES" => (Some("interfaces"), after),
                 "CONSTANT" | "CONSTANTS" => (Some("constants"), after),
                 "TYPE_ALIAS" | "TYPE_ALIASES" => (Some("type-aliases"), after),
                 _ => (None, rest), // not a kind — the whole `rest` is NAME[@PATH]
@@ -226,6 +247,27 @@ fn parse_directive(spec: &str) -> Result<Directive, String> {
         path_pat: path.map(str::to_owned),
         note,
     })
+}
+
+/// Name-gated groups larger than this are reported by the directive-inferrer as a suggested
+/// `settings:max-name-group` cap (a name shared by this many definitions is a convention or
+/// entry point), and it's the cap value the suggestion proposes.
+const SUGGEST_CAP: usize = 256;
+
+/// Apply one `settings:KEY=VALUE` directive to the pipeline options. Known keys are validated
+/// (a bad value for a known key is a hard error); unknown keys are warned-and-ignored so a
+/// directive file written for a newer build degrades gracefully on an older one.
+fn apply_setting(opts: &mut PipelineOpts, key: &str, value: &str) {
+    match key {
+        "max-name-group" => {
+            let Ok(n) = value.parse::<usize>() else {
+                eprintln!("find-dup-defs: settings:max-name-group expects an integer, got {value:?}");
+                std::process::exit(2);
+            };
+            opts.max_name_group = Some(n);
+        }
+        other => eprintln!("find-dup-defs: ignoring unknown settings key {other:?}"),
+    }
 }
 
 /// Minimal glob matcher — `*` (any run), `?` (single char), `{a,b,…}` (alternation, single
@@ -274,7 +316,29 @@ fn glob_match_simple(pat: &str, s: &str) -> bool {
 /// pattern with no alternation is one-call cheap.
 #[cfg(test)]
 mod glob_tests {
-    use super::{expand_braces, glob_match, vendored_score};
+    use super::{expand_braces, glob_match, parse_directive, vendored_score, DirectiveAction, PipelineOpts};
+
+    #[test]
+    fn settings_directive_parses_key_and_value() {
+        let d = parse_directive("settings:max-name-group=256").expect("parses");
+        assert_eq!(d.action, DirectiveAction::Settings);
+        assert_eq!(d.name_pat, "max-name-group");
+        assert_eq!(d.note.as_deref(), Some("256"));
+        assert!(d.kind.is_none() && d.path_pat.is_none());
+        // a settings directive without `=VALUE` is rejected.
+        assert!(parse_directive("settings:max-name-group").unwrap_err().contains("requires"));
+    }
+
+    #[test]
+    fn apply_setting_sets_max_name_group() {
+        let mut opts = PipelineOpts::with_paths(vec![]);
+        assert_eq!(opts.max_name_group, None);
+        super::apply_setting(&mut opts, "max-name-group", "256");
+        assert_eq!(opts.max_name_group, Some(256));
+        // unknown key is ignored (forward-compatible), not fatal.
+        super::apply_setting(&mut opts, "future-knob", "x");
+        assert_eq!(opts.max_name_group, Some(256));
+    }
 
     #[test]
     fn vendored_score_marks_known_snapshot_paths() {
@@ -362,8 +426,8 @@ fn main() {
     // Frontend registry — the binary is the composition root that knows every language; the
     // engine itself is frontend-agnostic. Bound to locals so the `&dyn Frontend` refs outlive
     // the whole run.
-    let (py, ts) = (py_canon::Python, ts_canon::TypeScript);
-    let registry: Vec<&dyn Frontend> = vec![&py, &ts];
+    let (py, ts, rs) = (py_canon::Python, ts_canon::TypeScript, rs_canon::Rust);
+    let registry: Vec<&dyn Frontend> = vec![&py, &ts, &rs];
     // `--only` selects a subset by language code. Unknown codes are an error (exit 2) rather
     // than a silent no-op — a typo'd `--only py,rs` should fail loud so a CI job that meant to
     // include Rust doesn't ship an empty report.
@@ -383,9 +447,22 @@ fn main() {
             registry.iter().copied().filter(|f| codes.iter().any(|c| c == f.lang())).collect()
         }
     };
-    // The whole detection pipeline — file walk, parse, 3 passes, thickness
-    // demotion/escalation — runs in one library call (find_dup_defs::scan_and_cluster).
-    let opts = PipelineOpts {
+    // User-authored directives, parsed once (exit-2 on a typo so CI fails loud). `settings:`
+    // entries configure the pipeline before the scan; the rest filter findings afterwards.
+    let directives: Vec<Directive> = cli
+        .directives
+        .iter()
+        .map(|s| {
+            parse_directive(s).unwrap_or_else(|e| {
+                eprintln!("find-dup-defs: invalid --directive: {e}");
+                std::process::exit(2);
+            })
+        })
+        .collect();
+
+    // `--max-name-group` is the base; `settings:max-name-group=…` directives override it (the
+    // portable, inferrer-suggested way to configure the same knob).
+    let mut opts = PipelineOpts {
         paths: cli.paths.clone(),
         threshold: cli.threshold,
         error_threshold: cli.error_threshold,
@@ -397,20 +474,17 @@ fn main() {
         kinds: cli.kinds.clone(),
         no_cross_name: cli.no_cross_name,
         no_type3: cli.no_type3,
+        max_name_group: cli.max_name_group,
     };
-    let mut findings = scan_and_cluster(&opts, &selected);
-    // User-authored directives (the manual override layer). Parsed once; mismatched action /
-    // kind tokens fail loud with exit-2 so a typo in CI doesn't silently keep emitting errors.
-    let directives: Vec<Directive> = cli
-        .directives
-        .iter()
-        .map(|s| {
-            parse_directive(s).unwrap_or_else(|e| {
-                eprintln!("find-dup-defs: invalid --directive: {e}");
-                std::process::exit(2);
-            })
-        })
-        .collect();
+    for d in directives.iter().filter(|d| d.action == DirectiveAction::Settings) {
+        apply_setting(&mut opts, &d.name_pat, d.note.as_deref().unwrap_or_default());
+    }
+
+    // One scan → defs. The cheap `(kind, name)` group sizes feed the directive-inferrer's
+    // `settings:max-name-group` suggestion (independent of clustering and the cap); then cluster.
+    let defs = collect_defs(&selected, &opts.paths);
+    let large_groups = large_name_groups(&defs, SUGGEST_CAP);
+    let mut findings = cluster(defs, &opts);
     if !directives.is_empty() {
         // Attach notes from EVERY matching directive first, even ones whose action will drop
         // the finding — but we run suppress last, so a `suppress` with a `=note` still has its
@@ -469,9 +543,9 @@ fn main() {
         let errs: Vec<&Finding> = findings.iter().filter(|f| f.severity == Severity::Error).collect();
         let warns: Vec<&Finding> = findings.iter().filter(|f| f.severity == Severity::Warning).collect();
         let report = if cli.json {
-            render_calibration_json(&errs, &warns, &findings, &cli.repo_root)
+            render_calibration_json(&errs, &warns, &findings, &large_groups, &cli.repo_root)
         } else {
-            format_calibration(&errs, &warns, &findings, &cli.repo_root)
+            format_calibration(&errs, &warns, &findings, &large_groups, &cli.repo_root)
         };
         print!("{report}");
         return;
@@ -1058,8 +1132,34 @@ fn build_suggestion(
 /// Pattern-match across findings to emit ready-to-paste `-D` directives for the recurring noise
 /// shapes (i18n locales, all-test clusters, generated `_pb2`/`_grpc`, schema migrations). The
 /// user still owns the final list; we shortcut the first 80% of project-specific tuning.
-fn infer_directives(findings: &[Finding], repo_root: &Path) -> Vec<InferredDirective> {
+fn infer_directives(
+    findings: &[Finding],
+    large_groups: &[(&'static KindSpec, String, usize)],
+    repo_root: &Path,
+) -> Vec<InferredDirective> {
     let mut out: Vec<InferredDirective> = Vec::new();
+    // Huge same-name groups (`fn main` across test fixtures, `async_setup_entry` across HA
+    // integrations) are conventions / entry points, not refactor clusters — and clustering them
+    // is the O(n²) cost that dominates big monorepos. Suggest a `settings:max-name-group` cap.
+    if !large_groups.is_empty() {
+        let total: usize = large_groups.iter().map(|(_, _, n)| n).sum();
+        let sample: Vec<String> =
+            large_groups.iter().take(4).map(|(k, n, c)| format!("{}:{n} ×{c}", k.id)).collect();
+        let more = large_groups.len().saturating_sub(4);
+        let tail = if more > 0 { format!(", +{more} more") } else { String::new() };
+        out.push(InferredDirective {
+            directive: format!("settings:max-name-group={SUGGEST_CAP}"),
+            rationale: format!(
+                "{} name-group(s) exceed {SUGGEST_CAP} members ({}{tail}) — shared / entry-point names, not duplication; their O(n²) name-gated clustering dominates runtime, so the cap skips them",
+                large_groups.len(),
+                sample.join(", ")
+            ),
+            affects_total: total,
+            affects_error: 0,
+            affects_warning: 0,
+            affects_info: 0,
+        });
+    }
     if let Some(s) = build_suggestion(
         findings,
         |f| {
@@ -1213,7 +1313,7 @@ fn fmt_member_locations(members: &[String], max: usize) -> String {
     s
 }
 
-fn render_calibration_json(errs: &[&Finding], warns: &[&Finding], all: &[Finding], repo_root: &Path) -> String {
+fn render_calibration_json(errs: &[&Finding], warns: &[&Finding], all: &[Finding], large_groups: &[(&'static KindSpec, String, usize)], repo_root: &Path) -> String {
     let report = CalibReport {
         error: CalibTier {
             total: errs.len(),
@@ -1227,7 +1327,7 @@ fn render_calibration_json(errs: &[&Finding], warns: &[&Finding], all: &[Finding
             histogram: thickness_histogram(&warns.iter().map(|f| f.thickness).collect::<Vec<_>>()),
             suggestions: calibration_suggestions(warns, repo_root),
         },
-        inferred_directives: infer_directives(all, repo_root),
+        inferred_directives: infer_directives(all, large_groups, repo_root),
     };
     serde_json::to_string_pretty(&report).unwrap_or_default() + "\n"
 }
@@ -1292,7 +1392,7 @@ fn format_calibration_tier(
     out.push('\n');
 }
 
-fn format_calibration(errs: &[&Finding], warns: &[&Finding], all: &[Finding], repo_root: &Path) -> String {
+fn format_calibration(errs: &[&Finding], warns: &[&Finding], all: &[Finding], large_groups: &[(&'static KindSpec, String, usize)], repo_root: &Path) -> String {
     if errs.is_empty() && warns.is_empty() {
         return "=== thickness calibration: 0 findings — nothing to calibrate against. ===\n".to_owned();
     }
@@ -1300,7 +1400,7 @@ fn format_calibration(errs: &[&Finding], warns: &[&Finding], all: &[Finding], re
     format_calibration_tier(&mut out, "ERROR", "error-thickness", errs, repo_root);
     format_calibration_tier(&mut out, "WARNING", "warning-thickness", warns, repo_root);
 
-    let inferred = infer_directives(all, repo_root);
+    let inferred = infer_directives(all, large_groups, repo_root);
     if !inferred.is_empty() {
         out.push_str("=== inferred directives (auto-detected noise patterns) ===\n\n");
         for d in &inferred {

@@ -1,0 +1,30 @@
+[package]
+name = "rs-canon"
+version = "0.1.0"
+description = "Rust source → structural canonicalization + module-level definition scan (syn parser). The Rust frontend for find-dup-defs."
+keywords = ["rust", "ast", "canonicalize", "parsing", "clone"]
+categories = ["parser-implementations", "development-tools"]
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "rs_canon"
+
+[dependencies]
+# The frontend↔engine contract (Def / KindSpec / Analysis / Frontend / LineMap) this crate implements.
+dup-defs-core = { path = "../dup-defs-core", version = "0.1" }
+# syn: the de-facto Rust parser. `full` enables the whole item/stmt/expr grammar (not just
+# proc-macro derive inputs); printing (default) backs `Spanned`.
+syn = { version = "2", features = ["full", "visit"] }
+# proc-macro2 with span-locations so syn spans expose byte ranges (for slicing a def's source)
+# and line/column — works in fallback mode (parsing from a string, not inside a proc-macro).
+proc-macro2 = { version = "1", features = ["span-locations"] }
+rayon = "1"
+
+[dev-dependencies]
+walkdir = "2" # examples/parse_coverage.rs walks a corpus to measure parse coverage + find pathological files
+
+[lints]
+workspace = true
