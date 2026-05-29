@@ -184,6 +184,11 @@ ACTION : [KIND:] NAME [@PATH] [=NOTE]
 
 # Pipeline config through the same channel — cap O(n²) clustering on huge shared-name groups
 -D 'settings:max-name-group=256'
+
+# Route large same-name groups' clustering through the Metal GPU (macOS, `--features gpu` build).
+# Values: on / gpu+cpu / gpu / off (default). No-op on a CPU build or off macOS — output is
+# byte-for-byte identical either way. See "GPU acceleration" below.
+-D 'settings:gpu=on'
 ```
 
 Notes show up inline:
@@ -245,6 +250,38 @@ On `django` (426K SLOC, 2 910 files):
 - `find-dup-defs`: **~422K SLOC/sec**
 - PMD CPD: ~205K SLOC/sec
 - jscpd: ~44K SLOC/sec
+
+### GPU acceleration (optional, macOS / Metal)
+
+`difflib-fast` 0.2 can offload the name-gated Ratcliff–Obershelp clustering to the Apple-Silicon
+GPU (Metal compute) via its stateful `Rationer` handle. It's wired in but **off by default** and
+gated twice:
+
+- **Build:** `cargo build --release --features gpu` (links Metal; macOS only).
+- **Runtime:** `-D 'settings:gpu=on'` (or `gpu+cpu` / `gpu` / `off`).
+
+Only large, all-ASCII same-name groups (≥ ~300 members) route to the GPU — the per-pair
+`matching_stats` walk runs on Metal while the CPU keeps the filters, `longest_in` recursion, and
+assembly. Everything else stays on CPU. On a non-`gpu` build, off macOS, or with no Metal device,
+the setting is silently a CPU no-op. **Output is byte-for-byte identical** in every mode (verified
+against the CPU path on rustc's `compiler`, `tests/ui`, and a TS corpus).
+
+**Honest read — it rarely helps end-to-end here.** The GPU only accelerates the clustering of a
+*single* large group; `difflib-fast`'s own micro-benchmark measures **1.1–1.4×** there on
+mid-size-body corpora (mypy/sympy). `find-dup-defs`'s real shape is the opposite — *many* same-name
+groups, most small — which is the case `difflib-fast` documents as **0.6–0.99×** (the fixed
+per-dispatch cost never amortizes), and groups of *short* bodies (e.g. rustc's thousands of
+`fn main` fixtures) are the GPU's worst case. Measured on `rustc/tests/ui` (20 425 `.rs` files,
+which contains `functions:main ×12 678` and other ≥256 groups), `hyperfine --warmup 1`:
+
+| mode | mean | speedup |
+|---|---|---|
+| `settings:gpu=off` (CPU) | 33.97 s ± 0.38 | 1.00× |
+| `settings:gpu=on` (GPU+CPU) | 33.62 s ± 0.68 | **1.01×** (tie) |
+
+So it's there for the narrow single-large-group-of-substantial-bodies case; for everyday runs the
+default CPU path is the right choice. (The Metal device + power-boost assertion are acquired only
+when a GPU mode is selected, so `gpu=off` keeps the historical zero startup cost.)
 
 ---
 

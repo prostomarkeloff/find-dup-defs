@@ -269,6 +269,7 @@ pub fn pass_name_gated(
     error: f64,
     min_size: usize,
     max_group: Option<usize>,
+    rationer: &difflib_fast::Rationer,
 ) -> Vec<Finding> {
     let mut groups: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
     for (i, d) in defs.iter().enumerate() {
@@ -286,7 +287,7 @@ pub fn pass_name_gated(
             let kind = defs[idxs[0]].kind;
             if !kind.body {
                 let canons: Vec<String> = idxs.iter().map(|&i| defs[i].text_orig.clone()).collect();
-                let clusters = difflib_fast::cluster_canonicals(&canons, 0.0);
+                let clusters = rationer.cluster_canonicals(&canons, 0.0);
                 return clusters
                     .into_iter()
                     .filter(|(c, _)| c.len() >= min_size)
@@ -318,7 +319,8 @@ pub fn pass_name_gated(
             }
             let canons: Vec<String> =
                 idxs.iter().map(|&i| defs[i].cluster_canonical.clone().unwrap_or_default()).collect();
-            difflib_fast::cluster_canonicals(&canons, threshold)
+            rationer
+                .cluster_canonicals(&canons, threshold)
                 .into_iter()
                 .filter(|(c, _)| c.len() >= min_size)
                 .map(|(c, min_sim)| {
@@ -432,6 +434,51 @@ pub fn pass_type3(defs: &[Def], theta: f64) -> Vec<Finding> {
         .collect()
 }
 
+// ── Backend selection ──────────────────────────────────────────────────────
+
+/// Backend for the name-gated Ratcliff–Obershelp clustering ([`pass_name_gated`]).
+///
+/// `Cpu` (default) is the historical path. `Gpu` / `GpuPlusCpu` ask `difflib-fast` to offload the
+/// large same-name groups to its Metal backend — but only when this crate is built with
+/// `--features gpu` *and* running on macOS with a usable Metal device. Without those, the
+/// [`difflib_fast::Rationer`] transparently degrades to CPU with byte-identical output, so the mode
+/// is always safe to request. GPU only engages where it measured a net win (a single group past
+/// `difflib-fast`'s size cutoff, all-ASCII); smaller groups stay on CPU regardless.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GpuMode {
+    /// Pure CPU. The only mode with any effect on a non-`gpu` build.
+    #[default]
+    Cpu,
+    /// Allow the Metal GPU on the paths where it wins; everything else stays on CPU.
+    Gpu,
+    /// Like [`GpuMode::Gpu`] plus rayon-parallel CPU overlap on the GPU output. `difflib-fast`'s
+    /// own recommended default; the value `settings:gpu=on` maps to.
+    #[serde(rename = "gpu+cpu")]
+    GpuPlusCpu,
+}
+
+impl GpuMode {
+    /// Map to `difflib-fast`'s backend selector.
+    fn to_concurrency(self) -> difflib_fast::Concurrency {
+        match self {
+            GpuMode::Cpu => difflib_fast::Concurrency::Cpu,
+            GpuMode::Gpu => difflib_fast::Concurrency::Gpu,
+            GpuMode::GpuPlusCpu => difflib_fast::Concurrency::GpuPlusCpu,
+        }
+    }
+}
+
+/// Build the shared clustering handle once per run. A [`difflib_fast::Rationer`] owns the long-lived
+/// backend resources (Metal device + power-boost assertion under a GPU mode; nothing under `Cpu`)
+/// and is reused across every per-group `cluster_canonicals` call instead of rebuilding per call.
+/// `Concurrency::Cpu` acquires no Metal device, so the default mode keeps the historical zero
+/// startup cost.
+#[must_use]
+fn build_rationer(mode: GpuMode) -> difflib_fast::Rationer {
+    difflib_fast::Rationer::builder().concurrency(mode.to_concurrency()).build()
+}
+
 // ── Pipeline orchestration ────────────────────────────────────────────────
 
 /// All the knobs the pipeline takes. Defaults via [`PipelineOpts::with_paths`].
@@ -464,6 +511,8 @@ pub struct PipelineOpts {
     /// Skip name-gated clustering for `(kind, name)` groups larger than this. `None` (default) =
     /// no cap, behavior unchanged. See [`pass_name_gated`].
     pub max_name_group: Option<usize>,
+    /// Backend for the name-gated clustering (default [`GpuMode::Cpu`]). See [`GpuMode`].
+    pub gpu: GpuMode,
 }
 
 impl PipelineOpts {
@@ -483,6 +532,7 @@ impl PipelineOpts {
             no_cross_name: false,
             no_type3: false,
             max_name_group: None,
+            gpu: GpuMode::Cpu,
         }
     }
 }
@@ -536,8 +586,17 @@ pub fn cluster(mut defs: Vec<Def>, opts: &PipelineOpts) -> Vec<Finding> {
         (a.file.as_ref(), a.line, a.col).cmp(&(b.file.as_ref(), b.line, b.col))
     });
 
-    let mut findings =
-        pass_name_gated(&defs, opts.threshold, opts.error_threshold, opts.min_size, opts.max_name_group);
+    // One shared clustering handle for the whole run — built once (acquiring the Metal device only
+    // under a GPU mode), reused across every per-group `cluster_canonicals` call below.
+    let rationer = build_rationer(opts.gpu);
+    let mut findings = pass_name_gated(
+        &defs,
+        opts.threshold,
+        opts.error_threshold,
+        opts.min_size,
+        opts.max_name_group,
+        &rationer,
+    );
     if !opts.no_cross_name {
         findings.extend(pass_cross_name(&defs, opts.min_size));
     }

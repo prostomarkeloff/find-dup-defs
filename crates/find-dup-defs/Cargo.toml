@@ -1,6 +1,6 @@
 [package]
 name = "find-dup-defs"
-version = "0.4.0"
+version = "0.5.0"
 description = "Find duplicate / near-duplicate top-level definitions across a codebase via clone clustering (Python frontend today)."
 keywords = ["duplicate", "clone", "python", "lint", "ast"]
 categories = ["command-line-utilities", "development-tools"]
@@ -26,7 +26,7 @@ ts-canon = { path = "../ts-canon", version = "0.1" }
 # Rust frontend — same contract as `py-canon`/`ts-canon`, over the `syn` parser.
 rs-canon = { path = "../rs-canon", version = "0.1" }
 # exact difflib Ratcliff–Obershelp ratio + clustering (https://crates.io/crates/difflib-fast)
-difflib-fast = "0.1"
+difflib-fast = "0.2"
 rayon = "1"
 rustc-hash = "2" # FxHash for the Type-3 (ECScan) pass's hot token/shingle maps
 walkdir = "2"
@@ -36,6 +36,13 @@ mimalloc = { version = "0.1", default-features = false }
 # dict order); serde's struct-field order + ryu floats reproduce its output byte-for-byte.
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+
+[features]
+# Heterogeneous CPU+GPU name-gated clustering through difflib-fast's Metal backend (Apple Silicon
+# only; a no-op elsewhere — the Rationer degrades to CPU with identical output). Off by default so
+# the stock build links no Metal/CoreFoundation; opt in at build time (`cargo build --features gpu`)
+# and then engage at runtime with `-D 'settings:gpu=on'`.
+gpu = ["difflib-fast/gpu"]
 
 [lints]
 workspace = true

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use dup_defs_core::{Frontend, KindSpec};
-use find_dup_defs::{cluster, collect_defs, large_name_groups, section_index, Finding, PipelineOpts, Severity};
+use find_dup_defs::{cluster, collect_defs, large_name_groups, section_index, Finding, GpuMode, PipelineOpts, Severity};
 use serde::Serialize;
 
 #[global_allocator]
@@ -266,6 +266,23 @@ fn apply_setting(opts: &mut PipelineOpts, key: &str, value: &str) {
             };
             opts.max_name_group = Some(n);
         }
+        // Backend for the name-gated clustering. Accepts boolean-ish words and the three
+        // `difflib-fast` concurrency names; `on` maps to the recommended GPU+CPU mode. Only takes
+        // effect on a `--features gpu` macOS build (else the Rationer runs CPU with identical
+        // output), but the directive parses and validates everywhere so a shared config is portable.
+        "gpu" => {
+            opts.gpu = match value.trim().to_ascii_lowercase().as_str() {
+                "off" | "cpu" | "false" | "no" | "0" => GpuMode::Cpu,
+                "on" | "true" | "yes" | "1" | "gpu+cpu" | "gpucpu" | "gpu_cpu" => GpuMode::GpuPlusCpu,
+                "gpu" => GpuMode::Gpu,
+                other => {
+                    eprintln!(
+                        "find-dup-defs: settings:gpu expects on/off (or cpu/gpu/gpu+cpu), got {other:?}"
+                    );
+                    std::process::exit(2);
+                }
+            };
+        }
         other => eprintln!("find-dup-defs: ignoring unknown settings key {other:?}"),
     }
 }
@@ -316,7 +333,7 @@ fn glob_match_simple(pat: &str, s: &str) -> bool {
 /// pattern with no alternation is one-call cheap.
 #[cfg(test)]
 mod glob_tests {
-    use super::{expand_braces, glob_match, parse_directive, vendored_score, DirectiveAction, PipelineOpts};
+    use super::{expand_braces, glob_match, parse_directive, vendored_score, DirectiveAction, GpuMode, PipelineOpts};
 
     #[test]
     fn settings_directive_parses_key_and_value() {
@@ -338,6 +355,20 @@ mod glob_tests {
         // unknown key is ignored (forward-compatible), not fatal.
         super::apply_setting(&mut opts, "future-knob", "x");
         assert_eq!(opts.max_name_group, Some(256));
+    }
+
+    #[test]
+    fn apply_setting_sets_gpu_mode() {
+        let mut opts = PipelineOpts::with_paths(vec![]);
+        assert_eq!(opts.gpu, GpuMode::Cpu); // default
+        super::apply_setting(&mut opts, "gpu", "on");
+        assert_eq!(opts.gpu, GpuMode::GpuPlusCpu);
+        super::apply_setting(&mut opts, "gpu", "gpu");
+        assert_eq!(opts.gpu, GpuMode::Gpu);
+        super::apply_setting(&mut opts, "gpu", "GPU+CPU"); // case-insensitive
+        assert_eq!(opts.gpu, GpuMode::GpuPlusCpu);
+        super::apply_setting(&mut opts, "gpu", "off");
+        assert_eq!(opts.gpu, GpuMode::Cpu);
     }
 
     #[test]
@@ -475,6 +506,7 @@ fn main() {
         no_cross_name: cli.no_cross_name,
         no_type3: cli.no_type3,
         max_name_group: cli.max_name_group,
+        gpu: GpuMode::Cpu,
     };
     for d in directives.iter().filter(|d| d.action == DirectiveAction::Settings) {
         apply_setting(&mut opts, &d.name_pat, d.note.as_deref().unwrap_or_default());
