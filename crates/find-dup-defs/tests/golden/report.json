@@ -1,0 +1,367 @@
+{
+  "groups": [
+    {
+      "kind": "CONSTANT",
+      "name": "DEFAULT_TIMEOUT",
+      "severity": "ERROR",
+      "min_sim": 1.0,
+      "cross_name": false,
+      "thickness": 0.2666138073748283,
+      "loc": 1,
+      "args": 0,
+      "members": [
+        {
+          "file": "py/core_a.py",
+          "line": 2
+        },
+        {
+          "file": "py/core_b.py",
+          "line": 2
+        },
+        {
+          "file": "ts/core_a.ts",
+          "line": 2
+        },
+        {
+          "file": "ts/core_b.ts",
+          "line": 2
+        }
+      ],
+      "allowlist_key": "dup-constant DEFAULT_TIMEOUT",
+      "notes": []
+    },
+    {
+      "kind": "CONSTANT",
+      "name": "MAX_RETRIES",
+      "severity": "ERROR",
+      "min_sim": 1.0,
+      "cross_name": false,
+      "thickness": 0.2666138073748283,
+      "loc": 1,
+      "args": 0,
+      "members": [
+        {
+          "file": "py/core_a.py",
+          "line": 1
+        },
+        {
+          "file": "py/core_b.py",
+          "line": 1
+        },
+        {
+          "file": "ts/core_a.ts",
+          "line": 1
+        },
+        {
+          "file": "ts/core_b.ts",
+          "line": 1
+        }
+      ],
+      "allowlist_key": "dup-constant MAX_RETRIES",
+      "notes": []
+    },
+    {
+      "kind": "FUNCTION",
+      "name": "computeScore",
+      "severity": "ERROR",
+      "min_sim": 1.0,
+      "cross_name": false,
+      "thickness": 0.37864529896068894,
+      "loc": 7,
+      "args": 2,
+      "members": [
+        {
+          "file": "ts/core_a.ts",
+          "line": 12
+        },
+        {
+          "file": "ts/core_b.ts",
+          "line": 12
+        }
+      ],
+      "allowlist_key": "dup-function computeScore",
+      "notes": []
+    },
+    {
+      "kind": "FUNCTION",
+      "name": "compute_score",
+      "severity": "ERROR",
+      "min_sim": 1.0,
+      "cross_name": false,
+      "thickness": 0.3404307879730062,
+      "loc": 5,
+      "args": 2,
+      "members": [
+        {
+          "file": "py/core_a.py",
+          "line": 8
+        },
+        {
+          "file": "py/core_b.py",
+          "line": 8
+        }
+      ],
+      "allowlist_key": "dup-function compute_score",
+      "notes": []
+    },
+    {
+      "kind": "FUNCTION",
+      "name": "renderBadge",
+      "severity": "ERROR",
+      "min_sim": 1.0,
+      "cross_name": false,
+      "thickness": 0.3404307879730062,
+      "loc": 5,
+      "args": 2,
+      "members": [
+        {
+          "file": "ts/widget_a.tsx",
+          "line": 1
+        },
+        {
+          "file": "ts/widget_b.tsx",
+          "line": 1
+        }
+      ],
+      "allowlist_key": "dup-function renderBadge",
+      "notes": []
+    },
+    {
+      "kind": "FUNCTION",
+      "name": "addNumbers/plusNumbers",
+      "severity": "WARNING",
+      "min_sim": null,
+      "cross_name": true,
+      "thickness": 0.32034667206637285,
+      "loc": 4,
+      "args": 2,
+      "members": [
+        {
+          "file": "ts/core_a.ts",
+          "line": 20
+        },
+        {
+          "file": "ts/core_b.ts",
+          "line": 20
+        }
+      ],
+      "allowlist_key": "dup-xname addNumbers/plusNumbers",
+      "notes": []
+    },
+    {
+      "kind": "FUNCTION",
+      "name": "add_numbers/plus_numbers",
+      "severity": "WARNING",
+      "min_sim": null,
+      "cross_name": true,
+      "thickness": 0.29958180277126445,
+      "loc": 3,
+      "args": 2,
+      "members": [
+        {
+          "file": "py/core_a.py",
+          "line": 15
+        },
+        {
+          "file": "py/core_b.py",
+          "line": 15
+        }
+      ],
+      "allowlist_key": "dup-xname add_numbers/plus_numbers",
+      "notes": []
+    },
+    {
+      "kind": "METHOD",
+      "name": "Repository.fetchItem",
+      "severity": "ERROR",
+      "min_sim": 1.0,
+      "cross_name": false,
+      "thickness": 0.36380422825645464,
+      "loc": 7,
+      "args": 1,
+      "members": [
+        {
+          "file": "ts/core_a.ts",
+          "line": 26
+        },
+        {
+          "file": "ts/core_b.ts",
+          "line": 26
+        }
+      ],
+      "allowlist_key": "dup-method Repository.fetchItem",
+      "notes": []
+    },
+    {
+      "kind": "METHOD",
+      "name": "Repository.fetch_item",
+      "severity": "ERROR",
+      "min_sim": 1.0,
+      "cross_name": false,
+      "thickness": 0.3404307879730062,
+      "loc": 5,
+      "args": 2,
+      "members": [
+        {
+          "file": "py/core_a.py",
+          "line": 21
+        },
+        {
+          "file": "py/core_b.py",
+          "line": 21
+        }
+      ],
+      "allowlist_key": "dup-method Repository.fetch_item",
+      "notes": []
+    },
+    {
+      "kind": "METHOD",
+      "name": "Repository.normalize",
+      "severity": "ERROR",
+      "min_sim": 1.0,
+      "cross_name": false,
+      "thickness": 0.28474073206703016,
+      "loc": 3,
+      "args": 1,
+      "members": [
+        {
+          "file": "py/core_a.py",
+          "line": 28
+        },
+        {
+          "file": "py/core_b.py",
+          "line": 28
+        }
+      ],
+      "allowlist_key": "dup-method Repository.normalize",
+      "notes": []
+    },
+    {
+      "kind": "METHOD",
+      "name": "Cache.load_entry/Repository.fetch_item",
+      "severity": "ERROR",
+      "min_sim": null,
+      "cross_name": true,
+      "thickness": 0.4313960779947836,
+      "loc": 5,
+      "args": 2,
+      "members": [
+        {
+          "file": "py/core_a.py",
+          "line": 21
+        },
+        {
+          "file": "py/core_a.py",
+          "line": 34
+        },
+        {
+          "file": "py/core_b.py",
+          "line": 21
+        }
+      ],
+      "allowlist_key": "dup-xname Cache.load_entry/Repository.fetch_item",
+      "notes": []
+    },
+    {
+      "kind": "CLASS",
+      "name": "Repository",
+      "severity": "ERROR",
+      "min_sim": 1.0,
+      "cross_name": false,
+      "thickness": 0.3984280825983475,
+      "loc": 10,
+      "args": 0,
+      "members": [
+        {
+          "file": "py/core_a.py",
+          "line": 20
+        },
+        {
+          "file": "py/core_b.py",
+          "line": 20
+        }
+      ],
+      "allowlist_key": "dup-class Repository",
+      "notes": []
+    },
+    {
+      "kind": "CLASS",
+      "name": "Repository",
+      "severity": "ERROR",
+      "min_sim": 1.0,
+      "cross_name": false,
+      "thickness": 0.3814272455227975,
+      "loc": 9,
+      "args": 0,
+      "members": [
+        {
+          "file": "ts/core_a.ts",
+          "line": 25
+        },
+        {
+          "file": "ts/core_b.ts",
+          "line": 25
+        }
+      ],
+      "allowlist_key": "dup-class Repository",
+      "notes": []
+    },
+    {
+      "kind": "INTERFACE",
+      "name": "Repo",
+      "severity": "ERROR",
+      "min_sim": 1.0,
+      "cross_name": false,
+      "thickness": 0.3074627925765701,
+      "loc": 5,
+      "args": 0,
+      "members": [
+        {
+          "file": "ts/core_a.ts",
+          "line": 6
+        },
+        {
+          "file": "ts/core_b.ts",
+          "line": 6
+        }
+      ],
+      "allowlist_key": "dup-interface Repo",
+      "notes": []
+    },
+    {
+      "kind": "TYPE_ALIAS",
+      "name": "UserIds",
+      "severity": "WARNING",
+      "min_sim": 0.7083333333333334,
+      "cross_name": false,
+      "thickness": 0.20828047404149502,
+      "loc": 1,
+      "args": 0,
+      "members": [
+        {
+          "file": "py/core_a.py",
+          "line": 5
+        },
+        {
+          "file": "py/core_b.py",
+          "line": 5
+        },
+        {
+          "file": "ts/core_a.ts",
+          "line": 4
+        },
+        {
+          "file": "ts/core_b.ts",
+          "line": 4
+        }
+      ],
+      "allowlist_key": "dup-type_alias UserIds",
+      "notes": []
+    }
+  ],
+  "summary": {
+    "ERROR": 12,
+    "WARNING": 3,
+    "total": 15
+  }
+}

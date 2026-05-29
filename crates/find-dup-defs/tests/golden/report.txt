@@ -1,0 +1,87 @@
+--- duplicate constants (cross-file, by name) ---
+DUPLICATE CONSTANT [ERROR]: DEFAULT_TIMEOUT  [ast sim 1.00, T=0.27, n=4, loc=1]
+  py/core_a.py:2
+  py/core_b.py:2
+  ts/core_a.ts:2
+  ts/core_b.ts:2
+
+DUPLICATE CONSTANT [ERROR]: MAX_RETRIES  [ast sim 1.00, T=0.27, n=4, loc=1]
+  py/core_a.py:1
+  py/core_b.py:1
+  ts/core_a.ts:1
+  ts/core_b.ts:1
+
+
+--- duplicate functions (cross-file, AST sim warn=0.5 error=0.85) ---
+DUPLICATE FUNCTION [ERROR]: computeScore  [ast sim 1.00, T=0.38, n=2, loc=7, args=2]
+  ts/core_a.ts:12
+  ts/core_b.ts:12
+
+DUPLICATE FUNCTION [ERROR]: compute_score  [ast sim 1.00, T=0.34, n=2, loc=5, args=2]
+  py/core_a.py:8
+  py/core_b.py:8
+
+DUPLICATE FUNCTION [ERROR]: renderBadge  [ast sim 1.00, T=0.34, n=2, loc=5, args=2]
+  ts/widget_a.tsx:1
+  ts/widget_b.tsx:1
+
+
+--- duplicate functions (cross-name, exact AST-normalized) ---
+DUPLICATE FUNCTION [WARNING]: addNumbers/plusNumbers  [normalized-exact, T=0.32, n=2, loc=4, args=2]
+  ts/core_a.ts:20
+  ts/core_b.ts:20
+
+DUPLICATE FUNCTION [WARNING]: add_numbers/plus_numbers  [normalized-exact, T=0.30, n=2, loc=3, args=2]
+  py/core_a.py:15
+  py/core_b.py:15
+
+
+--- duplicate functions (cross-name Type-3, IDF-weighted cosine) ---
+
+--- duplicate methods (cross-file, AST sim warn=0.5 error=0.85) ---
+DUPLICATE METHOD [ERROR]: Repository.fetchItem  [ast sim 1.00, T=0.36, n=2, loc=7, args=1]
+  ts/core_a.ts:26
+  ts/core_b.ts:26
+
+DUPLICATE METHOD [ERROR]: Repository.fetch_item  [ast sim 1.00, T=0.34, n=2, loc=5, args=2]
+  py/core_a.py:21
+  py/core_b.py:21
+
+DUPLICATE METHOD [ERROR]: Repository.normalize  [ast sim 1.00, T=0.28, n=2, loc=3, args=1]
+  py/core_a.py:28
+  py/core_b.py:28
+
+
+--- duplicate methods (cross-name, exact AST-normalized) ---
+DUPLICATE METHOD [ERROR]: Cache.load_entry/Repository.fetch_item  [normalized-exact, T=0.43, n=3, loc=5, args=2]
+  py/core_a.py:21
+  py/core_a.py:34
+  py/core_b.py:21
+
+
+--- duplicate methods (cross-name Type-3, IDF-weighted cosine) ---
+
+--- duplicate classes (cross-file, AST sim warn=0.5 error=0.85) ---
+DUPLICATE CLASS [ERROR]: Repository  [ast sim 1.00, T=0.40, n=2, loc=10]
+  py/core_a.py:20
+  py/core_b.py:20
+
+DUPLICATE CLASS [ERROR]: Repository  [ast sim 1.00, T=0.38, n=2, loc=9]
+  ts/core_a.ts:25
+  ts/core_b.ts:25
+
+
+--- duplicate interfaces (cross-file, AST sim warn=0.5 error=0.85) ---
+DUPLICATE INTERFACE [ERROR]: Repo  [ast sim 1.00, T=0.31, n=2, loc=5]
+  ts/core_a.ts:6
+  ts/core_b.ts:6
+
+
+--- duplicate type aliases (cross-file, by name) ---
+DUPLICATE TYPE_ALIAS [WARNING]: UserIds  [ast sim 0.71, T=0.21, n=4, loc=1]
+  py/core_a.py:5
+  py/core_b.py:5
+  ts/core_a.ts:4
+  ts/core_b.ts:4
+
+# summary: 12 ERROR, 3 WARNING groups
