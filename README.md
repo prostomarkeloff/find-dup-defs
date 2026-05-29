@@ -10,12 +10,12 @@
 [![exact difflib](https://img.shields.io/badge/similarity-byte--for--byte%20difflib-blue.svg)](https://crates.io/crates/difflib-fast)
 
 Duplicate & near-duplicate definitions — functions, **methods**, classes, constants, `type` aliases,
-**TypeScript interfaces** — clustered by structural AST canonicalization, ranked by a normalized
-**Thickness** score, graded ERROR / WARNING / INFO, with **auto-suggested project-specific noise
-filters** out of the box.
+**TypeScript interfaces / Rust traits** — clustered by structural AST canonicalization, ranked by a
+normalized **Thickness** score, graded ERROR / WARNING / INFO, with **auto-suggested project-specific
+noise filters** out of the box.
 
-**Python and TypeScript today** — `--only py,ts` to scope per language. One engine, two
-single-parse native frontends (Ruff for Python, oxc for TypeScript).
+**Python, TypeScript, and Rust today** — `--only py,ts,rs` to scope per language. One engine, three
+single-parse native frontends (Ruff for Python, oxc for TypeScript, syn for Rust).
 
 **2-12× faster than PMD CPD / jscpd. Calibrates itself on first run.**
 
@@ -102,9 +102,9 @@ cargo install find-dup-defs
 
 ## The three detection passes
 
-Every `.py` / `.ts` / `.tsx` / `.mts` / `.cts` file is parsed **once** (Ruff for Python — PEP 695 /
-701 ready; oxc for TypeScript — TS 5.x, JSX/TSX, decorators), each callable yielded as top-level
-functions **and class methods** (`Foo.bar`, `Foo.Inner.baz`):
+Every `.py` / `.ts` / `.tsx` / `.mts` / `.cts` / `.rs` file is parsed **once** (Ruff for Python — PEP
+695 / 701 ready; oxc for TypeScript — TS 5.x, JSX/TSX, decorators; syn for Rust — full item grammar),
+each callable yielded as top-level functions **and methods** (`Foo.bar` / `Type::method`):
 
 1. **name-gated** — same-`(kind, name)` defs clustered by exact Ratcliff–Obershelp similarity on the `ast.dump`-shape canonical.
 2. **cross-name** — renamed copy-paste: alpha-renamed canonical bucketed, ≥2 distinct names across ≥2 sites.
@@ -356,6 +356,24 @@ DUPLICATE FUNCTION [ERROR]: apply{ActivityBar,Explorer,Keybindings,Localization,
   ...
 ```
 
+…or on Rust — `find-dup-defs` dogfooding on its own crates (the three language frontends share structure):
+
+```console
+$ find-dup-defs ./crates --only rs
+--- duplicate functions (cross-file, AST sim warn=0.5 error=0.85) ---
+DUPLICATE FUNCTION [WARNING]: keyword_start  [ast sim 0.69, T=0.75, n=3, loc=25, args=3]
+  crates/py-canon/src/defs.rs:74
+  crates/rs-canon/src/defs.rs:55
+  crates/ts-canon/src/defs.rs:79
+
+--- duplicate methods (cross-name, exact AST-normalized) ---
+DUPLICATE METHOD [ERROR]: Python::scan/Rust::scan/TypeScript::scan
+  [normalized-exact, T=0.45, n=3, loc=6, args=1]
+  crates/py-canon/src/frontend.rs:61
+  crates/rs-canon/src/frontend.rs:50
+  crates/ts-canon/src/frontend.rs:50
+```
+
 ---
 
 ## CLI reference (essentials)
@@ -366,7 +384,7 @@ USAGE:
 
 LANGUAGES:
   --only <CODES>             Restrict scan to specific frontends (comma-separated:
-                             py,ts). Default: every supported frontend found in PATHS.
+                             py,ts,rs). Default: every supported frontend found in PATHS.
                              Unknown codes exit non-zero.
 
 THICKNESS LADDER:
@@ -401,7 +419,7 @@ OUTPUT:
 
 ## Architecture
 
-Four crates, each useful on its own:
+Five crates, each useful on its own:
 
 | crate | role |
 |---|---|
@@ -409,6 +427,7 @@ Four crates, each useful on its own:
 | [`dup-defs-core`](crates/dup-defs-core) | **Engine contract** — `Def` / `KindSpec` / `Analysis` / the `Frontend` trait (+ `LineMap`). Each frontend declares its own open kind vocabulary and lowers definitions to `Def` with canon precomputed. |
 | [`py-canon`](crates/py-canon) | **Python frontend** — Ruff parse → `ast.dump`-shape canonical + def scan |
 | [`ts-canon`](crates/ts-canon) | **TypeScript frontend** — oxc parse → s-expr canonical + def scan |
+| [`rs-canon`](crates/rs-canon) | **Rust frontend** — syn parse → s-expr canonical + def scan |
 
 Adding a new language is one more frontend crate that implements the `Frontend` trait against
 `dup-defs-core` (`scan` → `Vec<Def>`, each definition's canonical strings precomputed in the
@@ -419,7 +438,7 @@ single parse) — no engine changes. The similarity engine is the exact Ratcliff
 
 ## Limitations
 
-- **Python + TypeScript** today (frontend crate per language; PRs welcome — Rust / Go / Java would each be a `<lang>-canon` sibling)
+- **Python, TypeScript, Rust** today (frontend crate per language; PRs welcome — Go / Java / C# would each be a `<lang>-canon` sibling)
 - **Type 4 (semantic equivalence, different syntax → same logic)** — not done; neural-network research territory
 - **Token-level fine-grained duplication** (a 30-token sub-expression copy-pasted around) — out of scope; use jscpd / PMD CPD alongside if you need that
 - **Calibration is heuristic** — formula constants (loc=20, args=5, weight 0.7/0.1/0.2) were tuned on the 28-Python-repo + 10-TS-repo benchmarks; your codebase may want different
