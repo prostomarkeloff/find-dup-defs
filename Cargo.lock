@@ -300,6 +300,7 @@ dependencies = [
  "mimalloc",
  "py-canon",
  "rayon",
+ "rs-canon",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -1013,6 +1014,17 @@ name = "regex-automata"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f"
+
+[[package]]
+name = "rs-canon"
+version = "0.1.0"
+dependencies = [
+ "dup-defs-core",
+ "proc-macro2",
+ "rayon",
+ "syn",
+ "walkdir",
+]
 
 [[package]]
 name = "rustc-hash"

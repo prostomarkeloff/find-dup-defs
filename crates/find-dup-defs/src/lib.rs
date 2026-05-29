@@ -189,12 +189,25 @@ pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf]) -> Vec<Def> 
             route(p);
         }
     }
-    let mut defs = Vec::new();
-    for (fi, files) in per_frontend.into_iter().enumerate() {
-        let files: Vec<Arc<str>> = files.into_iter().collect();
-        defs.extend(frontends[fi].scan(&files));
+    // Recursive-descent parsers (syn especially) have no built-in nesting limit, and a deeply
+    // nested file — rustc's parser-stress fixtures, generated code — can exhaust a worker
+    // thread's default 2 MiB stack during parse or canonicalization. Run the scan on a pool with
+    // a generous per-worker stack so realistically-deep input is handled; the few inputs nested
+    // beyond this would also blow a compiler's own limits.
+    let scan = move || {
+        let mut defs = Vec::new();
+        for (fi, files) in per_frontend.into_iter().enumerate() {
+            let files: Vec<Arc<str>> = files.into_iter().collect();
+            defs.extend(frontends[fi].scan(&files));
+        }
+        defs
+    };
+    // Run the scan on a pool with a generous per-worker stack, falling back to the global pool if
+    // the pool can't be built (only fails on OS thread-spawn exhaustion).
+    match rayon::ThreadPoolBuilder::new().stack_size(64 * 1024 * 1024).build() {
+        Ok(pool) => pool.install(scan),
+        Err(_) => scan(),
     }
-    defs
 }
 
 // ── Cluster helpers ─────────────────────────────────────────────────────────
@@ -242,14 +255,29 @@ pub fn section_index(f: &Finding) -> usize {
 
 /// Pass 1 — name-gated: same-named body-kind defs clustered by structural-canonical
 /// similarity; same-named raw-text kinds (constants / type-aliases) compared by `text_orig`.
+///
+/// `max_group` (the CLI `--max-name-group`) optionally skips any `(kind, name)` group with more
+/// than that many members. Off by default (`None`) — behavior is unchanged unless the caller asks
+/// for it. It exists because a name shared by hundreds of definitions (`fn main` across thousands
+/// of test fixtures, `new` / `default`) is a convention, not a refactor cluster, and the
+/// within-group O(n²) Ratcliff–Obershelp comparison can dominate runtime on huge monorepos;
+/// renamed-identical copies among the members still surface via the cross-name pass (O(n)).
 #[must_use]
-pub fn pass_name_gated(defs: &[Def], threshold: f64, error: f64, min_size: usize) -> Vec<Finding> {
+pub fn pass_name_gated(
+    defs: &[Def],
+    threshold: f64,
+    error: f64,
+    min_size: usize,
+    max_group: Option<usize>,
+) -> Vec<Finding> {
     let mut groups: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
     for (i, d) in defs.iter().enumerate() {
         groups.entry((d.kind.id, d.name.as_str())).or_default().push(i);
     }
-    let groups: Vec<((&str, &str), Vec<usize>)> =
-        groups.into_iter().filter(|(_, v)| v.len() >= 2).collect();
+    let groups: Vec<((&str, &str), Vec<usize>)> = groups
+        .into_iter()
+        .filter(|(_, v)| v.len() >= 2 && max_group.is_none_or(|c| v.len() <= c))
+        .collect();
 
     groups
         .par_iter()
@@ -433,6 +461,9 @@ pub struct PipelineOpts {
     pub no_cross_name: bool,
     /// Skip the Type-3 pass (default `false`).
     pub no_type3: bool,
+    /// Skip name-gated clustering for `(kind, name)` groups larger than this. `None` (default) =
+    /// no cap, behavior unchanged. See [`pass_name_gated`].
+    pub max_name_group: Option<usize>,
 }
 
 impl PipelineOpts {
@@ -451,6 +482,7 @@ impl PipelineOpts {
             kinds: None,
             no_cross_name: false,
             no_type3: false,
+            max_name_group: None,
         }
     }
 }
@@ -468,7 +500,35 @@ impl PipelineOpts {
 /// [`section_index`] + name + first member) and renders.
 #[must_use]
 pub fn scan_and_cluster(opts: &PipelineOpts, frontends: &[&dyn Frontend]) -> Vec<Finding> {
-    let mut defs = collect_defs(frontends, &opts.paths);
+    cluster(collect_defs(frontends, &opts.paths), opts)
+}
+
+/// Group definitions by `(kind, name)` and return the groups with at least `min_members`,
+/// sorted by descending size. A name shared by very many definitions is a convention or entry
+/// point (`fn main`, `async_setup_entry`) rather than a refactor cluster — this is the cheap
+/// (O(n)) signal the directive-inferrer uses to suggest a `settings:max-name-group` cap, and it
+/// is independent of clustering, so it's reported even when the cap skips those groups.
+#[must_use]
+pub fn large_name_groups(defs: &[Def], min_members: usize) -> Vec<(&'static KindSpec, String, usize)> {
+    let mut counts: BTreeMap<(&str, &str), (&'static KindSpec, usize)> = BTreeMap::new();
+    for d in defs {
+        let entry = counts.entry((d.kind.id, d.name.as_str())).or_insert((d.kind, 0));
+        entry.1 += 1;
+    }
+    let mut out: Vec<(&'static KindSpec, String, usize)> = counts
+        .into_iter()
+        .filter(|(_, (_, n))| *n >= min_members)
+        .map(|((_, name), (kind, n))| (kind, name.to_owned(), n))
+        .collect();
+    out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+    out
+}
+
+/// Cluster a pre-collected `Vec<Def>` (the three passes + thickness demotion/escalation). Split
+/// out of [`scan_and_cluster`] so a caller (the CLI's `--calibrate`) can also derive
+/// [`large_name_groups`] from the same single scan without re-walking the tree.
+#[must_use]
+pub fn cluster(mut defs: Vec<Def>, opts: &PipelineOpts) -> Vec<Finding> {
     if let Some(kinds) = &opts.kinds {
         defs.retain(|d| kinds.iter().any(|k| k == d.kind.id));
     }
@@ -477,7 +537,7 @@ pub fn scan_and_cluster(opts: &PipelineOpts, frontends: &[&dyn Frontend]) -> Vec
     });
 
     let mut findings =
-        pass_name_gated(&defs, opts.threshold, opts.error_threshold, opts.min_size);
+        pass_name_gated(&defs, opts.threshold, opts.error_threshold, opts.min_size, opts.max_name_group);
     if !opts.no_cross_name {
         findings.extend(pass_cross_name(&defs, opts.min_size));
     }

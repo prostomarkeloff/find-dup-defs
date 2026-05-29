@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dup-defs-core", "crates/py-canon", "crates/ts-canon", "crates/find-dup-defs"]
+members = ["crates/dup-defs-core", "crates/py-canon", "crates/ts-canon", "crates/rs-canon", "crates/find-dup-defs"]
 
 [workspace.package]
 edition = "2021"
