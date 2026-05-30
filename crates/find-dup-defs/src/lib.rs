@@ -49,10 +49,8 @@ pub fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
 /// nodes. Avoids escalating "two `return []` one-liners" to ERROR purely on a
 /// renamed-exact match.
 pub const SUBSTANCE_NODES: usize = 20;
-/// Type-3 N-line shingle window.
+/// Type-3 minimum line count: only functions with ≥ this many name-agnostic lines are joined.
 pub const SHINGLE_LINES: usize = 3;
-/// Type-3 IDF gate: drop a shingle present in > this ratio of functions.
-pub const COMMON_RATIO: f64 = 0.007;
 /// Type-3 cluster's min-cosine ≥ this → ERROR (else WARNING).
 pub const TYPE3_ERROR_THETA: f64 = 0.9;
 
@@ -441,7 +439,7 @@ pub fn pass_type3(defs: &[Def], theta: f64) -> Vec<Finding> {
     if names.len() < 2 {
         return Vec::new();
     }
-    type3::type3_clusters(&line_lists, &names, theta, SHINGLE_LINES, COMMON_RATIO)
+    type3::type3_clusters(&line_lists, &names, theta)
         .into_iter()
         .filter_map(|(cluster, min_sim)| {
             let distinct: BTreeSet<&str> = cluster.iter().map(|&c| names[c].as_str()).collect();

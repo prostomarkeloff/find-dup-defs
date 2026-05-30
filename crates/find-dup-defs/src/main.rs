@@ -518,13 +518,7 @@ fn type3_bench(spec: &str, line_lists: &[Vec<String>], names: &[String], cli: &C
     let mut ms: Vec<f64> = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = std::time::Instant::now();
-        let r = find_dup_defs::type3::type3_clusters(
-            line_lists,
-            names,
-            cli.type3_theta,
-            find_dup_defs::SHINGLE_LINES,
-            find_dup_defs::COMMON_RATIO,
-        );
+        let r = find_dup_defs::type3::type3_clusters(line_lists, names, cli.type3_theta);
         std::hint::black_box(r.len());
         ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }

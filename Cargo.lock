@@ -288,9 +288,9 @@ dependencies = [
 
 [[package]]
 name = "difflib-fast"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b1b93c870a0a0f07ad507c96347ccab7f5d2d51f4d3816f0700877f6a448af7"
+checksum = "42b9c6508d8195fb293b6c193a375710eb02236f27b0854a9e6bc2bd29ea8a34"
 dependencies = [
  "metal",
  "rayon",

@@ -1,26 +1,35 @@
-//! **Type-3** (ECScan) cross-name near-copy detection — the O(n²) numeric core.
+//! **Type-3** (ECScan) cross-name near-copy detection — on difflib-fast's exact weighted-cosine join.
 //!
-//! Given each function's name-agnostic normalized lines (from `py-canon`) plus its name, this runs the
-//! whole pipeline: IDF over line tokens → per-function line-weight vectors → rare-shingle candidate
-//! generation → IDF-weighted cosine verify → union-find → exact min-cosine per cluster. It reproduces
-//! the Python reference bit-for-bit — same token regex, IDF, sorted-shared dot, insertion-order norm,
-//! and Neumaier-compensated summation — so `min_sim` (which drives ERROR/WARNING severity) is
-//! identical. The cross-file policy (≥2 distinct names AND files) is applied by the caller.
+//! Given each function's name-agnostic normalized lines (from `py-canon`) plus its name: build
+//! IDF-weighted per-line vectors, then hand them to [`difflib_fast::simjoin`] — an **exact all-pairs
+//! weighted-cosine join** (every pair with `cos ≥ θ`) on the SOTA **L2AP** algorithm (an inverted
+//! index with a Cauchy–Schwarz prefix bound), asserted bit-identical to an `O(n²)` brute force. We
+//! then drop the pairs other passes own (same name, sync/async twins, byte-identical sequences),
+//! union-find the
+//! survivors into clusters, and report the exact min pairwise cosine per cluster (single-linkage's
+//! conservative figure, which drives ERROR/WARNING severity). The cross-file policy (≥2 distinct
+//! names AND files) is applied by the caller.
 //!
-//! Perf shape (all results-invariant — clusters + `min_sim` are bit-identical regardless): the setup
-//! (line interning, `line_weight`, `FnVec` build) is rayon-parallel; the internal maps use `FxHash`
-//! not SipHash; each `FnVec` is a sorted `Vec` not a per-function `HashMap`; the crate runs on mimalloc.
-#![allow(clippy::doc_markdown)]
+//! This replaces the previous hand-rolled rare-3-line-shingle candidate generation + Python-bit-exact
+//! Neumaier cosine. simjoin is **exact all-pairs** — no shingle recall loss — and computes the same
+//! IDF-cosine metric (L2-normalised dot); scores shift by ~1e-15 vs the old Neumaier path, immaterial
+//! beside the recall change and below the ERROR/WARNING boundary except for a cluster sitting exactly
+//! on it. Vector construction (line interning, IDF, weights) is rayon-parallel; maps are `FxHash`.
+#![allow(
+    clippy::doc_markdown,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 
+use difflib_fast::simjoin::{cosine_join, Corpus};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Tokenize one line like Python's `re.compile(r"[A-Za-z_]\w*|\d+|\S")` — Unicode-aware, matching
 /// `findall`. An identifier starts on an ASCII `[A-Za-z_]` then greedily takes Python's `\w`
-/// (Unicode word chars: `is_alphanumeric` or `_` — so an ASCII letter followed by Cyrillic/accented
-/// letters in a string literal, e.g. `nВключи`, stays ONE token, exactly as Python's `\w*` does); a
-/// run of ASCII digits is `\d+`; any other non-whitespace code point is a single `\S`; whitespace
-/// (Unicode `\s`) is skipped. Left-to-right, non-overlapping.
+/// (Unicode word chars: `is_alphanumeric` or `_`); a run of ASCII digits is `\d+`; any other
+/// non-whitespace code point is a single `\S`; whitespace is skipped. Left-to-right, non-overlapping.
 fn tokenize(line: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut it = line.char_indices().peekable();
@@ -59,80 +68,36 @@ fn tokenize(line: &str) -> Vec<&str> {
     out
 }
 
-/// One function reduced to what the cosine needs: its distinct lines as `(line id, aggregated IDF
-/// weight)` **sorted by id**, plus the precomputed norm. A sorted vector (not a `HashMap`) so the dot
-/// is a linear merge and construction allocates one small Vec instead of a per-function hash table —
-/// the per-function `HashMap<u32,f64>` was the profile's dominant cost (alloc + memmove churn). Bit-
-/// exactness is preserved: weights still accumulate by repeated `+= w` in line order, and the norm
-/// still sums in first-occurrence (insertion) order before the sort. (The raw line sequence for
-/// shingles / byte-identical comparison lives in the shared `seqs`.)
-struct FnVec {
-    sorted: Vec<(u32, f64)>, // (line id, aggregated weight), ascending by id — for the dot merge
-    norm: f64,
-}
-
-/// Kahan–Babuška–**Neumaier** compensated summation — exactly what CPython's `sum()` does for floats
-/// since 3.12. The Python reference sums every float total (line weights, dot, norm) with `sum()`, so
-/// the score is only bit-identical if we compensate the same way; naive left-to-right summation drifts
-/// by ~1 ULP and can flip a cluster across the ERROR/WARNING line.
-fn neumaier_sum(values: impl Iterator<Item = f64>) -> f64 {
-    let mut sum = 0.0f64;
-    let mut c = 0.0f64;
-    for v in values {
-        let t = sum + v;
-        if sum.abs() >= v.abs() {
-            c += (sum - t) + v;
-        } else {
-            c += (v - t) + sum;
-        }
-        sum = t;
-    }
-    sum + c
-}
-
 /// `a == f"a{b}"` or `b == f"a{a}"` — the sync/async naming twin convention (owned by another pass).
 fn is_sync_async(a: &str, b: &str) -> bool {
     (a.len() == b.len() + 1 && a.as_bytes().first() == Some(&b'a') && &a[1..] == b)
         || (b.len() == a.len() + 1 && b.as_bytes().first() == Some(&b'a') && &b[1..] == a)
 }
 
-/// IDF-weighted cosine over two functions' line vectors. Dot is summed over **sorted** shared keys
-/// and each norm over **insertion order**, both with Neumaier compensation — exactly as the Python
-/// reference does, so the score is reproducible and bit-identical (it can otherwise flip a cluster
-/// across the ERROR/WARNING threshold).
-fn cosine(a: &FnVec, b: &FnVec) -> f64 {
-    if a.norm == 0.0 || b.norm == 0.0 {
+/// Cosine of two sparse line vectors given their precomputed norms: sorted-merge dot of the shared
+/// line ids over `norm_a · norm_b`. Same IDF-cosine metric as the join; used for the per-cluster
+/// `min_sim` (over all intra-cluster pairs, including the sub-θ ones the join doesn't return).
+fn cosine(a: &[(u32, f64)], b: &[(u32, f64)], na: f64, nb: f64) -> f64 {
+    if na == 0.0 || nb == 0.0 {
         return 0.0;
     }
-    // Dot over shared line ids, summed in ascending-id (= line-text, since ids are assigned in
-    // lexicographic order) order with Neumaier compensation — same keys, same order, same algorithm as
-    // the reference's `sum(a[k]*b[k] for k in sorted(shared))`, so the dot is bit-identical.
     let (mut i, mut j) = (0usize, 0usize);
-    let (mut sum, mut comp) = (0.0f64, 0.0f64);
-    while i < a.sorted.len() && j < b.sorted.len() {
-        let (ka, wa) = a.sorted[i];
-        let (kb, wb) = b.sorted[j];
-        match ka.cmp(&kb) {
+    let mut dot = 0.0f64;
+    while i < a.len() && j < b.len() {
+        match a[i].0.cmp(&b[j].0) {
             std::cmp::Ordering::Less => i += 1,
             std::cmp::Ordering::Greater => j += 1,
             std::cmp::Ordering::Equal => {
-                let prod = wa * wb;
-                let next = sum + prod;
-                if sum.abs() >= prod.abs() {
-                    comp += (sum - next) + prod;
-                } else {
-                    comp += (prod - next) + sum;
-                }
-                sum = next;
+                dot += a[i].1 * b[j].1;
                 i += 1;
                 j += 1;
             }
         }
     }
-    (sum + comp) / (a.norm * b.norm)
+    dot / (na * nb)
 }
 
-/// Union-find over edge endpoints → connected components (mirrors `type3._cluster`).
+/// Union-find over edge endpoints → connected components.
 fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
     while parent[x] != x {
         parent[x] = parent[parent[x]];
@@ -165,29 +130,13 @@ fn components(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usize>> {
 /// Type-3 clusters of renamed near-copies. Input: each function's normalized lines + name. Output:
 /// `(member indices, min pairwise cosine)` per connected component (size ≥ 2). The caller applies the
 /// cross-file contract (≥2 distinct names AND files) and builds the severity-tagged groups.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::too_many_lines
-)]
 #[must_use]
-pub fn type3_clusters(
-    line_lists: &[Vec<String>],
-    names: &[String],
-    theta: f64,
-    shingle_lines: usize,
-    common_ratio: f64,
-) -> Vec<(Vec<usize>, f64)> {
+pub fn type3_clusters(line_lists: &[Vec<String>], names: &[String], theta: f64) -> Vec<(Vec<usize>, f64)> {
     let n = line_lists.len();
     if n < 2 {
         return Vec::new();
     }
-    // Intern distinct lines → ids, assigned in **lexicographic (byte) order of the line text**. For
-    // valid UTF-8 byte order == code-point order == Python's `sorted()`, so when the cosine later sums
-    // the dot by ascending id it sums over shared keys in the exact order Python's `sorted(shared)`
-    // does — making the (order-sensitive) float dot bit-identical. (The norm is summed earlier, in
-    // first-occurrence order, so it is unaffected by this id ordering.)
+    // Intern distinct lines → ids (lexicographic / byte order, stable), then per-function id sequences.
     let mut id_text: Vec<&str> = {
         let mut seen: FxHashSet<&str> = FxHashSet::default();
         let mut distinct: Vec<&str> = Vec::new();
@@ -202,8 +151,6 @@ pub fn type3_clusters(
     };
     id_text.sort_unstable();
     let line_id: FxHashMap<&str, u32> = id_text.iter().enumerate().map(|(i, &t)| (t, i as u32)).collect();
-    // `with_min_len`: each rayon job takes a run of functions, not one — the per-item work (a few
-    // HashMap lookups) is tiny, so without this the join/work-steal coordination dwarfs it.
     let seqs: Vec<Vec<u32>> = line_lists
         .par_iter()
         .with_min_len(128)
@@ -211,8 +158,8 @@ pub fn type3_clusters(
         .collect();
     let total_lines: usize = seqs.iter().map(Vec::len).sum();
 
-    // IDF: df[token] = #line-occurrences containing token (a token counts once per line via the set).
-    let mut occ: Vec<u32> = vec![0; id_text.len()]; // occurrences of each distinct line
+    // IDF: df[token] = #line-occurrences containing token (counted once per distinct line via a set).
+    let mut occ: Vec<u32> = vec![0; id_text.len()];
     for seq in &seqs {
         for &id in seq {
             occ[id as usize] += 1;
@@ -223,7 +170,7 @@ pub fn type3_clusters(
         let count = u64::from(occ[id]);
         let mut toks: Vec<&str> = tokenize(text);
         toks.sort_unstable();
-        toks.dedup(); // set(tokens(line)) — distinct tokens of this line
+        toks.dedup();
         for t in toks {
             *df.entry(t).or_insert(0) += count;
         }
@@ -234,107 +181,52 @@ pub fn type3_clusters(
         df.iter().map(|(&t, &c)| (t, (total_lines as f64 / c as f64).ln())).collect()
     };
     // Per distinct line: weight = Σ idf(token) over findall(line) (with repetition, left-to-right).
-    // Parallel: each line's weight is independent and order is preserved, so this stays bit-exact.
     let line_weight: Vec<f64> = id_text
         .par_iter()
         .with_min_len(256)
-        .map(|&t| neumaier_sum(tokenize(t).iter().map(|tok| idf.get(tok).copied().unwrap_or(0.0))))
+        .map(|&t| tokenize(t).iter().map(|tok| idf.get(tok).copied().unwrap_or(0.0)).sum())
         .collect();
 
-    // Per-function vector: distinct lines in first-occurrence order with weight accumulated by
-    // repeated `+= w` (bit-identical to the old HashMap), then sorted by id for the dot merge.
-    // Most functions have few distinct lines (avg ~14), so the linear `find` dedup beats a hash
-    // table and its allocation — the whole point of this representation.
-    let vecs: Vec<FnVec> = seqs
+    // Per-function vector: distinct lines, weight accumulated by repeated `+= w`, then sorted by id
+    // (for the dot merge and for simjoin). Also the L2 norm, for the min_sim cosine.
+    let (rows, norms): (Vec<Vec<(u32, f64)>>, Vec<f64>) = seqs
         .par_iter()
         .with_min_len(128)
         .map(|seq| {
-            // Build directly into one Vec in first-occurrence order (linear `find` dedup), accumulating
-            // weight by repeated `+= w` exactly as the reference HashMap did — one allocation per
-            // function instead of three (the profile is allocator-bound, so transients matter).
-            let mut sorted: Vec<(u32, f64)> = Vec::new();
+            let mut v: Vec<(u32, f64)> = Vec::new();
             for &id in seq {
                 let w = line_weight[id as usize];
-                if let Some(slot) = sorted.iter_mut().find(|(k, _)| *k == id) {
+                if let Some(slot) = v.iter_mut().find(|(k, _)| *k == id) {
                     slot.1 += w;
                 } else {
-                    sorted.push((id, w));
+                    v.push((id, w));
                 }
             }
-            // norm sums in first-occurrence order — `sorted` is still insertion-ordered here, so this
-            // matches Python's `sqrt(sum(v*v for v in dict.values()))` bit-for-bit (Neumaier); THEN
-            // sort for the merge.
-            let norm = neumaier_sum(sorted.iter().map(|&(_, p)| p * p)).sqrt();
-            sorted.sort_unstable_by_key(|&(id, _)| id);
-            FnVec { sorted, norm }
+            let norm = v.iter().map(|&(_, p)| p * p).sum::<f64>().sqrt();
+            v.sort_unstable_by_key(|&(id, _)| id);
+            (v, norm)
         })
-        .collect();
+        .unzip();
 
-    // Candidate pairs: functions sharing a rare N-line shingle (drop shingles in > max_fns functions).
-    let max_fns = (common_ratio * n as f64) as usize;
-    let max_fns = max_fns.max(2);
-    // Flatten (shingle, fi) into a sortable Vec instead of `FxHashMap<&[u32], Vec<usize>>`: the per-
-    // shingle `Vec` allocations (one per distinct shingle, millions of them) were the dominant alloc
-    // churn (`mi_free` ≈ 23 % of Type-3) and the map build was serial. Pack each shingle's line-ids
-    // into a `u128` (Copy + Ord; `shingle_lines ≤ 4` fits 4×u32, exact — no hashing/collisions), then
-    // a **parallel** sort groups identical shingles. The candidate set is byte-identical (the same
-    // functions share the same packed key; the per-group dedup + pair-gen is unchanged).
-    // Flatten (shingle, fi) into a sortable Vec instead of `FxHashMap<&[u32], Vec<usize>>`: the per-
-    // shingle `Vec` allocations (millions, one per distinct shingle) were the dominant alloc churn
-    // (`mi_free` ≈ 23 % of Type-3) and the build was serial. Pack the ≤3 line-ids into a `u128` key
-    // (Copy + Ord, exact — no hashing), build + sort in **parallel**, then generate each shingle
-    // run's candidate pairs in parallel and sort+dedup the flat list. Byte-identical candidate set.
-    debug_assert!(shingle_lines <= 4, "u128 shingle packing supports up to 4 lines");
-    let mut shingles: Vec<(u128, u32)> = seqs
-        .par_iter()
-        .enumerate()
-        .flat_map_iter(|(fi, seq)| {
-            let fi = fi as u32;
-            seq.windows(shingle_lines).map(move |w| {
-                let mut key = 0u128;
-                for &id in w {
-                    key = (key << 32) | u128::from(id);
-                }
-                (key, fi)
-            })
-        })
-        .collect();
-    shingles.par_sort_unstable();
-    let groups: Vec<&[(u128, u32)]> = shingles.chunk_by(|a, b| a.0 == b.0).collect();
-    let mut cand: Vec<(usize, usize)> = groups
-        .par_iter()
-        .flat_map_iter(|grp| {
-            let mut uniq: Vec<usize> = grp.iter().map(|&(_, fi)| fi as usize).collect();
-            uniq.sort_unstable();
-            uniq.dedup();
-            let mut pairs: Vec<(usize, usize)> = Vec::new();
-            if uniq.len() >= 2 && uniq.len() <= max_fns {
-                for a in 0..uniq.len() {
-                    for b in (a + 1)..uniq.len() {
-                        pairs.push((uniq[a], uniq[b]));
-                    }
-                }
-            }
-            pairs
-        })
-        .collect();
-    cand.par_sort_unstable();
-    cand.dedup();
+    // Exact all-pairs weighted-cosine join (replaces shingle candidate-gen + per-pair verify).
+    let corpus = Corpus::from_rows(&rows);
+    let pairs = cosine_join(&corpus, theta); // (j, i, cos), j < i, cos ≥ theta
 
-    // Verify candidates with cosine (parallel); keep edges with cos > theta, skipping pairs other
-    // passes own: same name, sync/async twins, byte-identical line sequences.
-    let edges: Vec<(usize, usize)> = cand
-        .par_iter()
-        .filter(|&&(i, j)| {
-            names[i] != names[j]
+    // Edges: keep cross-name, non-twin, non-byte-identical pairs strictly above θ (other passes own
+    // same-name / sync-async / byte-identical clones).
+    let edges: Vec<(usize, usize)> = pairs
+        .into_par_iter()
+        .filter(|&(j, i, cos)| {
+            cos > theta
+                && names[i] != names[j]
                 && !is_sync_async(&names[i], &names[j])
                 && seqs[i] != seqs[j]
-                && cosine(&vecs[i], &vecs[j]) > theta
         })
-        .copied()
+        .map(|(j, i, _)| (j, i))
         .collect();
 
-    // Components → exact min cosine over ALL intra-component pairs (single-linkage's conservative figure).
+    // Components → exact min cosine over ALL intra-component pairs (single-linkage's conservative
+    // figure; can be < θ for a chain A–B–C where A,C aren't directly joined).
     components(n, &edges)
         .into_par_iter()
         .map(|mut members| {
@@ -343,7 +235,7 @@ pub fn type3_clusters(
             let mut first = true;
             for a in 0..members.len() {
                 for b in (a + 1)..members.len() {
-                    let c = cosine(&vecs[members[a]], &vecs[members[b]]);
+                    let c = cosine(&rows[members[a]], &rows[members[b]], norms[members[a]], norms[members[b]]);
                     if first || c < min_sim {
                         min_sim = c;
                         first = false;
