@@ -4,14 +4,21 @@
 //! sorts findings, applies user directives + calibration, and renders the
 //! human or JSON report.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
+
 use clap::Parser;
-use dup_defs_core::{Frontend, KindSpec};
-use find_dup_defs::{cluster, collect_defs, large_name_groups, section_index, Finding, GpuMode, PipelineOpts, Severity};
+use dup_defs_core::{Def, Frontend, KindSpec};
+use find_dup_defs::{
+    cluster, collect_defs, large_name_groups, pass_cross_name, pass_name_gated, pass_type3,
+    section_index, timed, Finding, GpuMode, PipelineOpts, Severity,
+};
 use serde::Serialize;
+
+mod snapshot;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -266,18 +273,19 @@ fn apply_setting(opts: &mut PipelineOpts, key: &str, value: &str) {
             };
             opts.max_name_group = Some(n);
         }
-        // Backend for the name-gated clustering. Accepts boolean-ish words and the three
-        // `difflib-fast` concurrency names; `on` maps to the recommended GPU+CPU mode. Only takes
-        // effect on a `--features gpu` macOS build (else the Rationer runs CPU with identical
-        // output), but the directive parses and validates everywhere so a shared config is portable.
+        // GPU backend for the GPU-capable passes (name-gated clustering + Type-3). `on` = the
+        // recommended **GPU+CPU** hybrid (exact); `only` = **GPU-only** where a pure-GPU path exists
+        // (Type-3's f32 join), short-circuiting to the hybrid on paths that have none; `off` = CPU.
+        // Only bites on a `--features gpu` macOS build (else the GPU modes run CPU with identical
+        // output), but the directive parses + validates everywhere so a shared config is portable.
         "gpu" => {
             opts.gpu = match value.trim().to_ascii_lowercase().as_str() {
                 "off" | "cpu" | "false" | "no" | "0" => GpuMode::Cpu,
                 "on" | "true" | "yes" | "1" | "gpu+cpu" | "gpucpu" | "gpu_cpu" => GpuMode::GpuPlusCpu,
-                "gpu" => GpuMode::Gpu,
+                "only" | "gpu-only" | "gpuonly" => GpuMode::Gpu,
                 other => {
                     eprintln!(
-                        "find-dup-defs: settings:gpu expects on/off (or cpu/gpu/gpu+cpu), got {other:?}"
+                        "find-dup-defs: settings:gpu expects on/off/only (or cpu/gpu+cpu), got {other:?}"
                     );
                     std::process::exit(2);
                 }
@@ -361,9 +369,9 @@ mod glob_tests {
     fn apply_setting_sets_gpu_mode() {
         let mut opts = PipelineOpts::with_paths(vec![]);
         assert_eq!(opts.gpu, GpuMode::Cpu); // default
-        super::apply_setting(&mut opts, "gpu", "on");
+        super::apply_setting(&mut opts, "gpu", "on"); // GPU+CPU hybrid
         assert_eq!(opts.gpu, GpuMode::GpuPlusCpu);
-        super::apply_setting(&mut opts, "gpu", "gpu");
+        super::apply_setting(&mut opts, "gpu", "only"); // GPU-only
         assert_eq!(opts.gpu, GpuMode::Gpu);
         super::apply_setting(&mut opts, "gpu", "GPU+CPU"); // case-insensitive
         assert_eq!(opts.gpu, GpuMode::GpuPlusCpu);
@@ -451,6 +459,82 @@ fn expand_braces(pat: &str) -> Vec<String> {
     out
 }
 
+/// Loop a single pipeline pass over already-scanned `defs` and report min/median (ms). Driven by
+/// the `FDD_BENCH` env hook in `main` so a change to one pass is A/B'd across rebuilds without the
+/// full pipeline. CPU `Rationer` (matches the default backend). Dev-only perf scaffolding.
+fn phase_bench(spec: &str, defs: &[Def], opts: &PipelineOpts) {
+    let (phase, iters) = match spec.split_once(':') {
+        Some((p, n)) => (p, n.parse().unwrap_or(5usize).max(1)),
+        None => (spec, 5usize),
+    };
+    let rationer = difflib_fast::Rationer::new();
+    let mut ms: Vec<f64> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        let n = match phase {
+            "pass1" => pass_name_gated(
+                defs, opts.threshold, opts.error_threshold, opts.min_size, opts.max_name_group, &rationer,
+            )
+            .len(),
+            "pass2" => pass_cross_name(defs, opts.min_size).len(),
+            "type3" => pass_type3(defs, opts.type3_theta, opts.gpu).len(),
+            other => {
+                eprintln!("[bench] unknown phase '{other}' (use pass1|pass2|type3)");
+                return;
+            }
+        };
+        std::hint::black_box(n);
+        ms.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    eprintln!(
+        "[bench {phase}] defs={} iters={iters} min={:.1}ms median={:.1}ms",
+        defs.len(), ms[0], ms[ms.len() / 2]
+    );
+}
+
+/// Loop `format_report` over snapshot findings and report min/median (ms). Driven by
+/// `FDD_BENCH=render:<iters>` + `FDD_SNAPSHOT=<dir>`. Dev-only perf scaffolding.
+fn render_bench(spec: &str, findings: &[Finding], selected: &[&dyn Frontend], cli: &Cli) {
+    let iters = spec.split_once(':').and_then(|(_, n)| n.parse().ok()).unwrap_or(20usize).max(1);
+    let visible: Vec<&Finding> = findings.iter().filter(|f| f.severity != Severity::Info).collect();
+    let mut ms: Vec<f64> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        let r = format_report(&visible, selected, cli.threshold, cli.error_threshold, &cli.repo_root);
+        std::hint::black_box(&r);
+        ms.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    eprintln!(
+        "[bench render] findings={} iters={iters} min={:.1}ms median={:.1}ms",
+        visible.len(), ms[0], ms[ms.len() / 2]
+    );
+}
+
+/// Loop `type3_clusters` over snapshot inputs and report min/median (ms). Driven by
+/// `FDD_BENCH=type3:<iters>` + `FDD_SNAPSHOT=<dir>`. Dev-only perf scaffolding.
+fn type3_bench(spec: &str, line_lists: &[Vec<String>], names: &[String], cli: &Cli) {
+    let iters = spec.split_once(':').and_then(|(_, n)| n.parse().ok()).unwrap_or(5usize).max(1);
+    let mut ms: Vec<f64> = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = std::time::Instant::now();
+        let r = find_dup_defs::type3::type3_clusters(
+            line_lists,
+            names,
+            cli.type3_theta,
+            difflib_fast::Concurrency::Cpu,
+        );
+        std::hint::black_box(r.len());
+        ms.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    eprintln!(
+        "[bench type3] fns={} iters={iters} min={:.1}ms median={:.1}ms",
+        names.len(), ms[0], ms[ms.len() / 2]
+    );
+}
+
 #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn main() {
     let cli = Cli::parse();
@@ -512,10 +596,62 @@ fn main() {
         apply_setting(&mut opts, &d.name_pat, d.note.as_deref().unwrap_or_default());
     }
 
+    // Snapshot-driven micro-bench: with `FDD_SNAPSHOT=<dir>` + `FDD_BENCH=<phase>:<iters>`, reload a
+    // stage's data dumped by a prior `FDD_DUMP` run and loop the function under test — NO scan, NO
+    // pipeline, so render/pass iterations cost ~a load + the loop instead of 25s.
+    if let (Ok(dir), Ok(spec)) = (std::env::var("FDD_SNAPSHOT"), std::env::var("FDD_BENCH")) {
+        let dir = std::path::PathBuf::from(dir);
+        if spec.starts_with("render") {
+            let findings = snapshot::load_findings(&dir).expect("load findings.json");
+            render_bench(&spec, &findings, &selected, &cli);
+        } else if spec.starts_with("type3") {
+            let (line_lists, names) = snapshot::load_type3(&dir).expect("load type3.json");
+            type3_bench(&spec, &line_lists, &names, &cli);
+        } else {
+            let defs = snapshot::load_defs(&dir).expect("load defs.json");
+            phase_bench(&spec, &defs, &opts);
+        }
+        return;
+    }
+
     // One scan → defs. The cheap `(kind, name)` group sizes feed the directive-inferrer's
     // `settings:max-name-group` suggestion (independent of clustering and the cap); then cluster.
     let defs = collect_defs(&selected, &opts.paths);
-    let large_groups = large_name_groups(&defs, SUGGEST_CAP);
+    // Dump the scanned defs for snapshot benches (see the FDD_SNAPSHOT path above).
+    // Cheap: dump just the Type-3 inputs (scan → dump → exit), no 2.6GB defs.json.
+    if let Ok(dir) = std::env::var("FDD_DUMP_T3") {
+        let (ll, nm) = find_dup_defs::type3_inputs(&defs);
+        snapshot::dump_type3(std::path::Path::new(&dir), &ll, &nm).expect("dump type3");
+        eprintln!("[dump] type3 → {dir}/type3.json ({} fns)", nm.len());
+        return;
+    }
+    if let Ok(dir) = std::env::var("FDD_DUMP") {
+        snapshot::dump_defs(std::path::Path::new(&dir), &defs).expect("dump defs");
+        eprintln!("[dump] defs → {dir}/defs.json ({} defs)", defs.len());
+        let (ll, nm) = find_dup_defs::type3_inputs(&defs);
+        snapshot::dump_type3(std::path::Path::new(&dir), &ll, &nm).expect("dump type3");
+        eprintln!("[dump] type3 → {dir}/type3.json ({} fns)", nm.len());
+    }
+    // Focused phase micro-bench on freshly-scanned defs (no snapshot): `FDD_BENCH=pass1:5` etc.
+    // `scan:N` re-runs the whole collect_defs (read + parse + canon) N times for profiling.
+    if let Ok(spec) = std::env::var("FDD_BENCH") {
+        if spec.starts_with("scan") {
+            let iters = spec.split_once(':').and_then(|(_, n)| n.parse().ok()).unwrap_or(3usize).max(1);
+            let mut ms: Vec<f64> = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let t = std::time::Instant::now();
+                let d = collect_defs(&selected, &opts.paths);
+                std::hint::black_box(d.len());
+                ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            }
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!("[bench scan] defs={} iters={iters} min={:.1}ms median={:.1}ms", defs.len(), ms[0], ms[ms.len() / 2]);
+            return;
+        }
+        phase_bench(&spec, &defs, &opts);
+        return;
+    }
+    let large_groups = timed("large-groups", || large_name_groups(&defs, SUGGEST_CAP));
     let mut findings = cluster(defs, &opts);
     if !directives.is_empty() {
         // Attach notes from EVERY matching directive first, even ones whose action will drop
@@ -560,12 +696,20 @@ fn main() {
     }
     // Detection/section order (constants, fn-name-gated, fn-cross-name, fn-Type-3, classes,
     // type-aliases), then within a section by name and first member — deterministic + reproducible.
-    findings.sort_by(|a, b| {
-        section_index(a)
-            .cmp(&section_index(b))
-            .then(a.name.cmp(&b.name))
-            .then(a.members[0].cmp(&b.members[0]))
+    timed("sort-find", || {
+        findings.sort_by(|a, b| {
+            section_index(a)
+                .cmp(&section_index(b))
+                .then(a.name.cmp(&b.name))
+                .then(a.members[0].cmp(&b.members[0]))
+        });
     });
+
+    // Dump the final-sorted findings (render's input) for the render snapshot bench.
+    if let Ok(dir) = std::env::var("FDD_DUMP") {
+        snapshot::dump_findings(std::path::Path::new(&dir), &findings).expect("dump findings");
+        eprintln!("[dump] findings → {dir}/findings.json ({} findings)", findings.len());
+    }
 
     if cli.calibrate {
         // Calibration is informational — never exits non-zero, never prints the dup list. Runs
@@ -583,19 +727,23 @@ fn main() {
         return;
     }
 
-    let report = if cli.json {
-        // JSON consumers get every severity unconditionally — it's their job to filter.
-        render_json(&findings, &cli.repo_root)
-    } else {
-        // Human report hides INFO by default — that's the whole point of the tier. JSON path
-        // unchanged so downstream tooling never loses data.
-        let visible: Vec<Finding> = if cli.show_info {
-            findings.clone()
+    let report = timed("render", || {
+        if cli.json {
+            // JSON consumers get every severity unconditionally — it's their job to filter.
+            render_json(&findings, &cli.repo_root)
         } else {
-            findings.iter().filter(|f| f.severity != Severity::Info).cloned().collect()
-        };
-        format_report(&visible, &selected, cli.threshold, cli.error_threshold, &cli.repo_root)
-    };
+            // Human report hides INFO by default — that's the whole point of the tier. JSON path
+            // unchanged so downstream tooling never loses data.
+            // Filter by reference — never clone the findings (each carries its full-source
+            // `snippet` String; cloning ~all of them was ~17% of wall on big corpora).
+            let visible: Vec<&Finding> = if cli.show_info {
+                findings.iter().collect()
+            } else {
+                findings.iter().filter(|f| f.severity != Severity::Info).collect()
+            };
+            format_report(&visible, &selected, cli.threshold, cli.error_threshold, &cli.repo_root)
+        }
+    });
     print!("{report}");
 
     if findings.iter().any(|f| f.severity == Severity::Error) {
@@ -1464,9 +1612,15 @@ fn is_cross_name(pass: &str) -> bool {
 
 /// Best-effort repo-relative path; raw string when not under `repo_root` (mirrors `short_path`).
 fn short_path(file: &str, repo_root: &Path) -> String {
-    let p = std::fs::canonicalize(file).unwrap_or_else(|_| PathBuf::from(file));
     let root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    p.strip_prefix(&root).map_or_else(|_| file.to_owned(), |rel| rel.to_string_lossy().into_owned())
+    short_path_root(file, &root)
+}
+
+/// `short_path` with the repo root already canonicalized — so a batch render canonicalizes the
+/// (constant) root once instead of per member. Byte-identical to `short_path`.
+fn short_path_root(file: &str, canon_root: &Path) -> String {
+    let p = std::fs::canonicalize(file).unwrap_or_else(|_| PathBuf::from(file));
+    p.strip_prefix(canon_root).map_or_else(|_| file.to_owned(), |rel| rel.to_string_lossy().into_owned())
 }
 
 /// The trailing marker on a `DUPLICATE` line: similarity / pass tag + thickness triage signals
@@ -1530,8 +1684,20 @@ fn report_sections(frontends: &[&dyn Frontend], warn: f64, error: f64) -> Vec<(u
 }
 
 /// Human-readable per-section report — byte-for-byte the Python `format_report`.
-fn format_report(findings: &[Finding], frontends: &[&dyn Frontend], warn: f64, error: f64, repo_root: &Path) -> String {
+fn format_report(findings: &[&Finding], frontends: &[&dyn Frontend], warn: f64, error: f64, repo_root: &Path) -> String {
     let sections = report_sections(frontends, warn, error);
+
+    // `short_path` does two `fs::canonicalize` calls per member (realpath → getattrlist/open/stat
+    // per path component) — ~90% of render at scale, repeated for every one of ~200k members. Hoist
+    // the (constant) repo-root canonicalize, and resolve each DISTINCT file ONCE, in parallel; the
+    // render loop then does a hash lookup. Byte-identical output (same per-file display string).
+    let canon_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut files: Vec<&str> =
+        findings.iter().flat_map(|f| f.members.iter().map(|(file, _, _)| file.as_str())).collect();
+    files.sort_unstable();
+    files.dedup();
+    let pathmap: HashMap<&str, String> =
+        files.par_iter().map(|&file| (file, short_path_root(file, &canon_root))).collect();
 
     let mut lines: Vec<String> = Vec::new();
     for (index, (sect, header)) in sections.iter().enumerate() {
@@ -1539,10 +1705,10 @@ fn format_report(findings: &[Finding], frontends: &[&dyn Frontend], warn: f64, e
             lines.push(String::new());
         }
         lines.push(format!("--- {header} ---"));
-        for f in findings.iter().filter(|&f| section_index(f) == *sect) {
+        for f in findings.iter().copied().filter(|f| section_index(f) == *sect) {
             lines.push(format!("DUPLICATE {} [{}]: {}{}", f.kind.label, f.severity.label(), f.name, group_suffix(f)));
             for (file, line, _col) in &f.members {
-                lines.push(format!("  {}:{}", short_path(file, repo_root), line));
+                lines.push(format!("  {}:{}", pathmap[file.as_str()], line));
             }
             lines.push(String::new());
         }

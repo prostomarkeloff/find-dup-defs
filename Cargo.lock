@@ -288,9 +288,9 @@ dependencies = [
 
 [[package]]
 name = "difflib-fast"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b1b93c870a0a0f07ad507c96347ccab7f5d2d51f4d3816f0700877f6a448af7"
+checksum = "42b9c6508d8195fb293b6c193a375710eb02236f27b0854a9e6bc2bd29ea8a34"
 dependencies = [
  "metal",
  "rayon",
@@ -304,7 +304,7 @@ checksum = "fd8e701084c37e7ef62d3f9e453b618130cbc0ef3573847785952a3ac3f746bf"
 
 [[package]]
 name = "dup-defs-core"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "either"
@@ -326,7 +326,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "find-dup-defs"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "clap",
  "difflib-fast",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "py-canon"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "dup-defs-core",
  "littrs-ruff-python-ast",
@@ -1298,7 +1298,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "ts-canon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dup-defs-core",
  "oxc_allocator",

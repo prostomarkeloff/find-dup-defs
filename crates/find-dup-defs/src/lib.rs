@@ -24,11 +24,24 @@ pub mod type3;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use dup_defs_core::{Def, Frontend, KindSpec};
 use rayon::prelude::*;
 use serde::Serialize;
 use walkdir::WalkDir;
+
+/// Wall-time a pipeline phase to stderr when `FDD_TIMING` is set; a transparent pass-through
+/// otherwise. Output-neutral (stderr only, behind the env flag) so it never affects findings.
+pub fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
+    if std::env::var_os("FDD_TIMING").is_none() {
+        return f();
+    }
+    let t = Instant::now();
+    let r = f();
+    eprintln!("[timing] {label:<12} {:>8.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+    r
+}
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -36,10 +49,8 @@ use walkdir::WalkDir;
 /// nodes. Avoids escalating "two `return []` one-liners" to ERROR purely on a
 /// renamed-exact match.
 pub const SUBSTANCE_NODES: usize = 20;
-/// Type-3 N-line shingle window.
+/// Type-3 minimum line count: only functions with ≥ this many name-agnostic lines are joined.
 pub const SHINGLE_LINES: usize = 3;
-/// Type-3 IDF gate: drop a shingle present in > this ratio of functions.
-pub const COMMON_RATIO: f64 = 0.007;
 /// Type-3 cluster's min-cosine ≥ this → ERROR (else WARNING).
 pub const TYPE3_ERROR_THETA: f64 = 0.9;
 
@@ -165,30 +176,33 @@ fn frontend_for(frontends: &[&dyn Frontend], path: &Path) -> Option<usize> {
 /// this is defense-in-depth for determinism).
 #[must_use]
 pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf]) -> Vec<Def> {
-    let mut per_frontend: Vec<BTreeSet<Arc<str>>> = vec![BTreeSet::new(); frontends.len()];
-    let mut route = |path: &Path| {
-        if let Some(fi) = frontend_for(frontends, path) {
-            per_frontend[fi].insert(Arc::from(path.to_string_lossy().as_ref()));
-        }
-    };
-    for p in paths {
-        if p.is_dir() {
-            let walker = WalkDir::new(p).into_iter().filter_entry(|e| {
-                if e.depth() == 0 {
-                    return true;
-                }
-                if e.file_type().is_dir() {
-                    return !is_excluded_dir(&e.file_name().to_string_lossy());
-                }
-                true
-            });
-            for entry in walker.filter_map(Result::ok) {
-                route(entry.path());
+    let per_frontend: Vec<BTreeSet<Arc<str>>> = timed("discovery", || {
+        let mut per_frontend: Vec<BTreeSet<Arc<str>>> = vec![BTreeSet::new(); frontends.len()];
+        let mut route = |path: &Path| {
+            if let Some(fi) = frontend_for(frontends, path) {
+                per_frontend[fi].insert(Arc::from(path.to_string_lossy().as_ref()));
             }
-        } else {
-            route(p);
+        };
+        for p in paths {
+            if p.is_dir() {
+                let walker = WalkDir::new(p).into_iter().filter_entry(|e| {
+                    if e.depth() == 0 {
+                        return true;
+                    }
+                    if e.file_type().is_dir() {
+                        return !is_excluded_dir(&e.file_name().to_string_lossy());
+                    }
+                    true
+                });
+                for entry in walker.filter_map(Result::ok) {
+                    route(entry.path());
+                }
+            } else {
+                route(p);
+            }
         }
-    }
+        per_frontend
+    });
     // Recursive-descent parsers (syn especially) have no built-in nesting limit, and a deeply
     // nested file — rustc's parser-stress fixtures, generated code — can exhaust a worker
     // thread's default 2 MiB stack during parse or canonicalization. Run the scan on a pool with
@@ -204,10 +218,10 @@ pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf]) -> Vec<Def> 
     };
     // Run the scan on a pool with a generous per-worker stack, falling back to the global pool if
     // the pool can't be built (only fails on OS thread-spawn exhaustion).
-    match rayon::ThreadPoolBuilder::new().stack_size(64 * 1024 * 1024).build() {
+    timed("scan", || match rayon::ThreadPoolBuilder::new().stack_size(64 * 1024 * 1024).build() {
         Ok(pool) => pool.install(scan),
         Err(_) => scan(),
-    }
+    })
 }
 
 // ── Cluster helpers ─────────────────────────────────────────────────────────
@@ -387,10 +401,29 @@ pub fn pass_cross_name(defs: &[Def], min_size: usize) -> Vec<Finding> {
     out
 }
 
-/// Pass 3 — Type-3 (`ECScan`): renamed near-copy callables via IDF-weighted
-/// cosine over name-agnostic lines.
+/// The `(line_lists, names)` inputs the Type-3 pass feeds to [`type3::type3_clusters`] — the
+/// `fn_like` defs with ≥ `SHINGLE_LINES` lines. Exposed so a perf bench can snapshot just this
+/// (tiny, plain-string) slice instead of the whole `Vec<Def>`.
 #[must_use]
-pub fn pass_type3(defs: &[Def], theta: f64) -> Vec<Finding> {
+pub fn type3_inputs(defs: &[Def]) -> (Vec<Vec<String>>, Vec<String>) {
+    let (mut line_lists, mut names) = (Vec::new(), Vec::new());
+    for d in defs {
+        if d.kind.fn_like {
+            if let Some(a) = &d.analysis {
+                if a.type3_lines.len() >= SHINGLE_LINES {
+                    line_lists.push(a.type3_lines.clone());
+                    names.push(d.name.clone());
+                }
+            }
+        }
+    }
+    (line_lists, names)
+}
+
+/// Pass 3 — Type-3 (`ECScan`): renamed near-copy callables via IDF-weighted cosine over name-agnostic
+/// lines. `gpu` selects the simjoin backend for the all-pairs join (`settings:gpu=on` → GPU hybrid).
+#[must_use]
+pub fn pass_type3(defs: &[Def], theta: f64, gpu: GpuMode) -> Vec<Finding> {
     let (mut line_lists, mut names, mut def_of) = (Vec::new(), Vec::new(), Vec::new());
     for (i, d) in defs.iter().enumerate() {
         if d.kind.fn_like {
@@ -406,7 +439,7 @@ pub fn pass_type3(defs: &[Def], theta: f64) -> Vec<Finding> {
     if names.len() < 2 {
         return Vec::new();
     }
-    type3::type3_clusters(&line_lists, &names, theta, SHINGLE_LINES, COMMON_RATIO)
+    type3::type3_clusters(&line_lists, &names, theta, gpu.to_concurrency())
         .into_iter()
         .filter_map(|(cluster, min_sim)| {
             let distinct: BTreeSet<&str> = cluster.iter().map(|&c| names[c].as_str()).collect();
@@ -450,10 +483,12 @@ pub enum GpuMode {
     /// Pure CPU. The only mode with any effect on a non-`gpu` build.
     #[default]
     Cpu,
-    /// Allow the Metal GPU on the paths where it wins; everything else stays on CPU.
+    /// GPU-only (`settings:gpu=only`): take the pure-GPU path where one exists (Type-3's f32 cosine
+    /// join), short-circuiting to the GPU+CPU hybrid on paths that have none (`difflib-fast` routes
+    /// those identically). Fastest; the join's f32 score differs from exact f64 by ≤1 pair in millions.
     Gpu,
-    /// Like [`GpuMode::Gpu`] plus rayon-parallel CPU overlap on the GPU output. `difflib-fast`'s
-    /// own recommended default; the value `settings:gpu=on` maps to.
+    /// GPU+CPU hybrid — the recommended GPU mode, what `settings:gpu=on` maps to. Exact (byte-identical
+    /// to CPU): the GPU filters and the CPU re-scores, with rayon-parallel overlap on the output.
     #[serde(rename = "gpu+cpu")]
     GpuPlusCpu,
 }
@@ -582,26 +617,30 @@ pub fn cluster(mut defs: Vec<Def>, opts: &PipelineOpts) -> Vec<Finding> {
     if let Some(kinds) = &opts.kinds {
         defs.retain(|d| kinds.iter().any(|k| k == d.kind.id));
     }
-    defs.sort_by(|a, b| {
-        (a.file.as_ref(), a.line, a.col).cmp(&(b.file.as_ref(), b.line, b.col))
+    timed("sort", || {
+        defs.sort_by(|a, b| {
+            (a.file.as_ref(), a.line, a.col).cmp(&(b.file.as_ref(), b.line, b.col))
+        });
     });
 
     // One shared clustering handle for the whole run — built once (acquiring the Metal device only
     // under a GPU mode), reused across every per-group `cluster_canonicals` call below.
     let rationer = build_rationer(opts.gpu);
-    let mut findings = pass_name_gated(
-        &defs,
-        opts.threshold,
-        opts.error_threshold,
-        opts.min_size,
-        opts.max_name_group,
-        &rationer,
-    );
+    let mut findings = timed("pass1-name", || {
+        pass_name_gated(
+            &defs,
+            opts.threshold,
+            opts.error_threshold,
+            opts.min_size,
+            opts.max_name_group,
+            &rationer,
+        )
+    });
     if !opts.no_cross_name {
-        findings.extend(pass_cross_name(&defs, opts.min_size));
+        timed("pass2-xname", || findings.extend(pass_cross_name(&defs, opts.min_size)));
     }
     if !opts.no_type3 {
-        findings.extend(pass_type3(&defs, opts.type3_theta));
+        timed("pass3-type3", || findings.extend(pass_type3(&defs, opts.type3_theta, opts.gpu)));
     }
 
     if opts.error_thickness > 0.0 {
