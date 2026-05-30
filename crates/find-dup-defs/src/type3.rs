@@ -273,31 +273,56 @@ pub fn type3_clusters(
     // Candidate pairs: functions sharing a rare N-line shingle (drop shingles in > max_fns functions).
     let max_fns = (common_ratio * n as f64) as usize;
     let max_fns = max_fns.max(2);
-    let mut shingle_map: FxHashMap<&[u32], Vec<usize>> = FxHashMap::default();
-    for (fi, seq) in seqs.iter().enumerate() {
-        if seq.len() >= shingle_lines {
-            for w in seq.windows(shingle_lines) {
-                shingle_map.entry(w).or_default().push(fi);
-            }
-        }
-    }
-    let mut cand: FxHashSet<(usize, usize)> = FxHashSet::default();
-    for fns in shingle_map.values() {
-        let mut uniq: Vec<usize> = fns.clone();
-        uniq.sort_unstable();
-        uniq.dedup();
-        if uniq.len() >= 2 && uniq.len() <= max_fns {
-            for a in 0..uniq.len() {
-                for b in (a + 1)..uniq.len() {
-                    cand.insert((uniq[a], uniq[b]));
+    // Flatten (shingle, fi) into a sortable Vec instead of `FxHashMap<&[u32], Vec<usize>>`: the per-
+    // shingle `Vec` allocations (one per distinct shingle, millions of them) were the dominant alloc
+    // churn (`mi_free` ≈ 23 % of Type-3) and the map build was serial. Pack each shingle's line-ids
+    // into a `u128` (Copy + Ord; `shingle_lines ≤ 4` fits 4×u32, exact — no hashing/collisions), then
+    // a **parallel** sort groups identical shingles. The candidate set is byte-identical (the same
+    // functions share the same packed key; the per-group dedup + pair-gen is unchanged).
+    // Flatten (shingle, fi) into a sortable Vec instead of `FxHashMap<&[u32], Vec<usize>>`: the per-
+    // shingle `Vec` allocations (millions, one per distinct shingle) were the dominant alloc churn
+    // (`mi_free` ≈ 23 % of Type-3) and the build was serial. Pack the ≤3 line-ids into a `u128` key
+    // (Copy + Ord, exact — no hashing), build + sort in **parallel**, then generate each shingle
+    // run's candidate pairs in parallel and sort+dedup the flat list. Byte-identical candidate set.
+    debug_assert!(shingle_lines <= 4, "u128 shingle packing supports up to 4 lines");
+    let mut shingles: Vec<(u128, u32)> = seqs
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(fi, seq)| {
+            let fi = fi as u32;
+            seq.windows(shingle_lines).map(move |w| {
+                let mut key = 0u128;
+                for &id in w {
+                    key = (key << 32) | u128::from(id);
+                }
+                (key, fi)
+            })
+        })
+        .collect();
+    shingles.par_sort_unstable();
+    let groups: Vec<&[(u128, u32)]> = shingles.chunk_by(|a, b| a.0 == b.0).collect();
+    let mut cand: Vec<(usize, usize)> = groups
+        .par_iter()
+        .flat_map_iter(|grp| {
+            let mut uniq: Vec<usize> = grp.iter().map(|&(_, fi)| fi as usize).collect();
+            uniq.sort_unstable();
+            uniq.dedup();
+            let mut pairs: Vec<(usize, usize)> = Vec::new();
+            if uniq.len() >= 2 && uniq.len() <= max_fns {
+                for a in 0..uniq.len() {
+                    for b in (a + 1)..uniq.len() {
+                        pairs.push((uniq[a], uniq[b]));
+                    }
                 }
             }
-        }
-    }
+            pairs
+        })
+        .collect();
+    cand.par_sort_unstable();
+    cand.dedup();
 
     // Verify candidates with cosine (parallel); keep edges with cos > theta, skipping pairs other
     // passes own: same name, sync/async twins, byte-identical line sequences.
-    let cand: Vec<(usize, usize)> = cand.into_iter().collect();
     let edges: Vec<(usize, usize)> = cand
         .par_iter()
         .filter(|&&(i, j)| {

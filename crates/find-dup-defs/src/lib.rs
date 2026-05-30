@@ -24,11 +24,24 @@ pub mod type3;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use dup_defs_core::{Def, Frontend, KindSpec};
 use rayon::prelude::*;
 use serde::Serialize;
 use walkdir::WalkDir;
+
+/// Wall-time a pipeline phase to stderr when `FDD_TIMING` is set; a transparent pass-through
+/// otherwise. Output-neutral (stderr only, behind the env flag) so it never affects findings.
+pub fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
+    if std::env::var_os("FDD_TIMING").is_none() {
+        return f();
+    }
+    let t = Instant::now();
+    let r = f();
+    eprintln!("[timing] {label:<12} {:>8.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+    r
+}
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -165,30 +178,33 @@ fn frontend_for(frontends: &[&dyn Frontend], path: &Path) -> Option<usize> {
 /// this is defense-in-depth for determinism).
 #[must_use]
 pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf]) -> Vec<Def> {
-    let mut per_frontend: Vec<BTreeSet<Arc<str>>> = vec![BTreeSet::new(); frontends.len()];
-    let mut route = |path: &Path| {
-        if let Some(fi) = frontend_for(frontends, path) {
-            per_frontend[fi].insert(Arc::from(path.to_string_lossy().as_ref()));
-        }
-    };
-    for p in paths {
-        if p.is_dir() {
-            let walker = WalkDir::new(p).into_iter().filter_entry(|e| {
-                if e.depth() == 0 {
-                    return true;
-                }
-                if e.file_type().is_dir() {
-                    return !is_excluded_dir(&e.file_name().to_string_lossy());
-                }
-                true
-            });
-            for entry in walker.filter_map(Result::ok) {
-                route(entry.path());
+    let per_frontend: Vec<BTreeSet<Arc<str>>> = timed("discovery", || {
+        let mut per_frontend: Vec<BTreeSet<Arc<str>>> = vec![BTreeSet::new(); frontends.len()];
+        let mut route = |path: &Path| {
+            if let Some(fi) = frontend_for(frontends, path) {
+                per_frontend[fi].insert(Arc::from(path.to_string_lossy().as_ref()));
             }
-        } else {
-            route(p);
+        };
+        for p in paths {
+            if p.is_dir() {
+                let walker = WalkDir::new(p).into_iter().filter_entry(|e| {
+                    if e.depth() == 0 {
+                        return true;
+                    }
+                    if e.file_type().is_dir() {
+                        return !is_excluded_dir(&e.file_name().to_string_lossy());
+                    }
+                    true
+                });
+                for entry in walker.filter_map(Result::ok) {
+                    route(entry.path());
+                }
+            } else {
+                route(p);
+            }
         }
-    }
+        per_frontend
+    });
     // Recursive-descent parsers (syn especially) have no built-in nesting limit, and a deeply
     // nested file — rustc's parser-stress fixtures, generated code — can exhaust a worker
     // thread's default 2 MiB stack during parse or canonicalization. Run the scan on a pool with
@@ -204,10 +220,10 @@ pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf]) -> Vec<Def> 
     };
     // Run the scan on a pool with a generous per-worker stack, falling back to the global pool if
     // the pool can't be built (only fails on OS thread-spawn exhaustion).
-    match rayon::ThreadPoolBuilder::new().stack_size(64 * 1024 * 1024).build() {
+    timed("scan", || match rayon::ThreadPoolBuilder::new().stack_size(64 * 1024 * 1024).build() {
         Ok(pool) => pool.install(scan),
         Err(_) => scan(),
-    }
+    })
 }
 
 // ── Cluster helpers ─────────────────────────────────────────────────────────
@@ -385,6 +401,25 @@ pub fn pass_cross_name(defs: &[Def], min_size: usize) -> Vec<Finding> {
         });
     }
     out
+}
+
+/// The `(line_lists, names)` inputs the Type-3 pass feeds to [`type3::type3_clusters`] — the
+/// `fn_like` defs with ≥ `SHINGLE_LINES` lines. Exposed so a perf bench can snapshot just this
+/// (tiny, plain-string) slice instead of the whole `Vec<Def>`.
+#[must_use]
+pub fn type3_inputs(defs: &[Def]) -> (Vec<Vec<String>>, Vec<String>) {
+    let (mut line_lists, mut names) = (Vec::new(), Vec::new());
+    for d in defs {
+        if d.kind.fn_like {
+            if let Some(a) = &d.analysis {
+                if a.type3_lines.len() >= SHINGLE_LINES {
+                    line_lists.push(a.type3_lines.clone());
+                    names.push(d.name.clone());
+                }
+            }
+        }
+    }
+    (line_lists, names)
 }
 
 /// Pass 3 — Type-3 (`ECScan`): renamed near-copy callables via IDF-weighted
@@ -582,26 +617,30 @@ pub fn cluster(mut defs: Vec<Def>, opts: &PipelineOpts) -> Vec<Finding> {
     if let Some(kinds) = &opts.kinds {
         defs.retain(|d| kinds.iter().any(|k| k == d.kind.id));
     }
-    defs.sort_by(|a, b| {
-        (a.file.as_ref(), a.line, a.col).cmp(&(b.file.as_ref(), b.line, b.col))
+    timed("sort", || {
+        defs.sort_by(|a, b| {
+            (a.file.as_ref(), a.line, a.col).cmp(&(b.file.as_ref(), b.line, b.col))
+        });
     });
 
     // One shared clustering handle for the whole run — built once (acquiring the Metal device only
     // under a GPU mode), reused across every per-group `cluster_canonicals` call below.
     let rationer = build_rationer(opts.gpu);
-    let mut findings = pass_name_gated(
-        &defs,
-        opts.threshold,
-        opts.error_threshold,
-        opts.min_size,
-        opts.max_name_group,
-        &rationer,
-    );
+    let mut findings = timed("pass1-name", || {
+        pass_name_gated(
+            &defs,
+            opts.threshold,
+            opts.error_threshold,
+            opts.min_size,
+            opts.max_name_group,
+            &rationer,
+        )
+    });
     if !opts.no_cross_name {
-        findings.extend(pass_cross_name(&defs, opts.min_size));
+        timed("pass2-xname", || findings.extend(pass_cross_name(&defs, opts.min_size)));
     }
     if !opts.no_type3 {
-        findings.extend(pass_type3(&defs, opts.type3_theta));
+        timed("pass3-type3", || findings.extend(pass_type3(&defs, opts.type3_theta)));
     }
 
     if opts.error_thickness > 0.0 {
