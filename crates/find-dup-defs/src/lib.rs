@@ -420,10 +420,10 @@ pub fn type3_inputs(defs: &[Def]) -> (Vec<Vec<String>>, Vec<String>) {
     (line_lists, names)
 }
 
-/// Pass 3 — Type-3 (`ECScan`): renamed near-copy callables via IDF-weighted
-/// cosine over name-agnostic lines.
+/// Pass 3 — Type-3 (`ECScan`): renamed near-copy callables via IDF-weighted cosine over name-agnostic
+/// lines. `gpu` selects the simjoin backend for the all-pairs join (`settings:gpu=on` → GPU hybrid).
 #[must_use]
-pub fn pass_type3(defs: &[Def], theta: f64) -> Vec<Finding> {
+pub fn pass_type3(defs: &[Def], theta: f64, gpu: GpuMode) -> Vec<Finding> {
     let (mut line_lists, mut names, mut def_of) = (Vec::new(), Vec::new(), Vec::new());
     for (i, d) in defs.iter().enumerate() {
         if d.kind.fn_like {
@@ -439,7 +439,7 @@ pub fn pass_type3(defs: &[Def], theta: f64) -> Vec<Finding> {
     if names.len() < 2 {
         return Vec::new();
     }
-    type3::type3_clusters(&line_lists, &names, theta)
+    type3::type3_clusters(&line_lists, &names, theta, gpu.to_concurrency())
         .into_iter()
         .filter_map(|(cluster, min_sim)| {
             let distinct: BTreeSet<&str> = cluster.iter().map(|&c| names[c].as_str()).collect();
@@ -483,10 +483,12 @@ pub enum GpuMode {
     /// Pure CPU. The only mode with any effect on a non-`gpu` build.
     #[default]
     Cpu,
-    /// Allow the Metal GPU on the paths where it wins; everything else stays on CPU.
+    /// GPU-only (`settings:gpu=only`): take the pure-GPU path where one exists (Type-3's f32 cosine
+    /// join), short-circuiting to the GPU+CPU hybrid on paths that have none (`difflib-fast` routes
+    /// those identically). Fastest; the join's f32 score differs from exact f64 by ≤1 pair in millions.
     Gpu,
-    /// Like [`GpuMode::Gpu`] plus rayon-parallel CPU overlap on the GPU output. `difflib-fast`'s
-    /// own recommended default; the value `settings:gpu=on` maps to.
+    /// GPU+CPU hybrid — the recommended GPU mode, what `settings:gpu=on` maps to. Exact (byte-identical
+    /// to CPU): the GPU filters and the CPU re-scores, with rayon-parallel overlap on the output.
     #[serde(rename = "gpu+cpu")]
     GpuPlusCpu,
 }
@@ -638,7 +640,7 @@ pub fn cluster(mut defs: Vec<Def>, opts: &PipelineOpts) -> Vec<Finding> {
         timed("pass2-xname", || findings.extend(pass_cross_name(&defs, opts.min_size)));
     }
     if !opts.no_type3 {
-        timed("pass3-type3", || findings.extend(pass_type3(&defs, opts.type3_theta)));
+        timed("pass3-type3", || findings.extend(pass_type3(&defs, opts.type3_theta, opts.gpu)));
     }
 
     if opts.error_thickness > 0.0 {

@@ -22,7 +22,8 @@
     clippy::cast_sign_loss
 )]
 
-use difflib_fast::simjoin::{cosine_join, Corpus};
+use difflib_fast::simjoin::{cosine_join_with, Corpus};
+use difflib_fast::Concurrency;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -130,8 +131,17 @@ fn components(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usize>> {
 /// Type-3 clusters of renamed near-copies. Input: each function's normalized lines + name. Output:
 /// `(member indices, min pairwise cosine)` per connected component (size ≥ 2). The caller applies the
 /// cross-file contract (≥2 distinct names AND files) and builds the severity-tagged groups.
+///
+/// `concurrency` selects the simjoin backend for the all-pairs join (`settings:gpu=on` → `GpuPlusCpu`,
+/// the exact f64 CPU+GPU hybrid; `=gpu` → `Gpu`, GPU-dominant f32; default `Cpu`). On a non-`gpu`
+/// build or with no Metal device it transparently runs on CPU — the GPU modes are always safe to ask.
 #[must_use]
-pub fn type3_clusters(line_lists: &[Vec<String>], names: &[String], theta: f64) -> Vec<(Vec<usize>, f64)> {
+pub fn type3_clusters(
+    line_lists: &[Vec<String>],
+    names: &[String],
+    theta: f64,
+    concurrency: Concurrency,
+) -> Vec<(Vec<usize>, f64)> {
     let n = line_lists.len();
     if n < 2 {
         return Vec::new();
@@ -208,9 +218,10 @@ pub fn type3_clusters(line_lists: &[Vec<String>], names: &[String], theta: f64) 
         })
         .unzip();
 
-    // Exact all-pairs weighted-cosine join (replaces shingle candidate-gen + per-pair verify).
+    // Exact all-pairs weighted-cosine join (replaces shingle candidate-gen + per-pair verify), on the
+    // selected backend — CPU, or difflib-fast's Metal GPU hybrid when `settings:gpu=on`.
     let corpus = Corpus::from_rows(&rows);
-    let pairs = cosine_join(&corpus, theta); // (j, i, cos), j < i, cos ≥ theta
+    let pairs = cosine_join_with(&corpus, theta, concurrency); // (j, i, cos), j < i, cos ≥ theta
 
     // Edges: keep cross-name, non-twin, non-byte-identical pairs strictly above θ (other passes own
     // same-name / sync-async / byte-identical clones).

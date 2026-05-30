@@ -273,18 +273,19 @@ fn apply_setting(opts: &mut PipelineOpts, key: &str, value: &str) {
             };
             opts.max_name_group = Some(n);
         }
-        // Backend for the name-gated clustering. Accepts boolean-ish words and the three
-        // `difflib-fast` concurrency names; `on` maps to the recommended GPU+CPU mode. Only takes
-        // effect on a `--features gpu` macOS build (else the Rationer runs CPU with identical
-        // output), but the directive parses and validates everywhere so a shared config is portable.
+        // GPU backend for the GPU-capable passes (name-gated clustering + Type-3). `on` = the
+        // recommended **GPU+CPU** hybrid (exact); `only` = **GPU-only** where a pure-GPU path exists
+        // (Type-3's f32 join), short-circuiting to the hybrid on paths that have none; `off` = CPU.
+        // Only bites on a `--features gpu` macOS build (else the GPU modes run CPU with identical
+        // output), but the directive parses + validates everywhere so a shared config is portable.
         "gpu" => {
             opts.gpu = match value.trim().to_ascii_lowercase().as_str() {
                 "off" | "cpu" | "false" | "no" | "0" => GpuMode::Cpu,
                 "on" | "true" | "yes" | "1" | "gpu+cpu" | "gpucpu" | "gpu_cpu" => GpuMode::GpuPlusCpu,
-                "gpu" => GpuMode::Gpu,
+                "only" | "gpu-only" | "gpuonly" => GpuMode::Gpu,
                 other => {
                     eprintln!(
-                        "find-dup-defs: settings:gpu expects on/off (or cpu/gpu/gpu+cpu), got {other:?}"
+                        "find-dup-defs: settings:gpu expects on/off/only (or cpu/gpu+cpu), got {other:?}"
                     );
                     std::process::exit(2);
                 }
@@ -368,9 +369,9 @@ mod glob_tests {
     fn apply_setting_sets_gpu_mode() {
         let mut opts = PipelineOpts::with_paths(vec![]);
         assert_eq!(opts.gpu, GpuMode::Cpu); // default
-        super::apply_setting(&mut opts, "gpu", "on");
+        super::apply_setting(&mut opts, "gpu", "on"); // GPU+CPU hybrid
         assert_eq!(opts.gpu, GpuMode::GpuPlusCpu);
-        super::apply_setting(&mut opts, "gpu", "gpu");
+        super::apply_setting(&mut opts, "gpu", "only"); // GPU-only
         assert_eq!(opts.gpu, GpuMode::Gpu);
         super::apply_setting(&mut opts, "gpu", "GPU+CPU"); // case-insensitive
         assert_eq!(opts.gpu, GpuMode::GpuPlusCpu);
@@ -476,7 +477,7 @@ fn phase_bench(spec: &str, defs: &[Def], opts: &PipelineOpts) {
             )
             .len(),
             "pass2" => pass_cross_name(defs, opts.min_size).len(),
-            "type3" => pass_type3(defs, opts.type3_theta).len(),
+            "type3" => pass_type3(defs, opts.type3_theta, opts.gpu).len(),
             other => {
                 eprintln!("[bench] unknown phase '{other}' (use pass1|pass2|type3)");
                 return;
@@ -518,7 +519,12 @@ fn type3_bench(spec: &str, line_lists: &[Vec<String>], names: &[String], cli: &C
     let mut ms: Vec<f64> = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = std::time::Instant::now();
-        let r = find_dup_defs::type3::type3_clusters(line_lists, names, cli.type3_theta);
+        let r = find_dup_defs::type3::type3_clusters(
+            line_lists,
+            names,
+            cli.type3_theta,
+            difflib_fast::Concurrency::Cpu,
+        );
         std::hint::black_box(r.len());
         ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
