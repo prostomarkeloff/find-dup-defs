@@ -297,6 +297,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "directiva"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e297a3cd303e345b542152da888d55e00c9b51efe985a1f5a3938ce191fefe10"
+
+[[package]]
 name = "dragonbox_ecma"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -330,6 +336,7 @@ version = "0.5.5"
 dependencies = [
  "clap",
  "difflib-fast",
+ "directiva",
  "dup-defs-core",
  "mimalloc",
  "py-canon",
