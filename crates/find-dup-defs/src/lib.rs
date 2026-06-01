@@ -144,6 +144,22 @@ pub struct Finding {
     pub members: Vec<(String, usize, usize)>,
 }
 
+/// A [`Finding`] is a [`directiva`] directive target: its qualifier is the kind id (so a
+/// `<methods>` filter matches), its names are the cluster name plus each `/`-joined alias (so
+/// `Foo.bar` lands on a cross-name `Foo.bar/Baz.bar`), and its scopes are the member file paths
+/// (any member match wins).
+impl directiva::Target for Finding {
+    fn qualifier(&self) -> Option<&str> {
+        Some(self.kind.id)
+    }
+    fn matches_name(&self, pat: &directiva::Pattern) -> bool {
+        self.name.split('/').any(|alias| pat.matches(alias)) || pat.matches(&self.name)
+    }
+    fn matches_scope(&self, pat: &directiva::Pattern) -> bool {
+        self.members.iter().any(|(file, _, _)| pat.matches(file))
+    }
+}
+
 /// Normalized [0, 1] "GET ME REFACTORED" score. Driven by three dimensions,
 /// each saturated independently with `1 - exp(-x/k)`:
 ///

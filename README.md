@@ -68,7 +68,7 @@ suggested thresholds (p50/p75/p90):
 
 === inferred directives (auto-detected noise patterns) ===
 
-  → -D 'de-escalate:*:*@*tests/*=test parametrize/fixture candidates'
+  → -D 'de-escalate:*@*tests/*=test parametrize/fixture candidates'
     rationale: 21 clusters live entirely in test paths
     affects: 21 total (10 ERROR, 11 WARNING, 0 INFO)
 ```
@@ -82,7 +82,7 @@ Then your CI:
 ```bash
 find-dup-defs ./src \
   --error-thickness 0.5 --warning-thickness 0.4 --escalate-thickness 0.55 \
-  -D 'de-escalate:*:*@*tests/*=test fixtures' \
+  -D 'de-escalate:*@*tests/*=test fixtures' \
   --errors-only --json
 ```
 
@@ -155,11 +155,13 @@ Sort findings by T → biggest refactor wins first.
 User-authored overrides for repo-specific intentional duplication.
 
 ```
-ACTION : [KIND:] NAME [@PATH] [=NOTE]
+ACTION : [<KIND>] NAME [@PATH] [=NOTE]
 ```
 
-`KIND` (optional) restricts a rule to one vocabulary: `FUNCTION` `METHOD` `CLASS` `INTERFACE`
-`CONSTANT` `TYPE_ALIAS`.
+The directive mini-language is the standalone [`directiva`](https://crates.io/crates/directiva)
+crate. `<KIND>` (optional, angle-bracketed) restricts a rule to one vocabulary: `<functions>`
+`<methods>` `<classes>` `<interfaces>` `<constants>` `<type-aliases>` (`<*>` or omitted = any).
+A bare value of `@PATH` reads directives from a file (one per line; `#` comments + blanks skipped).
 
 | Action | Effect | Severity |
 |---|---|---|
@@ -171,16 +173,20 @@ ACTION : [KIND:] NAME [@PATH] [=NOTE]
 
 ```bash
 # Plugin no-op API: intentional, don't gate
--D 'de-escalate:METHOD:Plugin.get_*_hook=intentional plugin no-op API'
+-D 'de-escalate:<methods>Plugin.get_*_hook=intentional plugin no-op API'
 
 # Bootstrap copy that can't be deduplicated
--D 'suppress:FUNCTION:spawn@*mypyc/lib-rt/*=bootstrap copy: lib-rt cannot import from mypyc'
+-D 'suppress:<functions>spawn@*mypyc/lib-rt/*=bootstrap copy: lib-rt cannot import from mypyc'
 
 # Architectural blocker — escalate to ERROR even if thickness is mid-range
--D 'escalate:METHOD:Lock.*@*/storage/*=Lock/LockExtend must share impl before v1.0'
+-D 'escalate:<methods>Lock.*@*/storage/*=Lock/LockExtend must share impl before v1.0'
 
 # Just leave a note
--D 'note:METHOD:For*.begin_body=v2 refactor target (see issue #42)'
+-D 'note:<methods>For*.begin_body=v2 refactor target (see issue #42)'
+
+# Keep a directive file in the repo and point CI at it (one directive per line; `#` comments).
+# `-D @-` reads them from stdin instead. Multiple -D (inline and/or @file) just concatenate.
+-D @ci/dup-directives.txt
 
 # Pipeline config through the same channel — cap O(n²) clustering on huge shared-name groups
 -D 'settings:max-name-group=256'
@@ -205,16 +211,16 @@ The `--calibrate` step pattern-matches across findings and surfaces ready-to-pas
 
 | Pattern | Suggestion |
 |---|---|
-| ≥5 CONSTANT clusters where ≥80% members are in `*/locale*` | `suppress:CONSTANT:*@*locale*` |
-| ≥3 clusters where all members live in test paths | `de-escalate:*:*@*/{test,tests,__tests__,test_cases,test-cases,__fixtures__,fixtures,integration,e2e}/*` |
-| ≥3 clusters where all members are `.test.*` / `.spec.*` (jest/vitest/mocha) | `de-escalate:*:*@*.{test,spec}.*` |
-| ≥5 clusters where all members are i18n / translation files | `suppress:*:*@*/{locale,locales,i18n,translations}/*` |
-| ≥3 clusters touching `*_pb2*` / `*_grpc*` files | `suppress:*:*@*_pb2*` |
-| ≥3 clusters all under `*/migrations/*` / `*/alembic/versions/*` | `suppress:*:*@*migrations/*` |
-| ≥5 clusters all under `*/docs_src/*` / `*/examples/*` / `*/tutorial/*` | `de-escalate:*:*@*/{docs_src,examples,tutorial,samples}/*` |
-| ≥5 clusters all in `.d.ts` declaration files | `suppress:*:*@*.d.ts` |
-| ≥5 clusters all in `*.stories.*` Storybook files | `de-escalate:*:*@*.stories.*` |
-| ≥30 clusters with same-name files across a vendored marker dir (`/util/vs/`, `/fixtures/`, `/vendor/`, `/third_party/`) and a parallel source root | `suppress:*:*@*<vendored-prefix>*` (per-snapshot, auto-derived) |
+| ≥5 CONSTANT clusters where ≥80% members are in `*/locale*` | `suppress:<constants>*@*locale*` |
+| ≥3 clusters where all members live in test paths | `de-escalate:*@*/{test,tests,__tests__,test_cases,test-cases,__fixtures__,fixtures,integration,e2e}/*` |
+| ≥3 clusters where all members are `.test.*` / `.spec.*` (jest/vitest/mocha) | `de-escalate:*@*.{test,spec}.*` |
+| ≥5 clusters where all members are i18n / translation files | `suppress:*@*/{locale,locales,i18n,translations}/*` |
+| ≥3 clusters touching `*_pb2*` / `*_grpc*` files | `suppress:*@*_pb2*` |
+| ≥3 clusters all under `*/migrations/*` / `*/alembic/versions/*` | `suppress:*@*migrations/*` |
+| ≥5 clusters all under `*/docs_src/*` / `*/examples/*` / `*/tutorial/*` | `de-escalate:*@*/{docs_src,examples,tutorial,samples}/*` |
+| ≥5 clusters all in `.d.ts` declaration files | `suppress:*@*.d.ts` |
+| ≥5 clusters all in `*.stories.*` Storybook files | `de-escalate:*@*.stories.*` |
+| ≥30 clusters with same-name files across a vendored marker dir (`/util/vs/`, `/fixtures/`, `/vendor/`, `/third_party/`) and a parallel source root | `suppress:*@*<vendored-prefix>*` (per-snapshot, auto-derived) |
 | ≥1 `(kind, name)` group above 256 members — shared / entry-point names (`fn main` across fixtures, `new` / `default`), not duplication | `settings:max-name-group=256` (skips their O(n²) name-gated clustering; cross-name still catches renamed copies) |
 
 Directive globs support `{a,b,c}` brace alternation so one paste covers every convention of a
@@ -443,9 +449,11 @@ SIMILARITY (name-gated):
   --type3-theta <F>          Type-3 cosine threshold (default 0.7)
 
 FILTERS:
-  -D, --directive <S>        ACTION:[KIND:]NAME[@PATH][=NOTE], repeatable. ACTION ∈ suppress
-                             / de-escalate / escalate / note / settings:KEY=VALUE.
-                             PATH glob supports `{a,b,c}` brace alternation.
+  -D, --directive <S>        ACTION:[<KIND>]NAME[@PATH][=NOTE], repeatable. ACTION ∈ suppress
+                             / de-escalate / escalate / note / set:KEY=VALUE. A value of
+                             `@PATH` reads directives from a file (one per line; `#` comments
+                             + blank lines skipped); `@-` reads them from stdin.
+                             NAME/PATH globs support `*` `?` `{a,b}` `[a-z]` + `\` escapes.
   --kinds <K1,K2,...>        functions,methods,classes,interfaces,constants,type-aliases
   --min-size <N>             Only clusters with ≥ N members (default 2)
   --max-name-group <N>       Skip name-gated clustering for (kind,name) groups > N members

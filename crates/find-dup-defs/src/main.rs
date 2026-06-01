@@ -108,153 +108,38 @@ struct Cli {
     /// output. Respects `--kinds` / `--min-size` so you can calibrate against a focused subset.
     #[arg(long)]
     calibrate: bool,
-    /// Filter findings by a compact glob-rule. Repeatable. Format:
-    ///   `ACTION:[KIND:]NAME[@PATH][=NOTE]`
+    /// Filter findings by a compact glob-rule (the `directiva` mini-language). Repeatable; a value
+    /// of `@PATH` reads directives from a file (one per line; `#` comments + blanks skipped).
+    /// Format: `ACTION:[<KIND>]NAME[@PATH][=NOTE]`
     ///
     /// `ACTION` ∈ `suppress` (drop entirely) | `de-escalate` (ERROR → WARNING) | `escalate`
-    ///            (WARNING → ERROR) | `note` (attach text, no severity change). Same vocabulary
-    ///            as iilint's `[tool.iilint].directives`.
-    /// `KIND`   ∈ `METHOD` | `FUNCTION` | `CLASS` | `CONSTANT` | `TYPE_ALIAS` (optional).
+    ///            (WARNING → ERROR) | `note` (attach text, no severity change) | `set` (pipeline
+    ///            config, e.g. `set:max-name-group=256`).
+    /// `<KIND>` ∈ `<functions>` | `<methods>` | `<classes>` | `<interfaces>` | `<constants>` |
+    ///            `<type-aliases>` (optional; `<*>` or omitted = any). Matched exactly.
     /// `NAME`   glob on the cluster's dup name (`Class.method` or `a/b/c` for cross-name).
-    ///          `*` matches any chars, `?` matches one. Tested against each `/`-separated alias.
+    ///          `*` any run, `?` one byte, `{a,b}` alternation, `[a-z]` char-class. Tested
+    ///          against each `/`-separated alias.
     /// `PATH`   glob on member file paths (any member match wins).
     /// `NOTE`   free-form annotation surfaced next to the finding (required for `note`,
-    ///          optional self-documentation for the other three).
+    ///          optional self-documentation for the others).
     ///
     /// Examples:
     ///   `-D de-escalate:Plugin.get_*_hook=intentional plugin no-op API`
-    ///   `-D suppress:FUNCTION:spawn@*mypyc/lib-rt/*=bootstrap copy`
-    ///   `-D de-escalate:METHOD:*.test_*@*/test/*=parametrize candidate`
-    ///   `-D escalate:METHOD:Lock.*@*/storage/*=Lock dups block this release`
-    ///   `-D note:METHOD:For*.begin_body=v2 refactor target`
+    ///   `-D suppress:<functions>spawn@*mypyc/lib-rt/*=bootstrap copy`
+    ///   `-D de-escalate:<methods>*.test_*@*/test/*=parametrize candidate`
+    ///   `-D escalate:<methods>Lock.*@*/storage/*=Lock dups block this release`
+    ///   `-D note:<methods>For*.begin_body=v2 refactor target`
     #[arg(long = "directive", short = 'D', value_name = "DIRECTIVE")]
     directives: Vec<String>,
 }
 
-// ───────────────────────────── directives (glob filters) ─────────────────────────────
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum DirectiveAction {
-    /// Drop the finding from the report entirely.
-    Suppress,
-    /// ERROR → WARNING. WARNING stays WARNING.
-    Deescalate,
-    /// WARNING → ERROR. ERROR stays ERROR.
-    Escalate,
-    /// Pure annotation — attach a note to the finding, no severity change.
-    Note,
-    /// Pipeline configuration, not a finding filter: `settings:KEY=VALUE` (e.g.
-    /// `settings:max-name-group=256`). Applied to [`PipelineOpts`] before the scan; arbitrary
-    /// keys, so new knobs can be configured through the same `-D` channel CI already passes.
-    Settings,
-}
-
-/// One compact directive: `ACTION:[KIND:]NAME[@PATH]`. See the `--directive` CLI doc for the
-/// grammar and examples. Parsed once into globs + a kind filter; matched against each Finding.
-#[derive(Debug)]
-struct Directive {
-    action: DirectiveAction,
-    /// Internal kind tag (`functions` / `methods` / `classes` / `constants` / `type-aliases`).
-    /// `None` matches any kind.
-    kind: Option<&'static str>,
-    name_pat: String,
-    path_pat: Option<String>,
-    /// Self-documentation attached after `=` in the spec — surfaced alongside the finding so
-    /// the next reviewer sees WHY this directive was added without grepping the directive file.
-    /// Required for `note`; optional but encouraged for `suppress`/`de-escalate`/`escalate`.
-    note: Option<String>,
-}
-
-impl Directive {
-    fn matches(&self, f: &Finding) -> bool {
-        // `settings:` is pipeline config, applied before the scan — it never filters findings.
-        if self.action == DirectiveAction::Settings {
-            return false;
-        }
-        if let Some(k) = self.kind {
-            if f.kind.id != k {
-                return false;
-            }
-        }
-        // Cross-name passes join aliases with '/'. Match any individual alias OR the joined
-        // form, so a pattern like `Foo.bar` lands on `Foo.bar/Baz.bar` without needing wildcards.
-        let any_alias = f.name.split('/').any(|alias| glob_match(&self.name_pat, alias));
-        if !(any_alias || glob_match(&self.name_pat, &f.name)) {
-            return false;
-        }
-        if let Some(pp) = &self.path_pat {
-            if !f.members.iter().any(|(file, _, _)| glob_match(pp, file)) {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-/// Parse `ACTION:[KIND:]NAME[@PATH]` into a [`Directive`]. The KIND segment is optional — if the
-/// first `:`-delimited chunk after the action matches a known kind label (`METHOD`/`FUNCTION`/
-/// `CLASS`/`CONSTANT`/`TYPE_ALIAS`, case-insensitive, `_` or `-` for the alias), it's consumed;
-/// otherwise the whole remainder is treated as the NAME glob.
-fn parse_directive(spec: &str) -> Result<Directive, String> {
-    // Strip the optional `=NOTE` tail first — note text is free-form (may contain `:` or `@`).
-    let (head, note) = match spec.split_once('=') {
-        Some((h, n)) => (h, Some(n.trim().to_owned())),
-        None => (spec, None),
-    };
-    let (action_str, rest) = head
-        .split_once(':')
-        .ok_or_else(|| format!("expected `ACTION:…` in directive {spec:?}"))?;
-    let action = match action_str.trim().to_ascii_lowercase().replace('-', "").as_str() {
-        "suppress" => DirectiveAction::Suppress,
-        "deescalate" => DirectiveAction::Deescalate,
-        "escalate" => DirectiveAction::Escalate,
-        "note" => DirectiveAction::Note,
-        "settings" => DirectiveAction::Settings,
-        other => {
-            return Err(format!(
-                "unknown action {other:?} in directive {spec:?} \
-                 (expected `suppress` / `de-escalate` / `escalate` / `note` / `settings`)"
-            ));
-        }
-    };
-    if matches!(action, DirectiveAction::Note | DirectiveAction::Settings) && note.is_none() {
-        return Err(format!(
-            "`{action_str}` directive requires `=…` ({}) (directive: {spec:?})",
-            if action == DirectiveAction::Settings { "the setting value, e.g. settings:max-name-group=256" } else { "note text" }
-        ));
-    }
-    let (kind, after_kind) = match rest.split_once(':') {
-        Some((maybe_kind, after)) => {
-            let token = maybe_kind.trim().to_ascii_uppercase().replace('-', "_");
-            match token.as_str() {
-                // `*` is an explicit "any kind" — consume the segment, no kind filter.
-                "*" => (None, after),
-                "METHOD" | "METHODS" => (Some("methods"), after),
-                "FUNCTION" | "FUNCTIONS" => (Some("functions"), after),
-                "CLASS" | "CLASSES" => (Some("classes"), after),
-                "INTERFACE" | "INTERFACES" => (Some("interfaces"), after),
-                "CONSTANT" | "CONSTANTS" => (Some("constants"), after),
-                "TYPE_ALIAS" | "TYPE_ALIASES" => (Some("type-aliases"), after),
-                _ => (None, rest), // not a kind — the whole `rest` is NAME[@PATH]
-            }
-        }
-        None => (None, rest),
-    };
-    let (name, path) = match after_kind.split_once('@') {
-        Some((n, p)) => (n.trim(), Some(p.trim())),
-        None => (after_kind.trim(), None),
-    };
-    if name.is_empty() {
-        return Err(format!("empty name pattern in directive {spec:?}"));
-    }
-    Ok(Directive {
-        action,
-        kind,
-        name_pat: name.to_owned(),
-        path_pat: path.map(str::to_owned),
-        note,
-    })
-}
+// ───────────────────────────── directives ─────────────────────────────
+//
+// The directive mini-language — parsing, glob matching, the `-D` (inline | @file) overload, and
+// the lint vocabulary + severity fold — lives in the `directiva` crate. find-dup-defs supplies the
+// `Target` impl for `Finding` (see lib.rs) and the `settings:` → `PipelineOpts` mapping below.
+use directiva::lint::LintAction;
 
 /// Name-gated groups larger than this are reported by the directive-inferrer as a suggested
 /// `settings:max-name-group` cap (a name shared by this many definitions is a convention or
@@ -295,64 +180,9 @@ fn apply_setting(opts: &mut PipelineOpts, key: &str, value: &str) {
     }
 }
 
-/// Minimal glob matcher — `*` (any run), `?` (single char), `{a,b,…}` (alternation, single
-/// level). Recursive-backtracking; cheap for the short patterns directives carry. Alternation
-/// lets one directive cover multiple test-tree conventions (`*/{test,tests,__tests__}/*`) in
-/// one paste, instead of asking the user to chain three `-D` flags.
-fn glob_match(pat: &str, s: &str) -> bool {
-    for expanded in expand_braces(pat) {
-        if glob_match_simple(&expanded, s) {
-            return true;
-        }
-    }
-    false
-}
-
-fn glob_match_simple(pat: &str, s: &str) -> bool {
-    fn go(p: &[u8], pi: usize, t: &[u8], ti: usize) -> bool {
-        if pi == p.len() {
-            return ti == t.len();
-        }
-        match p[pi] {
-            b'*' => {
-                // Collapse runs of `*` so `**name` doesn't blow up branching.
-                let mut j = pi + 1;
-                while j < p.len() && p[j] == b'*' {
-                    j += 1;
-                }
-                for k in ti..=t.len() {
-                    if go(p, j, t, k) {
-                        return true;
-                    }
-                }
-                false
-            }
-            b'?' => ti < t.len() && go(p, pi + 1, t, ti + 1),
-            c => ti < t.len() && t[ti] == c && go(p, pi + 1, t, ti + 1),
-        }
-    }
-    go(pat.as_bytes(), 0, s.as_bytes(), 0)
-}
-
-/// Expand one level of `{a,b,c}` brace alternation, recursively. `{test,tests}` ⇒ two
-/// patterns. Empty alternatives are legal (`{,s}` ⇒ both empty and `s`). Nesting beyond one
-/// `{...}` is supported via recursion — leftmost group is expanded first, the rest of the
-/// pattern is re-expanded on the result. Unmatched / empty braces fall through as literals so a
-/// pattern with no alternation is one-call cheap.
 #[cfg(test)]
-mod glob_tests {
-    use super::{expand_braces, glob_match, parse_directive, vendored_score, DirectiveAction, GpuMode, PipelineOpts};
-
-    #[test]
-    fn settings_directive_parses_key_and_value() {
-        let d = parse_directive("settings:max-name-group=256").expect("parses");
-        assert_eq!(d.action, DirectiveAction::Settings);
-        assert_eq!(d.name_pat, "max-name-group");
-        assert_eq!(d.note.as_deref(), Some("256"));
-        assert!(d.kind.is_none() && d.path_pat.is_none());
-        // a settings directive without `=VALUE` is rejected.
-        assert!(parse_directive("settings:max-name-group").unwrap_err().contains("requires"));
-    }
+mod directive_helper_tests {
+    use super::{vendored_score, GpuMode, PipelineOpts};
 
     #[test]
     fn apply_setting_sets_max_name_group() {
@@ -391,72 +221,6 @@ mod glob_tests {
         assert_eq!(vendored_score("src/features/admin-channel-add/model"), 0);
         assert_eq!(vendored_score("src/components/Button"), 0);
     }
-
-
-    #[test]
-    fn brace_expansion_covers_all_test_dir_conventions() {
-        let pat = "*/{test,tests,__tests__}/*";
-        let expanded = expand_braces(pat);
-        assert_eq!(expanded.len(), 3);
-        assert!(expanded.contains(&"*/test/*".to_owned()));
-        assert!(expanded.contains(&"*/tests/*".to_owned()));
-        assert!(expanded.contains(&"*/__tests__/*".to_owned()));
-    }
-
-    #[test]
-    fn glob_match_handles_alternation_in_path() {
-        let pat = "*/{test,tests,__tests__}/*";
-        // `/test/` (singular) — angular convention
-        assert!(glob_match(pat, "packages/compiler-cli/test/compliance/foo.ts"));
-        // `/tests/` (plural) — svelte / standard pytest
-        assert!(glob_match(pat, "packages/svelte/tests/css/test.ts"));
-        // `/__tests__/` — jest / RTL
-        assert!(glob_match(pat, "packages/next/src/__tests__/foo.test.ts"));
-        // Non-test path should NOT match
-        assert!(!glob_match(pat, "src/components/Button.ts"));
-    }
-
-    #[test]
-    fn glob_match_file_extension_alternation() {
-        let pat = "*.{test,spec}.*";
-        assert!(glob_match(pat, "src/foo.test.ts"));
-        assert!(glob_match(pat, "src/foo.spec.ts"));
-        assert!(glob_match(pat, "packages/next/src/server/foo.external.test.ts"));
-        assert!(!glob_match(pat, "src/foo.ts"));
-    }
-
-    #[test]
-    fn empty_alternation_branch_is_legal() {
-        let pat = "*/{,s}post*";
-        let expanded = expand_braces(pat);
-        assert!(expanded.contains(&"*/post*".to_owned()));
-        assert!(expanded.contains(&"*/spost*".to_owned()));
-    }
-
-    #[test]
-    fn no_braces_is_one_pattern() {
-        assert_eq!(expand_braces("*tests/*"), vec!["*tests/*".to_owned()]);
-    }
-}
-
-fn expand_braces(pat: &str) -> Vec<String> {
-    let bytes = pat.as_bytes();
-    let Some(open) = bytes.iter().position(|&b| b == b'{') else {
-        return vec![pat.to_owned()];
-    };
-    let Some(close_rel) = bytes[open + 1..].iter().position(|&b| b == b'}') else {
-        return vec![pat.to_owned()];
-    };
-    let close = open + 1 + close_rel;
-    let prefix = &pat[..open];
-    let alts = &pat[open + 1..close];
-    let suffix = &pat[close + 1..];
-    let mut out = Vec::new();
-    for alt in alts.split(',') {
-        let combined = format!("{prefix}{alt}{suffix}");
-        out.extend(expand_braces(&combined));
-    }
-    out
 }
 
 /// Loop a single pipeline pass over already-scanned `defs` and report min/median (ms). Driven by
@@ -564,15 +328,17 @@ fn main() {
     };
     // User-authored directives, parsed once (exit-2 on a typo so CI fails loud). `settings:`
     // entries configure the pipeline before the scan; the rest filter findings afterwards.
-    let directives: Vec<Directive> = cli
+    let directives: Vec<directiva::Directive<LintAction>> = cli
         .directives
         .iter()
-        .map(|s| {
-            parse_directive(s).unwrap_or_else(|e| {
+        .flat_map(|s| {
+            // `directiva` resolves each `-D` value: an inline directive, or `@file` (one per line).
+            directiva::source::cli::expand::<LintAction>(s).unwrap_or_else(|e| {
                 eprintln!("find-dup-defs: invalid --directive: {e}");
                 std::process::exit(2);
             })
         })
+        .map(|sourced| sourced.directive)
         .collect();
 
     // `--max-name-group` is the base; `settings:max-name-group=…` directives override it (the
@@ -592,8 +358,8 @@ fn main() {
         max_name_group: cli.max_name_group,
         gpu: GpuMode::Cpu,
     };
-    for d in directives.iter().filter(|d| d.action == DirectiveAction::Settings) {
-        apply_setting(&mut opts, &d.name_pat, d.note.as_deref().unwrap_or_default());
+    for (key, value) in directiva::lint::extract_settings(&directives) {
+        apply_setting(&mut opts, &key, &value);
     }
 
     // Snapshot-driven micro-bench: with `FDD_SNAPSHOT=<dir>` + `FDD_BENCH=<phase>:<iters>`, reload a
@@ -654,33 +420,26 @@ fn main() {
     let large_groups = timed("large-groups", || large_name_groups(&defs, SUGGEST_CAP));
     let mut findings = cluster(defs, &opts);
     if !directives.is_empty() {
-        // Attach notes from EVERY matching directive first, even ones whose action will drop
-        // the finding — but we run suppress last, so a `suppress` with a `=note` still has its
-        // note visible if some non-suppressing directive also matches. Order of effects:
-        //   1. Notes accumulate from every match.
-        //   2. Severity adjusts: escalate before de-escalate (so a conflicting pair lands at
-        //      ERROR, the louder of the two — matches "the user explicitly asked to raise it").
-        //   3. Suppress drops findings entirely.
+        // Order of effects (unchanged): notes accumulate from every matching directive (even a
+        // `suppress`, so a suppress with a `=note` still leaves its reason if another directive
+        // also matches); then severity steps by the summed escalate(−1)/de-escalate(+1) (clamped);
+        // then `suppress` drops the finding. `set:` directives are pipeline config (applied above),
+        // never finding filters, so they're skipped here.
         for f in &mut findings {
-            for d in &directives {
-                if d.matches(f) {
-                    if let Some(n) = &d.note {
-                        f.notes.push(n.clone());
-                    }
+            let mut step = 0i32;
+            for d in directives.iter().filter(|d| d.action != LintAction::Set) {
+                if !d.matches(f) {
+                    continue;
+                }
+                if let Some(n) = &d.note {
+                    f.notes.push(n.clone());
+                }
+                match d.action {
+                    LintAction::Deescalate => step += 1,
+                    LintAction::Escalate => step -= 1,
+                    _ => {}
                 }
             }
-            // Each matching directive contributes one step on the severity ladder — same
-            // semantic as iilint's `severity_steps`. Multiple `de-escalate`s chain (ERROR →
-            // WARNING → INFO); `escalate` cancels out (1 escalate + 1 de-escalate = no-op).
-            let step = directives
-                .iter()
-                .filter(|d| d.matches(f))
-                .map(|d| match d.action {
-                    DirectiveAction::Deescalate => 1,
-                    DirectiveAction::Escalate => -1,
-                    _ => 0,
-                })
-                .sum::<i32>();
             if step != 0 {
                 f.severity = Severity::from_index(f.severity.to_index() + step);
             }
@@ -688,7 +447,7 @@ fn main() {
         findings.retain(|f| {
             !directives
                 .iter()
-                .any(|d| d.action == DirectiveAction::Suppress && d.matches(f))
+                .any(|d| d.action == LintAction::Suppress && d.matches(f))
         });
     }
     if cli.errors_only {
@@ -1271,7 +1030,7 @@ fn infer_vendored_directives(findings: &[Finding], repo_root: &Path) -> Vec<Infe
                 .unwrap_or_default();
             InferredDirective {
                 directive: format!(
-                    "suppress:*:*@{glob}=likely vendored / fork snapshot mirroring {one_source}"
+                    "suppress:*@{glob}=likely vendored / fork snapshot mirroring {one_source}"
                 ),
                 rationale: format!(
                     "{n} clusters have all members in same-named files across `{short_prefix}` and a parallel source root"
@@ -1356,7 +1115,7 @@ fn infer_directives(
             }
         },
         5,
-        "suppress:CONSTANT:*@*locale*=i18n locale tables, duplication is by design",
+        "suppress:<constants>*@*locale*=i18n locale tables, duplication is by design",
         |n| format!("{n} CONSTANT clusters are ≥80% inside locale/i18n paths"),
     ) {
         out.push(s);
@@ -1368,7 +1127,7 @@ fn infer_directives(
         findings,
         |f| f.members.iter().all(|(p, _, _)| path_is_i18n(p)),
         5,
-        "suppress:*:*@*/{locale,locales,i18n,translations}/*=i18n / translation tables — per-locale near-duplicates are by design",
+        "suppress:*@*/{locale,locales,i18n,translations}/*=i18n / translation tables — per-locale near-duplicates are by design",
         |n| format!("{n} clusters live entirely in locale / i18n / translation paths"),
     ) {
         out.push(s);
@@ -1380,7 +1139,7 @@ fn infer_directives(
         // Brace alternation expands to every test-tree convention `path_is_test` recognizes,
         // so one paste covers `/test/`, `/tests/`, `/__tests__/`, `/test_cases/`, `/integration/`,
         // `/e2e/`, etc., without catching unrelated words like `/testimony/`.
-        "de-escalate:*:*@*/{test,tests,__tests__,test_cases,test-cases,__fixtures__,fixtures,integration,e2e}/*=test parametrize/fixture candidates — review for conftest",
+        "de-escalate:*@*/{test,tests,__tests__,test_cases,test-cases,__fixtures__,fixtures,integration,e2e}/*=test parametrize/fixture candidates — review for conftest",
         |n| format!("{n} clusters live entirely in test paths — parametrize/conftest candidates"),
     ) {
         out.push(s);
@@ -1397,7 +1156,7 @@ fn infer_directives(
             })
         },
         3,
-        "de-escalate:*:*@*.{test,spec}.*=test files by .test.* / .spec.* naming",
+        "de-escalate:*@*.{test,spec}.*=test files by .test.* / .spec.* naming",
         |n| format!("{n} clusters live entirely in `*.test.*` / `*.spec.*` files (jest/vitest/mocha)"),
     ) {
         out.push(s);
@@ -1406,7 +1165,7 @@ fn infer_directives(
         findings,
         |f| f.members.iter().any(|(p, _, _)| path_is_generated(p)),
         3,
-        "suppress:*:*@*_pb2*=generated protobuf/gRPC code, suppress wholesale",
+        "suppress:*@*_pb2*=generated protobuf/gRPC code, suppress wholesale",
         |n| format!("{n} clusters touch `*_pb2*`/`*_grpc*` files — generated code"),
     ) {
         out.push(s);
@@ -1415,7 +1174,7 @@ fn infer_directives(
         findings,
         |f| f.members.iter().all(|(p, _, _)| path_is_migration(p)),
         3,
-        "suppress:*:*@*migrations/*=schema migrations are snapshots, not refactor targets",
+        "suppress:*@*migrations/*=schema migrations are snapshots, not refactor targets",
         |n| format!("{n} clusters live entirely under migrations/ — schema-history files"),
     ) {
         out.push(s);
@@ -1427,7 +1186,7 @@ fn infer_directives(
         findings,
         |f| f.members.iter().all(|(p, _, _)| path_is_doc_example(p)),
         5,
-        "de-escalate:*:*@*/{docs_src,docs/src,examples,example,tutorial,tutorials,samples}/*=tutorial/doc-example code — snippet duplication is expected",
+        "de-escalate:*@*/{docs_src,docs/src,examples,example,tutorial,tutorials,samples}/*=tutorial/doc-example code — snippet duplication is expected",
         |n| format!("{n} clusters live entirely under docs_src/ / examples/ / tutorial/ paths"),
     ) {
         out.push(s);
@@ -1438,7 +1197,7 @@ fn infer_directives(
         findings,
         |f| f.members.iter().all(|(p, _, _)| path_is_dts(p)),
         3,
-        "suppress:*:*@*.d.ts=TypeScript declaration files, type-only duplication is by design",
+        "suppress:*@*.d.ts=TypeScript declaration files, type-only duplication is by design",
         |n| format!("{n} clusters live entirely in `.d.ts` declaration files"),
     ) {
         out.push(s);
@@ -1449,7 +1208,7 @@ fn infer_directives(
         findings,
         |f| f.members.iter().all(|(p, _, _)| path_is_story(p)),
         5,
-        "de-escalate:*:*@*.stories.*=Storybook stories — boilerplate duplication is the docstring",
+        "de-escalate:*@*.stories.*=Storybook stories — boilerplate duplication is the docstring",
         |n| format!("{n} clusters live entirely in `*.stories.*` Storybook files"),
     ) {
         out.push(s);

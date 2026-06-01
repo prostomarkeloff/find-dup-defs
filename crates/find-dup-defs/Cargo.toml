@@ -1,6 +1,6 @@
 [package]
 name = "find-dup-defs"
-version = "0.5.5"
+version = "0.6.0"
 description = "Find duplicate / near-duplicate top-level definitions across a codebase via clone clustering (Python frontend today)."
 keywords = ["duplicate", "clone", "python", "lint", "ast"]
 categories = ["command-line-utilities", "development-tools"]
@@ -28,6 +28,9 @@ rs-canon = { path = "../rs-canon", version = "0.1" }
 # exact difflib Ratcliff–Obershelp ratio + clustering + exact weighted-cosine similarity join
 # (simjoin) — https://crates.io/crates/difflib-fast
 difflib-fast = "0.3"
+# The directive mini-language (ACTION:[<KIND>]NAME[@PATH][=NOTE]) — parsing, glob matching, the
+# `-D` overload, and the lint pack (LintAction/Severity/fold) — https://crates.io/crates/directiva
+directiva = "0.1"
 rayon = "1"
 rustc-hash = "2" # FxHash for the Type-3 (ECScan) pass's hot token/shingle maps
 walkdir = "2"

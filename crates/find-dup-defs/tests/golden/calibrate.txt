@@ -104,7 +104,7 @@ suggested thresholds (p50/p75/p90 of current WARNING thickness distribution):
 
 === inferred directives (auto-detected noise patterns) ===
 
-  → -D 'de-escalate:*:*@*/{test,tests,__tests__,test_cases,test-cases,__fixtures__,fixtures,integration,e2e}/*=test parametrize/fixture candidates — review for conftest'
+  → -D 'de-escalate:*@*/{test,tests,__tests__,test_cases,test-cases,__fixtures__,fixtures,integration,e2e}/*=test parametrize/fixture candidates — review for conftest'
     rationale: 15 clusters live entirely in test paths — parametrize/conftest candidates
     affects: 15 total (12 ERROR, 3 WARNING, 0 INFO)
 
