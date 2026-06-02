@@ -32,7 +32,7 @@ use syn::{
 
 /// `(cluster_canonical, xname_canonical, type3_lines, node_count)` — the analysis tuple the scan
 /// reads to build a callable `Def`'s cluster canonical + `Analysis`.
-pub type AnalyzedFn = (String, String, Vec<String>, usize);
+pub use canon_core::AnalyzedFn;
 
 // ───────────────────────────── bound-locals collector ─────────────────────────────
 
@@ -199,16 +199,8 @@ impl<'a> Dump<'a> {
         Self { locals, map: HashMap::new(), blanked: false, count: 0 }
     }
 
-    #[allow(clippy::cast_possible_truncation)] // a callable's distinct bound-name count is far below u32::MAX
     fn rename(&mut self, name: &str) -> String {
-        if let Some(locals) = self.locals {
-            if locals.contains(name) {
-                let next = self.map.len() as u32;
-                let slot = *self.map.entry(name.to_owned()).or_insert(next);
-                return format!("_v{slot}");
-            }
-        }
-        name.to_owned()
+        canon_core::alpha_rename(&mut self.map, self.locals, name)
     }
 
     fn node(&mut self, tag: &str, fields: &[String]) -> String {

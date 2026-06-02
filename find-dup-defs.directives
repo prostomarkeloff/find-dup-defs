@@ -1,0 +1,31 @@
+# find-dup-defs self-dogfood directives.
+#
+# The genuinely-shareable canon logic (alpha-rename, count_loc, is_upper_snake, the KindSpec
+# constants, AnalyzedFn) was extracted into the `canon-core` crate. What remains below is
+# IRREDUCIBLE cross-frontend structure: each `*-canon` crate implements the same Frontend contract
+# over a *different* parser AST (Ruff / syn / oxc), so these can't be merged into one function
+# without erasing the per-crate API. De-escalated (ERROR -> WARNING) rather than suppressed, so they
+# stay visible as advisory.
+#
+# Usage: find-dup-defs crates -D @find-dup-defs.directives
+
+# Per-frontend kind subset — Python declares 5 kinds, Rust/TS 6 (interfaces). Different content.
+de-escalate:<constants>KINDS@*canon/src/frontend.rs=per-frontend kind subset, not duplication
+
+# Public per-crate batch wrappers — identical `par_iter().map(...).collect()` body, but each calls
+# its own crate's parser-backed canon function. The API surface must exist per frontend.
+de-escalate:<functions>analyze_functions@*canon/src/canon.rs=per-crate parallel-map over a different parser
+de-escalate:<functions>ast_canonical_many@*canon/src/canon.rs=per-crate parallel-map over a different parser
+
+# Cross-frontend contract tests — each asserts its own frontend's registry/extraction. Parallel by design.
+de-escalate:<functions>tests::*@*canon/src/*=per-frontend contract tests, parallel by design
+
+# Thin per-crate unparser methods on the (per-language) Dump struct.
+de-escalate:<methods>Dump::list@*canon/src/canon.rs=thin per-crate forwarder (calls self.node)
+de-escalate:<methods>Dump::rename@*canon/src/canon.rs=thin per-crate forwarder to canon_core::alpha_rename
+
+# The Frontend::scan trait impl — identical body (parallel read + scan_source) per frontend.
+de-escalate:<methods>*::scan@*canon/src/frontend.rs=Frontend trait impl, identical body per frontend
+
+# The Collect visitor — same shape, but walks a different AST (Ruff/syn/oxc node types) per crate.
+de-escalate:<classes>Collect@*canon/src/canon.rs=per-language AST visitor, different node types

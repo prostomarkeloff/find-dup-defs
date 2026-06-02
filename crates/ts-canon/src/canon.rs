@@ -44,7 +44,7 @@ use std::fmt::Write as _;
 /// `(cluster_canonical, xname_canonical, type3_lines, node_count)` — the analysis tuple the scan
 /// reads to build a `Def`'s cluster canonical + `Analysis`. `ts-canon`'s own type (was shared via
 /// `dup-defs-core`, now local since the engine consumes `Def`, not this tuple).
-pub type AnalyzedFn = (String, String, Vec<String>, usize);
+pub use canon_core::AnalyzedFn;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     self, ArrayExpressionElement, Argument, AssignmentTarget, AssignmentTargetMaybeDefault,
@@ -372,16 +372,8 @@ impl<'a> Dump<'a> {
         Self { locals, map: HashMap::new(), blanked: false, count: 0 }
     }
 
-    #[allow(clippy::cast_possible_truncation)] // a function's distinct bound-name count is far below u32::MAX
     fn rename(&mut self, name: &str) -> String {
-        if let Some(locals) = self.locals {
-            if locals.contains(name) {
-                let next = self.map.len() as u32;
-                let slot = *self.map.entry(name.to_owned()).or_insert(next);
-                return format!("_v{slot}");
-            }
-        }
-        name.to_owned()
+        canon_core::alpha_rename(&mut self.map, self.locals, name)
     }
 
     /// Emit one node as `Tag(field1, field2, …)`. Empty trailing fields are NOT trimmed (so

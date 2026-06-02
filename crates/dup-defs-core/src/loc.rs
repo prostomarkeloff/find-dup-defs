@@ -30,19 +30,24 @@ impl<'a> LineMap<'a> {
         }
     }
 
+    /// 0-indexed `(line, column)` with column counted in characters — the shared core of
+    /// [`Self::loc0`] / [`Self::loc1`].
+    fn line_col(&self, offset: usize) -> (usize, usize) {
+        let line = self.line_index(offset);
+        let col = self.src.get(self.starts[line]..offset).map_or(0, |s| s.chars().count());
+        (line, col)
+    }
+
     /// 1-indexed `(line, column)` with column counted in characters — rustpython parity.
     #[must_use]
     pub fn loc1(&self, offset: usize) -> (usize, usize) {
-        let line = self.line_index(offset);
-        let col = self.src.get(self.starts[line]..offset).map_or(0, |s| s.chars().count());
+        let (line, col) = self.line_col(offset);
         (line + 1, col + 1)
     }
 
     /// 0-indexed `(line, column)` — the convention [`crate::Def`] reports.
     #[must_use]
     pub fn loc0(&self, offset: usize) -> (usize, usize) {
-        let line = self.line_index(offset);
-        let col = self.src.get(self.starts[line]..offset).map_or(0, |s| s.chars().count());
-        (line, col)
+        self.line_col(offset)
     }
 }

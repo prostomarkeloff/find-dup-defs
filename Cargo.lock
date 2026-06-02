@@ -127,6 +127,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "canon-core"
+version = "0.1.0"
+dependencies = [
+ "dup-defs-core",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1026,6 +1033,7 @@ dependencies = [
 name = "py-canon"
 version = "0.3.1"
 dependencies = [
+ "canon-core",
  "dup-defs-core",
  "littrs-ruff-python-ast",
  "littrs-ruff-python-parser",
@@ -1126,6 +1134,7 @@ checksum = "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f"
 name = "rs-canon"
 version = "0.1.0"
 dependencies = [
+ "canon-core",
  "dup-defs-core",
  "proc-macro2",
  "rayon",
@@ -1307,6 +1316,7 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 name = "ts-canon"
 version = "0.1.2"
 dependencies = [
+ "canon-core",
  "dup-defs-core",
  "oxc_allocator",
  "oxc_ast",

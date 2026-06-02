@@ -13,24 +13,9 @@ use rayon::prelude::*;
 
 use crate::defs::scan_source;
 
-/// Free `fn foo(...)`.
-pub static FUNCTIONS: KindSpec =
-    KindSpec { id: "functions", label: "FUNCTION", noun_plural: "functions", section: 1, body: true, fn_like: true };
-/// `impl` methods and trait default methods, qualified `Type::method`.
-pub static METHODS: KindSpec =
-    KindSpec { id: "methods", label: "METHOD", noun_plural: "methods", section: 4, body: true, fn_like: true };
-/// `struct` / `enum` / `union` — body-bearing nominal types.
-pub static CLASSES: KindSpec =
-    KindSpec { id: "classes", label: "CLASS", noun_plural: "classes", section: 7, body: true, fn_like: false };
-/// `trait` — its associated-item shape (the interface analog).
-pub static INTERFACES: KindSpec =
-    KindSpec { id: "interfaces", label: "INTERFACE", noun_plural: "interfaces", section: 8, body: true, fn_like: false };
-/// `const` / `static` with an `UPPER_SNAKE` name.
-pub static CONSTANTS: KindSpec =
-    KindSpec { id: "constants", label: "CONSTANT", noun_plural: "constants", section: 0, body: false, fn_like: false };
-/// `type X = ...` (note the space in `noun_plural`, distinct from the hyphenated `id`).
-pub static TYPE_ALIASES: KindSpec =
-    KindSpec { id: "type-aliases", label: "TYPE_ALIAS", noun_plural: "type aliases", section: 9, body: false, fn_like: false };
+// The `KindSpec` vocabulary is shared across frontends — re-exported from `canon-core` so callers
+// (`crate::frontend::METHODS`, …) are unchanged. Rust supports all six kinds (`interfaces` = `trait`).
+pub use canon_core::kinds::{CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
 
 static KINDS: &[&KindSpec] = &[&FUNCTIONS, &METHODS, &CLASSES, &INTERFACES, &CONSTANTS, &TYPE_ALIASES];
 

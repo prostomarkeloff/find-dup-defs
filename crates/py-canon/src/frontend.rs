@@ -12,23 +12,9 @@ use rayon::prelude::*;
 
 use crate::defs::scan_source;
 
-// Section bases reproduce the engine's historical ordering: constants(0), functions(1→1/2/3 via
-// pass offset), methods(4→4/5/6), classes(7), type-aliases(9). `interfaces`(8) is TS-only.
-/// `def foo(...)` — top-level functions.
-pub static FUNCTIONS: KindSpec =
-    KindSpec { id: "functions", label: "FUNCTION", noun_plural: "functions", section: 1, body: true, fn_like: true };
-/// Class methods, qualified `Class.method`.
-pub static METHODS: KindSpec =
-    KindSpec { id: "methods", label: "METHOD", noun_plural: "methods", section: 4, body: true, fn_like: true };
-/// `class Foo: ...`.
-pub static CLASSES: KindSpec =
-    KindSpec { id: "classes", label: "CLASS", noun_plural: "classes", section: 7, body: true, fn_like: false };
-/// Module-level `UPPER_CASE = ...` constants.
-pub static CONSTANTS: KindSpec =
-    KindSpec { id: "constants", label: "CONSTANT", noun_plural: "constants", section: 0, body: false, fn_like: false };
-/// PEP 695 `type X = ...` aliases (note the space in `noun_plural`, distinct from the `id`).
-pub static TYPE_ALIASES: KindSpec =
-    KindSpec { id: "type-aliases", label: "TYPE_ALIAS", noun_plural: "type aliases", section: 9, body: false, fn_like: false };
+// The `KindSpec` vocabulary is shared across frontends — re-exported from `canon-core` so callers
+// (`crate::frontend::METHODS`, …) are unchanged. Python declares five kinds; `interfaces` is TS-only.
+pub use canon_core::kinds::{CLASSES, CONSTANTS, FUNCTIONS, METHODS, TYPE_ALIASES};
 
 static KINDS: &[&KindSpec] = &[&FUNCTIONS, &METHODS, &CLASSES, &CONSTANTS, &TYPE_ALIASES];
 

@@ -14,6 +14,7 @@ authors.workspace = true
 name = "py_canon"
 
 [dependencies]
+canon-core = { path = "../canon-core" }
 # The frontend↔engine contract (Def / KindSpec / Analysis / Frontend / LineMap) this crate
 # implements; the engine consumes the Defs this frontend emits.
 dup-defs-core = { path = "../dup-defs-core", version = "0.1" }

@@ -22,20 +22,13 @@
 
 use std::sync::Arc;
 
+use canon_core::{count_loc, is_upper_snake};
 use dup_defs_core::{Analysis, CanonDialect, Def, KindSpec, LineMap};
 use ruff_python_ast::{Expr, Parameters, Stmt};
 use ruff_python_parser::parse_module;
 
 use crate::canon::{analyze_functions, analyze_stmt, ast_canonical, cluster_canonical_node};
 use crate::frontend::{kind_spec, METHODS};
-
-/// Non-blank line count of a def's source text — the simplest "how big" metric the report can
-/// surface. Blank/whitespace-only lines (including the line after a multi-line signature) are
-/// excluded so a method with a deliberately spaced-out body doesn't read as twice as big as an
-/// equivalent dense one.
-fn count_loc(text: &str) -> usize {
-    text.lines().filter(|l| !l.trim().is_empty()).count()
-}
 
 /// Total parameter count: posonly + args + kwonly + (`*args` if present) + (`**kwargs` if
 /// present). For methods this includes the receiver (`self` / `cls`) — that's what the user
@@ -48,20 +41,15 @@ fn count_args(p: &Parameters) -> usize {
         + usize::from(p.kwarg.is_some())
 }
 
-fn is_upper(name: &str) -> bool {
-    !name.is_empty()
-        && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-}
-
 /// The name of a module-level `UPPER_CASE` constant assignment (`NAME = …` / `NAME: T = …`).
 fn const_name(stmt: &Stmt) -> Option<String> {
     match stmt {
         Stmt::Assign(node) => match node.targets.as_slice() {
-            [Expr::Name(name)] if is_upper(name.id.as_str()) => Some(name.id.as_str().to_owned()),
+            [Expr::Name(name)] if is_upper_snake(name.id.as_str()) => Some(name.id.as_str().to_owned()),
             _ => None,
         },
         Stmt::AnnAssign(node) => match node.target.as_ref() {
-            Expr::Name(name) if is_upper(name.id.as_str()) => Some(name.id.as_str().to_owned()),
+            Expr::Name(name) if is_upper_snake(name.id.as_str()) => Some(name.id.as_str().to_owned()),
             _ => None,
         },
         _ => None,

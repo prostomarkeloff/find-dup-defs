@@ -30,18 +30,9 @@ use crate::canon::{
     analyze_impl_fn, analyze_item_fn, analyze_trait_fn, enum_canon, struct_canon, trait_canon,
     union_canon, AnalyzedFn,
 };
+use canon_core::{count_loc, is_upper_snake};
+
 use crate::frontend::{CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
-
-/// Non-blank line count of a def's source text.
-fn count_loc(text: &str) -> usize {
-    text.lines().filter(|l| !l.trim().is_empty()).count()
-}
-
-/// `UPPER_SNAKE` (the constant convention) — same rule as the other frontends.
-fn is_upper_snake(name: &str) -> bool {
-    !name.is_empty()
-        && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
-}
 
 /// Number of value parameters, excluding a `self` receiver (the analog of TS not counting
 /// `this`).

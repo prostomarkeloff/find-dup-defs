@@ -34,6 +34,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use canon_core::{count_loc, is_upper_snake};
 use dup_defs_core::{Analysis, CanonDialect, Def, KindSpec, LineMap};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -53,24 +54,11 @@ fn u(x: u32) -> usize {
     x as usize
 }
 
-/// Non-blank line count of a def's source text. Same definition as `py-canon::count_loc` for
-/// cross-language consistency.
-fn count_loc(text: &str) -> usize {
-    text.lines().filter(|l| !l.trim().is_empty()).count()
-}
-
 /// User-visible parameter count: every formal slot (`x`, `...rest`, defaults) counts once. The
 /// `this: Foo` annotation in `function f(this: Foo, x: number)` is a type-only fake parameter
 /// (analogous to Python's stripped `self`/`cls`) and does NOT count.
 fn count_args(params: &FormalParameters<'_>) -> usize {
     params.items.len() + usize::from(params.rest.is_some())
-}
-
-/// True iff `name` is `UPPER_SNAKE_CASE`. Same rule as `py-canon` so `MAX_RETRIES` clusters
-/// cross-language alongside Python `MAX_RETRIES`.
-fn is_upper_snake(name: &str) -> bool {
-    !name.is_empty()
-        && name.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// The byte offset just after the last decorator (skipping whitespace / single-line comments) —

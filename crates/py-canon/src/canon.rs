@@ -16,7 +16,7 @@ use std::fmt::Write as _;
 /// `(cluster_canonical, xname_canonical, type3_lines, node_count)` — the analysis tuple the scan
 /// reads to build a `Def`'s cluster canonical + `Analysis`. `py-canon`'s own type (was shared via
 /// `dup-defs-core`, now local since the engine consumes `Def`, not this tuple).
-pub type AnalyzedFn = (String, String, Vec<String>, usize);
+pub use canon_core::AnalyzedFn;
 use rayon::prelude::*;
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{
@@ -300,16 +300,8 @@ impl<'a> Dump<'a> {
     }
 
     /// In cross-name mode, rewrite a bound local to its positional `_v{n}` placeholder.
-    #[allow(clippy::cast_possible_truncation)] // a function's distinct local count is far below u32::MAX
     fn rename_id(&mut self, id: &str) -> String {
-        if let Some(locals) = self.locals {
-            if locals.contains(id) {
-                let next = self.map.len() as u32;
-                let slot = *self.map.entry(id.to_owned()).or_insert(next);
-                return format!("_v{slot}");
-            }
-        }
-        id.to_owned()
+        canon_core::alpha_rename(&mut self.map, self.locals, id)
     }
 
     /// Emit one AST node `name(field, …)` applying the `show_empty=False` + keyword-switch rule.
@@ -1252,16 +1244,8 @@ struct Unparse<'a> {
 }
 
 impl Unparse<'_> {
-    #[allow(clippy::cast_possible_truncation)]
     fn rename_id(&mut self, id: &str) -> String {
-        if let Some(locals) = self.locals {
-            if locals.contains(id) {
-                let next = self.map.len() as u32;
-                let slot = *self.map.entry(id.to_owned()).or_insert(next);
-                return format!("_v{slot}");
-            }
-        }
-        id.to_owned()
+        canon_core::alpha_rename(&mut self.map, self.locals, id)
     }
 
     /// Start a new logical line (CPython `fill`): a newline unless we're at the start.

@@ -758,20 +758,8 @@ impl<'a> TermParser<'a> {
     }
 
     fn quoted(&mut self) -> Term {
-        let q = self.b[self.i];
         let start = self.i;
-        self.i += 1;
-        while self.i < self.b.len() {
-            if self.b[self.i] == b'\\' {
-                self.i += 2;
-                continue;
-            }
-            if self.b[self.i] == q {
-                self.i += 1;
-                break;
-            }
-            self.i += 1;
-        }
+        self.skip_quoted();
         Term::Atom(self.s[start..self.i.min(self.b.len())].to_owned())
     }
 
@@ -1230,15 +1218,6 @@ fn rs_parse_function_body(canon: &str) -> Vec<Term> {
 
 // ── Rust pseudo-source renderer ──────────────────────────────────────────────
 
-/// An atom/hole in name position (`Path` id, a method/field name, a `Bind` name): strip quotes, hole
-/// → `?`.
-fn rs_name(t: Option<&Term>) -> String {
-    match t {
-        Some(Term::Atom(s)) => unq(s).to_owned(),
-        _ => "?".to_owned(),
-    }
-}
-
 /// Comma-join node children `ch[from..]` via [`rs_render`].
 fn rs_seq(ch: &[Term], from: usize, out: &mut String, b: &mut usize) {
     for (i, c) in ch.iter().enumerate().skip(from) {
@@ -1303,7 +1282,7 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
     match tag {
         "Func" => {
             out.push_str("fn ");
-            out.push_str(&rs_name(ch.first()));
+            out.push_str(&ident(ch.first()));
             out.push('(');
             if let Some(Term::Node(pt, pch)) = ch.get(1) {
                 if pt == "Params" {
@@ -1345,29 +1324,29 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
         "ExprStmt" | "Tail" | "BlockExpr" => rs_render(ch.first().unwrap_or(&Term::Hole), out, b),
         // Name-position leaves: a path/binding id or a bare numeric/bool literal — render the value.
         "Path" | "PatPath" | "Bind" | "Int" | "Float" | "Bool" | "Byte" => {
-            out.push_str(&rs_name(ch.first()));
+            out.push_str(&ident(ch.first()));
         }
         "Wild" | "TyInfer" => out.push('_'),
         "Rest" => out.push_str(".."),
         "Str" => {
             out.push('"');
-            out.push_str(&rs_name(ch.first()));
+            out.push_str(&ident(ch.first()));
             out.push('"');
         }
         "Char" => {
             out.push('\'');
-            out.push_str(&rs_name(ch.first()));
+            out.push_str(&ident(ch.first()));
             out.push('\'');
         }
         "Bin" => {
             rs_render(ch.first().unwrap_or(&Term::Hole), out, b);
             out.push(' ');
-            out.push_str(&rs_name(ch.get(1)));
+            out.push_str(&ident(ch.get(1)));
             out.push(' ');
             rs_render(ch.get(2).unwrap_or(&Term::Hole), out, b);
         }
         "Unary" => {
-            out.push_str(&rs_name(ch.first()));
+            out.push_str(&ident(ch.first()));
             rs_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
         }
         "Assign" => {
@@ -1384,7 +1363,7 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
         "Method" => {
             rs_render(ch.first().unwrap_or(&Term::Hole), out, b);
             out.push('.');
-            out.push_str(&rs_name(ch.get(1)));
+            out.push_str(&ident(ch.get(1)));
             out.push('(');
             rs_seq(ch, 2, out, b);
             out.push(')');
@@ -1392,7 +1371,7 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
         "Field" => {
             rs_render(ch.first().unwrap_or(&Term::Hole), out, b);
             out.push('.');
-            out.push_str(&rs_name(ch.get(1)));
+            out.push_str(&ident(ch.get(1)));
         }
         "Index" => {
             rs_render(ch.first().unwrap_or(&Term::Hole), out, b);
@@ -1467,7 +1446,7 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
         // `&expr` / `&mut expr` — value reference and type reference share the `&['mut'] inner` shape.
         "Ref" | "TyRef" => {
             out.push('&');
-            if rs_name(ch.first()) == "mut" {
+            if ident(ch.first()) == "mut" {
                 out.push_str("mut ");
             }
             rs_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
@@ -1515,13 +1494,13 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             }
         }
         "StructLit" | "PatStruct" => {
-            out.push_str(&rs_name(ch.first()));
+            out.push_str(&ident(ch.first()));
             out.push_str(" { ");
             rs_seq(ch, 1, out, b);
             out.push_str(" }");
         }
         "FieldVal" | "PatField" => {
-            out.push_str(&rs_name(ch.first()));
+            out.push_str(&ident(ch.first()));
             out.push_str(": ");
             rs_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
         }
@@ -1547,11 +1526,11 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             }
         }
         "Macro" | "MacroStmt" => {
-            out.push_str(&rs_name(ch.first()));
+            out.push_str(&ident(ch.first()));
             out.push_str("!(…)");
         }
         "Ty" => {
-            out.push_str(&rs_name(ch.first()));
+            out.push_str(&ident(ch.first()));
             if let Some(args) = ch.get(1) {
                 if matches!(args, Term::Node(..)) {
                     out.push('<');
@@ -1566,7 +1545,7 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
         }
         // Tuple-struct / enum-variant pattern: `Path(p, …)`. Slot 0 is the path name (spliced pats follow).
         "PatTupleStruct" => {
-            out.push_str(&rs_name(ch.first()));
+            out.push_str(&ident(ch.first()));
             out.push('(');
             rs_seq(ch, 1, out, b);
             out.push(')');
@@ -1877,8 +1856,9 @@ fn stmt_bareword(s: &str) -> &str {
     }
 }
 
-/// Render an atom/hole in identifier position (`Name` id, `Attribute` attr, `arg` name): strip quotes
-/// off a literal, hole → `?`, anything unexpected → `?`.
+/// Render an atom/hole in a *name* position (a `Name`/`Path` id, an `Attribute`/`Field`/method or
+/// kwarg name, an `arg`/`Bind` name): strip quotes off a literal, hole → `?`, anything else → `?`.
+/// Shared by both the Python and Rust renderers.
 fn ident(t: Option<&Term>) -> String {
     match t {
         Some(Term::Atom(s)) => unq(s).to_owned(),
