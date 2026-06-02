@@ -1593,6 +1593,646 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
     }
 }
 
+// ── TypeScript dialect ───────────────────────────────────────────────────────
+
+/// The TypeScript dialect — `ts-canon`'s `oxc`-derived structural dump. Same `Tag(field, …)`
+/// S-shape as Rust, and like Rust it **splices** statement-list elements as node children
+/// (`Block(stmt, stmt, …)`, `Params(Param, …)`, `Switch(disc, Case, …)`) rather than wrapping them
+/// in a `[…]` `Term::List` — the exceptions are `Var`'s declarator list and the collection literals
+/// (`Arr`/`Obj`/`Tpl`/`Seq`), which ARE bracket lists. A function reaching patternology is either a
+/// `Func('_fn', Params, Block, …flags)` declaration or an arrow / function-expression bound to a
+/// `const`/`let` (`Var('const', [Decl(Bind, Arrow(…))])`); class methods don't reach here (their
+/// slice doesn't re-parse as a standalone function, so they analyze to `None`).
+///
+/// One canon quirk drives the slot table: the `async=… gen=…[ expr=…]` flag string is emitted
+/// **unquoted**, so the parser reads it as a run of trailing `false`/`true` atoms (the `async`/`gen`
+/// names look like `name=value` keywords and are dropped). Those flag atoms are signature material —
+/// classified `Anno` so they neither anchor the motif nor count as holes.
+pub(crate) struct TsDialect;
+
+impl Dialect for TsDialect {
+    fn slot_ctx(&self, tag: &str, k: usize) -> Ctx {
+        match (tag, k) {
+            // Statement-holding positions — a hole here is a leaky statement-divergence. `Block`
+            // children are spliced statements; a compound-statement body may be a *bare* statement
+            // (`if (x) return;`) rather than a `Block`, so the slot itself can hole to a statement:
+            // `If` consequent/alternate, the `For`/`ForIn`/`ForOf`/`ForAwaitOf`/`While`/`DoWhile`
+            // loop body, and the `With`/`Label`/`Catch` body.
+            ("Block", _)
+            | ("If", 1 | 2)
+            | ("For", 3)
+            | ("ForIn" | "ForOf" | "ForAwaitOf", 2)
+            | ("DoWhile", 0)
+            | ("While" | "With" | "Label" | "Catch", 1) => Ctx::Stmt,
+            // Name-identity (selector) slots: a varying member / property / method *name* would need
+            // reflection (`obj[?]`, `{[?]: v}`), not a parameter — so it disqualifies the helper.
+            ("Member" | "PrivateMember", 1)
+            | ("ObjProp" | "Prop" | "Method" | "BindProp" | "TargetProp", 0) => Ctx::Selector,
+            // Signature material — the fn name, the `async=… gen=…[ expr=…]` flag atoms (parsed as
+            // trailing `false`/`true`), and the type of an `x as T` / `x satisfies T` / `<T>x`.
+            // A `Decl`'s binding name (slot 0) is a synthetic `_fn` (blanked arrow-const) or a `_v…`
+            // placeholder — never shared logic, so it must not anchor the motif.
+            ("Func", 0 | 3 | 4) | ("Arrow", 2..=4) | ("Decl", 0) | ("TSAs" | "TSSat" | "TSAssert", 1) => {
+                Ctx::Anno
+            }
+            _ => Ctx::Expr,
+        }
+    }
+
+    fn parse_function_body(&self, canon: &str) -> Vec<Term> {
+        ts_parse_function_body(canon)
+    }
+
+    fn render(&self, t: &Term, out: &mut String, budget: &mut usize) {
+        ts_render(t, out, budget);
+    }
+}
+
+/// Body statement list of a TS function canonical. The top term is either a `Func`/`Arrow` node
+/// (the body is its `Block` child) or a `Var('kind', [Decl(Bind, Arrow|Func(…))])` (an arrow /
+/// fn-expr bound to a `const`/`let`) — recurse into the first declarator's initializer. Empty for
+/// anything else. Unlike the Python/Rust hot paths it parses the *whole* term (TS `Params` carry no
+/// annotation subtrees, so the discarded-signature cost the targeted skip avoids is negligible here)
+/// and then walks to the body block.
+fn ts_parse_function_body(canon: &str) -> Vec<Term> {
+    fn block_stmts(t: Option<&Term>) -> Vec<Term> {
+        match t {
+            Some(Term::Node(tag, ch)) if tag == "Block" => ch.clone(),
+            _ => Vec::new(),
+        }
+    }
+    fn body_of(t: &Term) -> Vec<Term> {
+        match t {
+            Term::Node(tag, ch) if tag == "Func" => block_stmts(ch.get(2)),
+            Term::Node(tag, ch) if tag == "Arrow" => block_stmts(ch.get(1)),
+            // `Var('kind', [Decl(Bind, init), …])` — the bound function is the first declarator's init.
+            Term::Node(tag, ch) if tag == "Var" => match ch.get(1) {
+                Some(Term::List(decls)) => match decls.first() {
+                    Some(Term::Node(dt, dch)) if dt == "Decl" => {
+                        dch.get(1).map_or_else(Vec::new, body_of)
+                    }
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        }
+    }
+    body_of(&parse_term(canon))
+}
+
+// ── TypeScript pseudo-source renderer ────────────────────────────────────────
+
+/// Comma-join node children `ch[from..]` via [`ts_render`].
+fn ts_seq(ch: &[Term], from: usize, out: &mut String, b: &mut usize) {
+    for (i, c) in ch.iter().enumerate().skip(from) {
+        if i > from {
+            out.push_str(", ");
+        }
+        if *b == 0 {
+            out.push('…');
+            return;
+        }
+        ts_render(c, out, b);
+    }
+}
+
+/// Render the elements of a bracket-list child (call/`new` args, `Arr`/`Obj` elements), each through
+/// [`ts_render`], comma-joined. A missing or non-list child contributes nothing.
+fn ts_list_inner(t: Option<&Term>, out: &mut String, b: &mut usize) {
+    if let Some(Term::List(items)) = t {
+        for (i, it) in items.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            if *b == 0 {
+                out.push('…');
+                return;
+            }
+            ts_render(it, out, b);
+        }
+    }
+}
+
+/// Render a statement child: a `Block` node as a braced `{ s; s }` body, anything else inline (a bare
+/// single-statement body), a missing child as `{}`.
+fn ts_stmt_child(t: Option<&Term>, out: &mut String, b: &mut usize) {
+    match t {
+        Some(Term::Node(tag, ch)) if tag == "Block" => {
+            out.push_str("{ ");
+            for (i, s) in ch.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("; ");
+                }
+                if *b == 0 {
+                    out.push('…');
+                    break;
+                }
+                ts_render(s, out, b);
+            }
+            out.push_str(" }");
+        }
+        Some(other) => ts_render(other, out, b),
+        None => out.push_str("{}"),
+    }
+}
+
+/// Render the parameter list of a `Func`/`Arrow` — the `Params(Param, …)` node's children, or a lone
+/// hole, comma-joined (the surrounding parens are written by the caller).
+fn ts_params(t: Option<&Term>, out: &mut String, b: &mut usize) {
+    match t {
+        Some(Term::Node(tag, ch)) if tag == "Params" => ts_seq(ch, 0, out, b),
+        Some(other) => ts_render(other, out, b),
+        None => {}
+    }
+}
+
+/// Render a property / object key child: a string-literal atom verbatim (unquoted), a `ComputedKey`
+/// or other node through [`ts_render`], a hole as `?`.
+fn ts_key(t: Option<&Term>, out: &mut String, b: &mut usize) {
+    match t {
+        Some(Term::Atom(s)) => out.push_str(unq(s)),
+        Some(other) => ts_render(other, out, b),
+        None => out.push('?'),
+    }
+}
+
+/// Render a folded TS term as one line of pseudo-source. Mirrors [`py`] / [`rs_render`]: bounded by
+/// `b`, holes `?`, unknown tags fall back to the raw `Tag(child, …)` form.
+fn ts_render(t: &Term, out: &mut String, b: &mut usize) {
+    if *b == 0 {
+        out.push('…');
+        return;
+    }
+    *b -= 1;
+    match t {
+        Term::Hole => out.push('?'),
+        Term::Atom(s) => out.push_str(unq(s)),
+        Term::List(items) => {
+            out.push('[');
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                ts_render(it, out, b);
+            }
+            out.push(']');
+        }
+        Term::Node(tag, ch) => ts_node(tag, ch, out, b),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn ts_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
+    match tag {
+        "Func" => {
+            out.push_str("function ");
+            out.push_str(&ident(ch.first()));
+            out.push('(');
+            ts_params(ch.get(1), out, b);
+            out.push_str(") ");
+            ts_stmt_child(ch.get(2), out, b);
+        }
+        "Arrow" => {
+            out.push('(');
+            ts_params(ch.first(), out, b);
+            out.push_str(") => ");
+            ts_stmt_child(ch.get(1), out, b);
+        }
+        // Parenthesized comma list — a parameter list or a sequence expression.
+        "Params" | "Seq" => {
+            out.push('(');
+            ts_seq(ch, 0, out, b);
+            out.push(')');
+        }
+        // A binding with an optional initializer — a `Param`'s default or a `Decl`'s init.
+        "Param" | "Decl" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            if let Some(init) = ch.get(1) {
+                out.push_str(" = ");
+                ts_render(init, out, b);
+            }
+        }
+        // `...rest` parameter / `...spread` element render identically.
+        "Rest" | "Spread" => {
+            out.push_str("...");
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+        }
+        // Name-position leaves — render the (renamed) identifier / literal value.
+        "Id" | "Bind" | "Num" | "Bool" | "BigInt" => out.push_str(&ident(ch.first())),
+        "This" => out.push_str("this"),
+        "Super" => out.push_str("super"),
+        "Null" => out.push_str("null"),
+        "Str" => {
+            out.push('"');
+            out.push_str(&ident(ch.first()));
+            out.push('"');
+        }
+        "Regex" => {
+            out.push('/');
+            out.push_str(&ident(ch.first()));
+            out.push('/');
+        }
+        "Tpl" => {
+            out.push('`');
+            for c in ch {
+                if *b == 0 {
+                    out.push('…');
+                    break;
+                }
+                match c {
+                    Term::Atom(s) => out.push_str(unq(s)),
+                    other => {
+                        out.push_str("${");
+                        ts_render(other, out, b);
+                        out.push('}');
+                    }
+                }
+            }
+            out.push('`');
+        }
+        "Block" => {
+            out.push_str("{ ");
+            for (i, s) in ch.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("; ");
+                }
+                if *b == 0 {
+                    out.push('…');
+                    break;
+                }
+                ts_render(s, out, b);
+            }
+            out.push_str(" }");
+        }
+        "Var" => {
+            out.push_str(match ch.first() {
+                Some(Term::Atom(s)) => unq(s),
+                _ => "var",
+            });
+            out.push(' ');
+            match ch.get(1) {
+                Some(Term::List(decls)) => {
+                    for (i, d) in decls.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        if *b == 0 {
+                            out.push('…');
+                            break;
+                        }
+                        ts_render(d, out, b);
+                    }
+                }
+                Some(other) => ts_render(other, out, b),
+                None => {}
+            }
+        }
+        // Transparent wrappers — an expression statement / optional-chain just renders the inner.
+        "Expr" | "Chain" => ts_render(ch.first().unwrap_or(&Term::Hole), out, b),
+        "If" => {
+            out.push_str("if (");
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push_str(") ");
+            ts_stmt_child(ch.get(1), out, b);
+            if let Some(alt) = ch.get(2) {
+                out.push_str(" else ");
+                ts_stmt_child(Some(alt), out, b);
+            }
+        }
+        "For" => {
+            out.push_str("for (");
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push_str("; ");
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+            out.push_str("; ");
+            ts_render(ch.get(2).unwrap_or(&Term::Hole), out, b);
+            out.push_str(") ");
+            ts_stmt_child(ch.get(3), out, b);
+        }
+        "ForIn" | "ForOf" | "ForAwaitOf" => {
+            out.push_str(if tag == "ForAwaitOf" { "for await (" } else { "for (" });
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push_str(if tag == "ForIn" { " in " } else { " of " });
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+            out.push_str(") ");
+            ts_stmt_child(ch.get(2), out, b);
+        }
+        "While" => {
+            out.push_str("while (");
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push_str(") ");
+            ts_stmt_child(ch.get(1), out, b);
+        }
+        "DoWhile" => {
+            out.push_str("do ");
+            ts_stmt_child(ch.first(), out, b);
+            out.push_str(" while (");
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+            out.push(')');
+        }
+        "Return" => {
+            out.push_str("return");
+            if let Some(e) = ch.first() {
+                out.push(' ');
+                ts_render(e, out, b);
+            }
+        }
+        "Throw" => {
+            out.push_str("throw ");
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+        }
+        "Break" => {
+            out.push_str("break");
+            if let Some(Term::Atom(s)) = ch.first() {
+                if !unq(s).is_empty() {
+                    out.push(' ');
+                    out.push_str(unq(s));
+                }
+            }
+        }
+        "Continue" => {
+            out.push_str("continue");
+            if let Some(Term::Atom(s)) = ch.first() {
+                if !unq(s).is_empty() {
+                    out.push(' ');
+                    out.push_str(unq(s));
+                }
+            }
+        }
+        "Try" => {
+            out.push_str("try ");
+            ts_stmt_child(ch.first(), out, b);
+            if let Some(h) = ch.get(1) {
+                if matches!(h, Term::Node(..)) {
+                    out.push(' ');
+                    ts_render(h, out, b);
+                }
+            }
+            if let Some(f) = ch.get(2) {
+                if matches!(f, Term::Node(..)) {
+                    out.push_str(" finally ");
+                    ts_stmt_child(Some(f), out, b);
+                }
+            }
+        }
+        "Catch" => {
+            out.push_str("catch (");
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push_str(") ");
+            ts_stmt_child(ch.get(1), out, b);
+        }
+        "Switch" => {
+            out.push_str("switch (");
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push_str(") { ");
+            ts_seq(ch, 1, out, b);
+            out.push_str(" }");
+        }
+        "Case" => {
+            if matches!(ch.first(), Some(Term::Node(..) | Term::Hole)) {
+                out.push_str("case ");
+                ts_render(&ch[0], out, b);
+                out.push_str(": ");
+            } else {
+                out.push_str("default: ");
+            }
+            ts_stmt_child(ch.get(1), out, b);
+        }
+        "Label" => {
+            out.push_str(&ident(ch.first()));
+            out.push_str(": ");
+            ts_stmt_child(ch.get(1), out, b);
+        }
+        "With" => {
+            out.push_str("with (");
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push_str(") ");
+            ts_stmt_child(ch.get(1), out, b);
+        }
+        "Bin" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push(' ');
+            out.push_str(&ts_op(ch.get(1), ts_bin_sym));
+            out.push(' ');
+            ts_render(ch.get(2).unwrap_or(&Term::Hole), out, b);
+        }
+        "Logic" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push(' ');
+            out.push_str(&ts_op(ch.get(1), ts_logic_sym));
+            out.push(' ');
+            ts_render(ch.get(2).unwrap_or(&Term::Hole), out, b);
+        }
+        "Unary" => {
+            // Word operators (`typeof`/`void`/`delete`) carry their own trailing space; symbolic
+            // ones (`!`/`-`/`~`) abut the operand.
+            out.push_str(&ts_op(ch.first(), ts_unary_sym));
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+        }
+        "Update" => {
+            let op = match ch.first() {
+                Some(Term::Atom(s)) if unq(s) == "Increment" => "++",
+                Some(Term::Atom(s)) if unq(s) == "Decrement" => "--",
+                _ => "?",
+            };
+            let pre = matches!(ch.get(1), Some(Term::Atom(s)) if unq(s) == "pre");
+            if pre {
+                out.push_str(op);
+                ts_render(ch.get(2).unwrap_or(&Term::Hole), out, b);
+            } else {
+                ts_render(ch.get(2).unwrap_or(&Term::Hole), out, b);
+                out.push_str(op);
+            }
+        }
+        "Assign" => {
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+            out.push(' ');
+            out.push_str(ts_assign_op(ch.first()));
+            out.push(' ');
+            ts_render(ch.get(2).unwrap_or(&Term::Hole), out, b);
+        }
+        "Cond" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push_str(" ? ");
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+            out.push_str(" : ");
+            ts_render(ch.get(2).unwrap_or(&Term::Hole), out, b);
+        }
+        "Call" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push('(');
+            ts_list_inner(ch.get(2), out, b);
+            out.push(')');
+        }
+        "New" => {
+            out.push_str("new ");
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push('(');
+            ts_list_inner(ch.get(1), out, b);
+            out.push(')');
+        }
+        "Member" | "PrivateMember" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push('.');
+            out.push_str(&ident(ch.get(1)));
+        }
+        "CMember" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push('[');
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+            out.push(']');
+        }
+        "Await" => {
+            out.push_str("await ");
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+        }
+        "Yield" => {
+            out.push_str("yield ");
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+        }
+        // Array literal / array-destructuring pattern.
+        "Arr" | "BindArr" => {
+            out.push('[');
+            ts_seq(ch, 0, out, b);
+            out.push(']');
+        }
+        // Object literal / object-destructuring pattern.
+        "Obj" | "BindObj" => {
+            out.push_str("{ ");
+            ts_seq(ch, 0, out, b);
+            out.push_str(" }");
+        }
+        // `key: value` object-literal entry / object-destructuring binding.
+        "ObjProp" | "BindProp" => {
+            ts_key(ch.first(), out, b);
+            out.push_str(": ");
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+        }
+        "BindDefault" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push_str(" = ");
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+        }
+        "TSAs" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push_str(" as ");
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+        }
+        "TSSat" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push_str(" satisfies ");
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+        }
+        "TSNonNull" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push('!');
+        }
+        "TSAssert" => {
+            out.push('<');
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+            out.push('>');
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+        }
+        "JSX" => {
+            out.push('<');
+            out.push_str(&ident(ch.first()));
+            out.push_str(" />");
+        }
+        "JSXFragment" => out.push_str("<></>"),
+        // Type-position structure that can ride along a `x as T` ascription or a local `type` decl.
+        "TSTypeAlias" => {
+            out.push_str("type ");
+            out.push_str(&ident(ch.first()));
+            out.push_str(" = ");
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+        }
+        "TSArray" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push_str("[]");
+        }
+        "TSUnion" | "TSInter" => {
+            let sep = if tag == "TSUnion" { " | " } else { " & " };
+            for (i, c) in ch.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(sep);
+                }
+                if *b == 0 {
+                    out.push('…');
+                    break;
+                }
+                ts_render(c, out, b);
+            }
+        }
+        // Opaque long-tail summaries (`TS_<discriminant>` type kinds, `Unknown_<NodeKind>`) ts-canon
+        // emits when it doesn't case a node — not real renderable source, so show a hole.
+        _ if tag.starts_with("TS_") || tag.starts_with("Unknown_") => out.push('?'),
+        // Unknown / unhandled node: compact `Tag(child, …)` fallback (keeps holes visible).
+        _ => {
+            out.push_str(tag);
+            if !ch.is_empty() {
+                out.push('(');
+                ts_seq(ch, 0, out, b);
+                out.push(')');
+            }
+        }
+    }
+}
+
+/// The source symbol for a binary operator (oxc emits the operator as its `Debug` name —
+/// `Addition`, `StrictEquality`). Unknown names pass through verbatim.
+fn ts_bin_sym(s: &str) -> &str {
+    match s {
+        "Addition" => "+", "Subtraction" => "-", "Multiplication" => "*", "Division" => "/",
+        "Remainder" => "%", "Exponential" => "**", "Equality" => "==", "Inequality" => "!=",
+        "StrictEquality" => "===", "StrictInequality" => "!==", "LessThan" => "<",
+        "LessEqualThan" => "<=", "GreaterThan" => ">", "GreaterEqualThan" => ">=",
+        "ShiftLeft" => "<<", "ShiftRight" => ">>", "ShiftRightZeroFill" => ">>>",
+        "BitwiseOR" => "|", "BitwiseXOR" => "^", "BitwiseAnd" => "&", "In" => "in",
+        "Instanceof" => "instanceof", other => other,
+    }
+}
+
+/// The source symbol for a logical operator (`&&` / `||` / `??`).
+fn ts_logic_sym(s: &str) -> &str {
+    match s {
+        "Or" => "||", "And" => "&&", "Coalesce" => "??", other => other,
+    }
+}
+
+/// The source prefix for a unary operator — word operators (`typeof`/`void`/`delete`) keep a trailing
+/// space so the operand reads correctly.
+fn ts_unary_sym(s: &str) -> &str {
+    match s {
+        "UnaryNegation" => "-", "UnaryPlus" => "+", "LogicalNot" => "!", "BitwiseNot" => "~",
+        "Typeof" => "typeof ", "Void" => "void ", "Delete" => "delete ", other => other,
+    }
+}
+
+/// The source symbol for an assignment operator (`=`, `+=`, `&&=`, …); a hole / unknown reads as `=`.
+fn ts_assign_op(t: Option<&Term>) -> &'static str {
+    let s = match t {
+        Some(Term::Atom(a)) => unq(a),
+        _ => return "=",
+    };
+    // `"Assign"` (plain `=`) falls through to the wildcard.
+    match s {
+        "Addition" => "+=", "Subtraction" => "-=", "Multiplication" => "*=", "Division" => "/=",
+        "Remainder" => "%=", "Exponential" => "**=", "ShiftLeft" => "<<=", "ShiftRight" => ">>=",
+        "ShiftRightZeroFill" => ">>>=", "BitwiseOR" => "|=", "BitwiseXOR" => "^=",
+        "BitwiseAnd" => "&=", "LogicalOr" => "||=", "LogicalAnd" => "&&=", "LogicalNullish" => "??=",
+        _ => "=",
+    }
+}
+
+/// Map an operator child (a quoted-name `Term::Atom`) through `sym`; a hole / non-atom reads as `?`.
+fn ts_op(t: Option<&Term>, sym: fn(&str) -> &str) -> String {
+    match t {
+        Some(Term::Atom(s)) => sym(unq(s)).to_owned(),
+        _ => "?".to_owned(),
+    }
+}
+
 /// Tallies from walking a folded LGG term: fixed (non-hole) nodes/atoms — the helper body's size —
 /// plus holes split by the context they sit in, and the set of distinct *anchor* names (shared
 /// identifiers/literals, excluding bound-variable placeholders) that make the motif domain-specific.
@@ -3016,5 +3656,88 @@ mod tests {
         // (`KeyError`/`LookupError`) holed, rendered as a sub-block (no function header).
         assert_eq!(c.body, "_v0 = self.get(_v1); if _v0 is None: raise ?(_v1)", "body: {}", c.body);
         assert_eq!(c.params, 1, "the holed exception class is the one param");
+    }
+
+    // ── TypeScript dialect (the `ts-canon` `oxc` shape) ──────────────────────
+    //
+    // The TS canonicals below are hand-written in `ts-canon`'s emitter format (see
+    // `ts-canon/src/canon.rs`): spliced `Block(stmt, …)` / `Params(Param, …)` children like Rust,
+    // string literals single-quoted, the `async=… gen=…` flag emitted UNQUOTED (so it parses as a
+    // run of trailing `false` atoms), and `Var('kind', [Decl(…), …])` as a bracket list.
+
+    #[test]
+    fn ts_whole_fn_emits_factory_helper() {
+        // Two `function make*(x) { const v = new T(x); store.add(v); return v }` builders whose only
+        // divergence is the constructed class (`User`/`Order`) — a bindable callee, not a selector.
+        // The whole-function pass folds them into one factory helper, holing the class name.
+        let make_user = "Func('_fn', Params(Param(Bind('_v0'))), Block(Var('const', [Decl(Bind('_v1'), New(Id('User'), [Id('_v0')]))]), Expr(Call(Member(Id('store'), 'add', ''), '', [Id('_v1')])), Return(Id('_v1'))), async=false gen=false)".to_owned();
+        let make_order = "Func('_fn', Params(Param(Bind('_v0'))), Block(Var('const', [Decl(Bind('_v1'), New(Id('Order'), [Id('_v0')]))]), Expr(Call(Member(Id('store'), 'add', ''), '', [Id('_v1')])), Return(Id('_v1'))), async=false gen=false)".to_owned();
+        let cands =
+            whole_fn_helpers(&TsDialect, &[make_user, make_order], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert_eq!(cands.len(), 1, "exactly the factory helper");
+        let c = &cands[0];
+        assert_eq!(c.members, vec![0, 1]);
+        assert_eq!(c.support, 2);
+        assert_eq!(c.granularity, "whole-fn");
+        assert_eq!(
+            c.body,
+            "function _fn(_v0) { const _v1 = new ?(_v0); store.add(_v1); return _v1 }",
+            "body: {}",
+            c.body
+        );
+        assert_eq!(c.params, 1, "the holed constructor is the one param");
+    }
+
+    #[test]
+    fn ts_whole_fn_handles_arrow_const_form() {
+        // The dominant TS form: an arrow bound to a `const`. ts-canon blanks the declarator name to
+        // `_fn`, so two such functions fold cleanly — the `Var`/`Decl`/`Arrow` shape renders as
+        // readable pseudo-source and the blanked name is neither an anchor nor a phantom parameter.
+        let a = "Var('const', [Decl(Bind('_fn'), Arrow(Params(Param(Bind('_v0'))), Block(Var('const', [Decl(Bind('_v1'), Await(Call(Member(Id('db'), 'find', ''), '', [Id('_v0')])))]), Expr(Call(Member(Id('cache'), 'set', ''), '', [Id('_v0'), Id('_v1')])), Return(Id('_v1'))), true, false, false))])".to_owned();
+        let b = a.clone();
+        let cands = whole_fn_helpers(&TsDialect, &[a, b], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert_eq!(cands.len(), 1, "the arrow-const family");
+        let c = &cands[0];
+        assert_eq!(c.granularity, "whole-fn");
+        assert_eq!(
+            c.body,
+            "const _fn = (_v0) => { const _v1 = await db.find(_v0); cache.set(_v0, _v1); return _v1 }",
+            "body: {}",
+            c.body
+        );
+        assert_eq!(c.params, 0, "the blanked name must not be a phantom param");
+    }
+
+    #[test]
+    fn ts_subblock_mines_embedded_fetch_motif() {
+        // A `const r = await db.query(x, "…"); return r.rows` idiom embedded in two otherwise-different
+        // functions (distinct leading noise). Mined by support=2; the shared method (`query`) and
+        // member (`rows`) stay verbatim, the divergent string argument is holed into the one param.
+        let fa = "Func('_fn', Params(Param(Bind('_v0'))), Block(Expr(Call(Id('log'), '', [Str('a')])), Var('const', [Decl(Bind('_v1'), Await(Call(Member(Id('db'), 'query', ''), '', [Id('_v0'), Str('users')])))]), Return(Member(Id('_v1'), 'rows', ''))), async=true gen=false)".to_owned();
+        let fb = "Func('_fn', Params(Param(Bind('_v0'))), Block(Expr(Assign('Addition', Id('count'), Num(1))), Var('const', [Decl(Bind('_v1'), Await(Call(Member(Id('db'), 'query', ''), '', [Id('_v0'), Str('orders')])))]), Return(Member(Id('_v1'), 'rows', ''))), async=true gen=false)".to_owned();
+        let cands = subblock_helpers(&TsDialect, &[fa, fb], 2, &ExtractCfg::default());
+        assert_eq!(cands.len(), 1, "exactly the fetch-one motif");
+        let c = &cands[0];
+        assert_eq!(c.granularity, "sub-block");
+        assert_eq!(c.support, 2);
+        assert_eq!(c.members, vec![0, 1]);
+        assert_eq!(
+            c.body,
+            "const _v1 = await db.query(_v0, \"?\"); return _v1.rows",
+            "body: {}",
+            c.body
+        );
+        assert_eq!(c.params, 1, "the holed string argument is the one param");
+    }
+
+    #[test]
+    fn ts_varying_member_name_is_selector_not_extractable() {
+        // Same shape but the *member* differs (`.save` vs `.delete`) — a varying member name needs
+        // reflection (`obj[?]`), so it's a selector hole and disqualifies the helper.
+        let fa = "Func('_fn', Params(Param(Bind('_v0'))), Block(Expr(Call(Member(Id('repo'), 'save', ''), '', [Id('_v0')])), Return(Id('_v0'))), async=false gen=false)".to_owned();
+        let fb = "Func('_fn', Params(Param(Bind('_v0'))), Block(Expr(Call(Member(Id('repo'), 'delete', ''), '', [Id('_v0')])), Return(Id('_v0'))), async=false gen=false)".to_owned();
+        let cands =
+            whole_fn_helpers(&TsDialect, &[fa, fb], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert!(cands.is_empty(), "a varying member name must not extract, got: {cands:?}");
     }
 }

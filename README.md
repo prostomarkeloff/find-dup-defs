@@ -91,7 +91,7 @@ Three passes find *duplicated definitions* and grade them by severity:
 Each cluster is graded **ERROR / WARNING / INFO** by its *Thickness* (see below) and is a directive
 target you can suppress / de-escalate / annotate.
 
-### 2 · Patternology — collapsible duplication (opt-in, `--patternology`)
+### 2 · Patternology — collapsible duplication (opt-in, `--patternology` · Python · TypeScript · Rust)
 
 The passes above find duplicate *functions*. Patternology finds the **recurring structure that should
 become one helper** — and surfaces a motif *only if* it actually collapses into a clean,
@@ -116,7 +116,7 @@ line; wrapped here). A Python run renders `def …:` pseudo-source the same way.
 | Frontend | Parser | Duplicate passes | Patternology |
 |---|---|:---:|:---:|
 | **Python** (`.py`) | Ruff (PEP 695 / 701) | ✅ | ✅ |
-| **TypeScript** (`.ts` `.tsx` `.mts` `.cts`) | oxc (TS 5.x / JSX / decorators) | ✅ | — *(no dialect yet)* |
+| **TypeScript** (`.ts` `.tsx` `.mts` `.cts`) | oxc (TS 5.x / JSX / decorators) | ✅ | ✅ |
 | **Rust** (`.rs`) | syn (full item grammar) | ✅ | ✅ |
 
 `--only py,ts,rs` scopes a run to specific frontends. Each is a single parse per file; method
@@ -233,9 +233,9 @@ Two granularities:
 
 **Language-agnostic engine.** The mechanism lives behind a `Dialect` trait; adding a language is a
 trait impl (slot classification + a pseudo-source renderer), the engine core is untouched. Ships with
-`PyDialect` (CPython `ast.dump`) and `RustDialect` (`rs-canon`). A run **partitions defs by language**
-and folds each group with its own dialect — Python and Rust functions never anti-unify against each
-other.
+`PyDialect` (CPython `ast.dump`), `RustDialect` (`rs-canon`) and `TsDialect` (`ts-canon`). A run
+**partitions defs by language** and folds each group with its own dialect — Python, TypeScript and
+Rust functions never anti-unify against each other.
 
 Each finding carries the proposed helper body (rendered as readable pseudo-source), its parameter
 count, an estimated LOC saved, and a **stable signature key** (holes `?`, atoms verbatim): the same
@@ -381,7 +381,7 @@ SIMILARITY
   -e, --error-threshold <F> Name-gated ERROR floor   (default 0.85)
   --type3-theta <F>         Type-3 cosine floor       (default 0.7)
 
-PATTERNOLOGY (opt-in · Python + Rust · advisory, never ERROR)
+PATTERNOLOGY (opt-in · Python + TypeScript + Rust · advisory, never ERROR)
   --patternology            Surface collapsible-duplication helper candidates
   --pattern-theta <F>       Whole-fn structural cosine floor (default 0.85)
   --pattern-support <N>     Sub-block idiom support floor     (default 3)
@@ -408,10 +408,13 @@ MODES
 
 ## Limitations
 
-- **Python / TypeScript / Rust** today; patternology covers **Python + Rust** (a TS dialect is a
-  follow-up). New languages are a `<lang>-canon` sibling — PRs welcome.
+- **Python / TypeScript / Rust** today; patternology covers **all three**. New languages are a
+  `<lang>-canon` sibling — PRs welcome.
 - Rust patternology is **initial**: `rs-canon` splices statement bodies as node children rather than
   lists, so long-body alignment is prefix-only, and macro internals are opaque.
+- TypeScript patternology surfaces top-level `function` declarations and arrow / function-expression
+  `const`s; class **methods** don't participate (their slice doesn't re-parse as a standalone
+  function, so they carry no patternology canonical — they're still covered by the duplicate passes).
 - **Type-4** (semantic equivalence, different syntax → same logic) — out of scope.
 - **Token-level** sub-expression duplication — out of scope; pair with jscpd / PMD CPD if you need it.
 - Calibration is heuristic — the thickness formula constants were tuned on the benchmark corpora above;

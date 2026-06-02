@@ -514,12 +514,13 @@ pub fn pass_patternology(defs: &[Def], theta: f64, support_min: usize, gpu: GpuM
     // Patternology's helper-extractor is dialect-specific (the slot tables + pseudo-source renderer
     // are shaped per frontend). Partition the fn-like defs by `CanonDialect`, route each to its
     // `Dialect` impl, and run the engine once per group — never anti-unifying across languages. A
-    // dialect the engine has no impl for (`Other`, e.g. TypeScript today) is skipped rather than
-    // mis-walked.
+    // dialect the engine has no impl for is skipped rather than mis-walked.
     let py = patternology::PyDialect;
     let rs = patternology::RustDialect;
+    let ts = patternology::TsDialect;
     let (mut py_canons, mut py_def_of): (Vec<String>, Vec<usize>) = (Vec::new(), Vec::new());
     let (mut rs_canons, mut rs_def_of): (Vec<String>, Vec<usize>) = (Vec::new(), Vec::new());
+    let (mut ts_canons, mut ts_def_of): (Vec<String>, Vec<usize>) = (Vec::new(), Vec::new());
     for (i, d) in defs.iter().enumerate() {
         if !d.kind.fn_like {
             continue;
@@ -528,7 +529,10 @@ pub fn pass_patternology(defs: &[Def], theta: f64, support_min: usize, gpu: GpuM
         let (canons, def_of) = match a.canon_dialect {
             CanonDialect::CPythonAst => (&mut py_canons, &mut py_def_of),
             CanonDialect::Rust => (&mut rs_canons, &mut rs_def_of),
-            _ => continue, // `Other` (TS) and any future dialect without an engine impl
+            CanonDialect::Other => (&mut ts_canons, &mut ts_def_of), // the TypeScript frontend
+            // `CanonDialect` is `#[non_exhaustive]`: a future dialect without an engine impl is
+            // skipped rather than mis-walked.
+            _ => continue,
         };
         if patternology::node_type_seq(&a.xname_canonical).len() >= patternology::MIN_SKELETON_NODES {
             canons.push(a.xname_canonical.clone());
@@ -581,9 +585,10 @@ pub fn pass_patternology(defs: &[Def], theta: f64, support_min: usize, gpu: GpuM
 
     // Run the engine once per dialect group and merge. The whole-vs-sub subset filter is per group
     // (cluster indices are group-local), applied before mapping through that group's `def_of`.
-    let groups: [PatGroup; 2] = [
+    let groups: [PatGroup; 3] = [
         (&py, "py", &py_canons, &py_def_of),
         (&rs, "rs", &rs_canons, &rs_def_of),
+        (&ts, "ts", &ts_canons, &ts_def_of),
     ];
     let mut findings: Vec<Finding> = Vec::new();
     for (dialect, tag, canons, def_of) in groups {

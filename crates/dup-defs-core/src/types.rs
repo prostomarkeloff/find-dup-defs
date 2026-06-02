@@ -47,8 +47,9 @@ pub enum CanonDialect {
     /// The Rust frontend's `syn`-derived structural dump (`Func`/`Block`/`Let`/`Method`/… tags) —
     /// the patternology engine has a `RustDialect` for it.
     Rust,
-    /// Some other structural canonical (e.g. the TypeScript frontend) — opaque to passes that need a
-    /// specific dialect.
+    /// The TypeScript frontend's `oxc`-derived structural dump (`Func`/`Block`/`Var`/`Call`/… tags)
+    /// — the patternology engine has a `TsDialect` for it. (Also the catch-all for any future
+    /// frontend whose canonical the dialect-specific passes don't yet recognize.)
     Other,
 }
 

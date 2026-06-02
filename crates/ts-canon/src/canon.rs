@@ -363,13 +363,19 @@ struct Dump<'a> {
     /// In xname mode, blank the *top* def's own name to `_fn` exactly once. Nested defs keep
     /// their renamed names (they're regular bound locals).
     blanked: bool,
+    /// In xname mode, the top *binding* name to blank to `_fn` on its first occurrence — the
+    /// arrow / function-expression `const`/`let` form (`const foo = () => …`), whose name rides on
+    /// the declarator rather than on a `Func`/`Class` node. `function foo` / `class Foo` are blanked
+    /// inside [`Dump::function`] / [`Dump::class`] via `is_top` instead, so this stays `None` for
+    /// them. Makes two differently-named arrow-consts alpha-equal, exactly like named functions.
+    blank: Option<String>,
     /// Count of node-emit calls — used as the cross-name pass's "substance" gate.
     count: usize,
 }
 
 impl<'a> Dump<'a> {
     fn new(locals: Option<&'a HashSet<String>>) -> Self {
-        Self { locals, map: HashMap::new(), blanked: false, count: 0 }
+        Self { locals, map: HashMap::new(), blanked: false, blank: None, count: 0 }
     }
 
     fn rename(&mut self, name: &str) -> String {
@@ -797,6 +803,16 @@ impl<'a> Dump<'a> {
     fn binding(&mut self, pat: &BindingPattern<'_>) -> String {
         match pat {
             BindingPattern::BindingIdentifier(id) => {
+                // Arrow / fn-expr `const`: blank the top declarator name to `_fn` once (the named
+                // `function`/`class` path does this via `is_top`), so two differently-named
+                // arrow-consts alpha-equate.
+                if self.locals.is_some()
+                    && !self.blanked
+                    && self.blank.as_deref() == Some(id.name.as_str())
+                {
+                    self.blanked = true;
+                    return self.node("Bind", &[Self::lit_str("_fn")]);
+                }
                 let n = self.rename(id.name.as_str());
                 self.node("Bind", &[Self::lit_str(&n)])
             }
@@ -1363,8 +1379,19 @@ fn analyze_one(text: &str) -> Option<AnalyzedFn> {
     let locals = collect.bound;
 
     // Single Dump over the same stmt with rename mode on — produces xname canonical, lines, and
-    // the node count from one walk.
+    // the node count from one walk. For the arrow / fn-expr `const` form the def name rides on the
+    // top declarator (not a `Func` node), so name it for the `_fn` blank; `func.is_some()` is the
+    // named-`function` path, already blanked via `is_top`.
     let mut xd = Dump::new(Some(&locals));
+    if func.is_none() {
+        if let Statement::VariableDeclaration(v) = stmt {
+            if let Some(BindingPattern::BindingIdentifier(id)) =
+                v.declarations.first().map(|d| &d.id)
+            {
+                xd.blank = Some(id.name.to_string());
+            }
+        }
+    }
     let xname = cluster_stmt(&mut xd, stmt);
     let size = xd.count;
 
@@ -1437,6 +1464,18 @@ mod tests {
         let a = ast_canonical(plain);
         let b = ast_canonical(exported);
         assert_eq!(a, b, "export-default wrapper should be transparent\n  plain: {a}\n  exported: {b}");
+    }
+
+    #[test]
+    fn arrow_const_name_is_blanked_so_renamed_copies_alpha_equate() {
+        // The def name rides on the declarator (not a `Func` node); xname must blank it to `_fn` —
+        // like a named `function` — so two differently-named arrow-consts with the same body match.
+        let a = "const loadUser = (id: string) => { return db.find(id); };";
+        let b = "const fetchOrder = (key: string) => { return db.find(key); };";
+        let aa = analyze_one(a).expect("a parses");
+        let bb = analyze_one(b).expect("b parses");
+        assert!(aa.1.contains("Bind('_fn')"), "top name should blank to _fn, got: {}", aa.1);
+        assert_eq!(aa.1, bb.1, "renamed arrow-consts should alpha-equate\n  a: {}\n  b: {}", aa.1, bb.1);
     }
 
     #[test]
