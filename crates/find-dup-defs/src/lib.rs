@@ -528,7 +528,7 @@ pub fn pass_patternology(defs: &[Def], theta: f64, support_min: usize, gpu: GpuM
         let (canons, def_of) = match a.canon_dialect {
             CanonDialect::CPythonAst => (&mut py_canons, &mut py_def_of),
             CanonDialect::Rust => (&mut rs_canons, &mut rs_def_of),
-            CanonDialect::Other => continue,
+            _ => continue, // `Other` (TS) and any future dialect without an engine impl
         };
         if patternology::node_type_seq(&a.xname_canonical).len() >= patternology::MIN_SKELETON_NODES {
             canons.push(a.xname_canonical.clone());

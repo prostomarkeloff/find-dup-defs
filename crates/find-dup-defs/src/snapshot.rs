@@ -45,7 +45,7 @@ fn dialect_tag(d: CanonDialect) -> &'static str {
     match d {
         CanonDialect::CPythonAst => "cpython_ast",
         CanonDialect::Rust => "rust",
-        CanonDialect::Other => "",
+        _ => "", // `Other` and any future not-yet-serialized dialect
     }
 }
 

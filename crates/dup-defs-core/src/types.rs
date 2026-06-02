@@ -37,6 +37,9 @@ pub struct KindSpec {
 /// it. Dialect-specific engine passes (the patternology helper-extractor walks `CPython` `ast.dump`
 /// field order) read this to skip canon they cannot soundly analyze, rather than silently
 /// mis-walking a foreign tree. The engine matches on the *capability*, not a language name.
+/// New dialects are added as the engine grows language support, so downstream `match`es must carry a
+/// wildcard arm — adding a variant is not a breaking change.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CanonDialect {
     /// `CPython` `ast.dump(annotate_fields=False)` tree shape (the Python frontend).
