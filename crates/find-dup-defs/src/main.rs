@@ -223,7 +223,7 @@ mod directive_helper_tests {
     #[test]
     fn apply_setting_sets_pattern_min_thickness() {
         let mut opts = PipelineOpts::with_paths(vec![]);
-        assert_eq!(opts.pattern_min_thickness, 0.0); // default: nothing dropped
+        assert!(opts.pattern_min_thickness.abs() < 1e-9); // default: nothing dropped
         super::apply_setting(&mut opts, "pattern-min-thickness", "0.55");
         assert!((opts.pattern_min_thickness - 0.55).abs() < 1e-9);
     }
