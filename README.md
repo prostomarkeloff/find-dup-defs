@@ -342,18 +342,18 @@ Six crates, layered so the engine never depends on a frontend and the contract c
               dup-defs-core            ← the contract: Def / KindSpec / Analysis / CanonDialect /
                   ▲                       the Frontend trait / LineMap.  No deps.
         ┌─────────┴─────────┐
-   canon-core          find-dup-defs   ← canon-core: shared frontend helpers (alpha-rename, the
+   find-dup-defs-canon         find-dup-defs   ← find-dup-defs-canon: shared frontend helpers (alpha-rename, the
         ▲                  (engine+CLI)   KindSpec vocabulary, count_loc, AnalyzedFn).
    ┌────┼────┐               │           find-dup-defs: the 3 passes + patternology + severity +
  py-   rs-   ts-canon ───────┘           directives + calibration + reports.
- canon canon            (engine depends on the contract + each frontend, NOT on canon-core)
+ canon canon            (engine depends on the contract + each frontend, NOT on find-dup-defs-canon)
 ```
 
 | crate | role |
 |---|---|
 | [`find-dup-defs`](crates/find-dup-defs) | engine + CLI; frontend-agnostic, clusters a `Vec<Def>` and never names a language |
 | [`dup-defs-core`](crates/dup-defs-core) | the engine↔frontend **contract** (`Def` / `KindSpec` / `Analysis` / `Frontend` / `LineMap`) |
-| [`canon-core`](crates/canon-core) | **shared frontend helpers** between the contract and the frontends — no duplication across the three |
+| [`find-dup-defs-canon`](crates/find-dup-defs-canon) | **shared frontend helpers** between the contract and the frontends — no duplication across the three |
 | [`py-canon`](crates/py-canon) · [`ts-canon`](crates/ts-canon) · [`rs-canon`](crates/rs-canon) | the Python / TypeScript / Rust frontends (Ruff · oxc · syn) |
 
 Adding a language = one more `<lang>-canon` frontend implementing `Frontend` (and, for patternology, a

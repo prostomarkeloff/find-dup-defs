@@ -30,7 +30,7 @@ use crate::canon::{
     analyze_impl_fn, analyze_item_fn, analyze_trait_fn, enum_canon, struct_canon, trait_canon,
     union_canon, AnalyzedFn,
 };
-use canon_core::{count_loc, is_upper_snake};
+use find_dup_defs_canon::{count_loc, is_upper_snake};
 
 use crate::frontend::{CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
 

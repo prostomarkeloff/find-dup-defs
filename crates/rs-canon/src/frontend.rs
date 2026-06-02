@@ -13,9 +13,9 @@ use rayon::prelude::*;
 
 use crate::defs::scan_source;
 
-// The `KindSpec` vocabulary is shared across frontends — re-exported from `canon-core` so callers
+// The `KindSpec` vocabulary is shared across frontends — re-exported from `find-dup-defs-canon` so callers
 // (`crate::frontend::METHODS`, …) are unchanged. Rust supports all six kinds (`interfaces` = `trait`).
-pub use canon_core::kinds::{CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
+pub use find_dup_defs_canon::kinds::{CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
 
 static KINDS: &[&KindSpec] = &[&FUNCTIONS, &METHODS, &CLASSES, &INTERFACES, &CONSTANTS, &TYPE_ALIASES];
 

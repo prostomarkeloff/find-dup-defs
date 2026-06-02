@@ -32,7 +32,7 @@ use syn::{
 
 /// `(cluster_canonical, xname_canonical, type3_lines, node_count)` — the analysis tuple the scan
 /// reads to build a callable `Def`'s cluster canonical + `Analysis`.
-pub use canon_core::AnalyzedFn;
+pub use find_dup_defs_canon::AnalyzedFn;
 
 // ───────────────────────────── bound-locals collector ─────────────────────────────
 
@@ -200,7 +200,7 @@ impl<'a> Dump<'a> {
     }
 
     fn rename(&mut self, name: &str) -> String {
-        canon_core::alpha_rename(&mut self.map, self.locals, name)
+        find_dup_defs_canon::alpha_rename(&mut self.map, self.locals, name)
     }
 
     fn node(&mut self, tag: &str, fields: &[String]) -> String {

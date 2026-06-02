@@ -44,7 +44,7 @@ use std::fmt::Write as _;
 /// `(cluster_canonical, xname_canonical, type3_lines, node_count)` — the analysis tuple the scan
 /// reads to build a `Def`'s cluster canonical + `Analysis`. `ts-canon`'s own type (was shared via
 /// `dup-defs-core`, now local since the engine consumes `Def`, not this tuple).
-pub use canon_core::AnalyzedFn;
+pub use find_dup_defs_canon::AnalyzedFn;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     self, ArrayExpressionElement, Argument, AssignmentTarget, AssignmentTargetMaybeDefault,
@@ -373,7 +373,7 @@ impl<'a> Dump<'a> {
     }
 
     fn rename(&mut self, name: &str) -> String {
-        canon_core::alpha_rename(&mut self.map, self.locals, name)
+        find_dup_defs_canon::alpha_rename(&mut self.map, self.locals, name)
     }
 
     /// Emit one node as `Tag(field1, field2, …)`. Empty trailing fields are NOT trimmed (so

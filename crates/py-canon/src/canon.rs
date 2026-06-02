@@ -16,7 +16,7 @@ use std::fmt::Write as _;
 /// `(cluster_canonical, xname_canonical, type3_lines, node_count)` — the analysis tuple the scan
 /// reads to build a `Def`'s cluster canonical + `Analysis`. `py-canon`'s own type (was shared via
 /// `dup-defs-core`, now local since the engine consumes `Def`, not this tuple).
-pub use canon_core::AnalyzedFn;
+pub use find_dup_defs_canon::AnalyzedFn;
 use rayon::prelude::*;
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{
@@ -301,7 +301,7 @@ impl<'a> Dump<'a> {
 
     /// In cross-name mode, rewrite a bound local to its positional `_v{n}` placeholder.
     fn rename_id(&mut self, id: &str) -> String {
-        canon_core::alpha_rename(&mut self.map, self.locals, id)
+        find_dup_defs_canon::alpha_rename(&mut self.map, self.locals, id)
     }
 
     /// Emit one AST node `name(field, …)` applying the `show_empty=False` + keyword-switch rule.
@@ -1245,7 +1245,7 @@ struct Unparse<'a> {
 
 impl Unparse<'_> {
     fn rename_id(&mut self, id: &str) -> String {
-        canon_core::alpha_rename(&mut self.map, self.locals, id)
+        find_dup_defs_canon::alpha_rename(&mut self.map, self.locals, id)
     }
 
     /// Start a new logical line (CPython `fill`): a newline unless we're at the start.

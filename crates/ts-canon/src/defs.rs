@@ -34,7 +34,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use canon_core::{count_loc, is_upper_snake};
+use find_dup_defs_canon::{count_loc, is_upper_snake};
 use dup_defs_core::{Analysis, CanonDialect, Def, KindSpec, LineMap};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{

@@ -1,5 +1,5 @@
 [package]
-name = "canon-core"
+name = "find-dup-defs-canon"
 version = "0.1.0"
 description = "Shared canonicalization helpers for the find-dup-defs language frontends (py-canon, rs-canon, ts-canon): the KindSpec vocabulary, alpha-rename, and string utils. Sits between the dup-defs-core contract and the frontends."
 keywords = ["ast", "canonicalize", "parsing", "clone", "duplicate"]
@@ -10,10 +10,10 @@ repository.workspace = true
 authors.workspace = true
 
 [lib]
-name = "canon_core"
+name = "find_dup_defs_canon"
 
 [dependencies]
-dup-defs-core = { path = "../dup-defs-core" }
+dup-defs-core = { path = "../dup-defs-core", version = "0.1" }
 
 [lints]
 workspace = true
