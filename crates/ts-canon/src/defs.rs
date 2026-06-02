@@ -34,7 +34,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use dup_defs_core::{Analysis, Def, KindSpec, LineMap};
+use dup_defs_core::{Analysis, CanonDialect, Def, KindSpec, LineMap};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BindingPattern, Class, ClassElement, Declaration, Decorator, ExportDefaultDeclarationKind,
@@ -156,7 +156,7 @@ fn canon_for(kind: &KindSpec, text: &str) -> (Option<String>, Option<Analysis>) 
     if kind.fn_like {
         match analyze_functions(&[text.to_owned()]).into_iter().next().flatten() {
             Some((cc, xname, lines, size)) => {
-                (Some(cc), Some(Analysis { xname_canonical: xname, type3_lines: lines, size }))
+                (Some(cc), Some(Analysis { xname_canonical: xname, type3_lines: lines, size, canon_dialect: CanonDialect::Other }))
             }
             None => (Some(ast_canonical(text)), None),
         }

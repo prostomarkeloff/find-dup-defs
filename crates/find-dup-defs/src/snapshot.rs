@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use dup_defs_core::{Analysis, Def, KindSpec};
+use dup_defs_core::{Analysis, CanonDialect, Def, KindSpec};
 use serde::{Deserialize, Serialize};
 
 use crate::{Finding, Severity};
@@ -31,6 +31,32 @@ struct AnalysisSnap {
     xname_canonical: String,
     type3_lines: Vec<String>,
     size: usize,
+    /// Serialized [`CanonDialect`] (`"cpython_ast"` | `"rust"` | `""`=other). `#[serde(default)]`
+    /// (empty) so a pre-tristate snapshot with no `dialect` falls back to `legacy_cpython_ast` below.
+    #[serde(default)]
+    dialect: String,
+    /// Back-compat: pre-tristate snapshots stored only this bool. Read iff `dialect` is empty.
+    #[serde(default)]
+    cpython_ast: bool,
+}
+
+/// Serialize a [`CanonDialect`] to its snapshot tag.
+fn dialect_tag(d: CanonDialect) -> &'static str {
+    match d {
+        CanonDialect::CPythonAst => "cpython_ast",
+        CanonDialect::Rust => "rust",
+        CanonDialect::Other => "",
+    }
+}
+
+/// Reconstruct a [`CanonDialect`] from a snapshot's `dialect` tag, falling back to the legacy bool.
+fn dialect_from(tag: &str, legacy_cpython_ast: bool) -> CanonDialect {
+    match tag {
+        "cpython_ast" => CanonDialect::CPythonAst,
+        "rust" => CanonDialect::Rust,
+        "" if legacy_cpython_ast => CanonDialect::CPythonAst,
+        _ => CanonDialect::Other,
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -126,6 +152,8 @@ pub fn dump_defs(dir: &Path, defs: &[Def]) -> std::io::Result<()> {
                 xname_canonical: a.xname_canonical.clone(),
                 type3_lines: a.type3_lines.clone(),
                 size: a.size,
+                dialect: dialect_tag(a.canon_dialect).to_owned(),
+                cpython_ast: false,
             }),
         })
         .collect();
@@ -161,6 +189,7 @@ pub fn load_defs(dir: &Path) -> std::io::Result<Vec<Def>> {
                     xname_canonical: a.xname_canonical,
                     type3_lines: a.type3_lines,
                     size: a.size,
+                    canon_dialect: dialect_from(&a.dialect, a.cpython_ast),
                 }),
             }
         })

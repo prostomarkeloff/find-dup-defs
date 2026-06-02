@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use dup_defs_core::{Analysis, Def, KindSpec, LineMap};
+use dup_defs_core::{Analysis, CanonDialect, Def, KindSpec, LineMap};
 use ruff_python_ast::{Expr, Parameters, Stmt};
 use ruff_python_parser::parse_module;
 
@@ -255,7 +255,7 @@ pub(crate) fn classify(source: &str, stmt: &Stmt) -> Option<(&'static str, Strin
 
 /// Tuple → [`Analysis`], shared by the function and method canon paths.
 fn analysis_from(xname: String, lines: Vec<String>, size: usize) -> Analysis {
-    Analysis { xname_canonical: xname, type3_lines: lines, size }
+    Analysis { xname_canonical: xname, type3_lines: lines, size, canon_dialect: CanonDialect::CPythonAst }
 }
 
 /// Canonicalize a **top-level** function/class node (no re-parse). Returns

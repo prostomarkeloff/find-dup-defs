@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use dup_defs_core::{Analysis, Def, KindSpec, LineMap};
+use dup_defs_core::{Analysis, CanonDialect, Def, KindSpec, LineMap};
 use syn::spanned::Spanned;
 use syn::{Attribute, Block, Expr, FnArg, ImplItem, Item, Signature, Stmt, TraitItem, Type};
 
@@ -144,7 +144,7 @@ fn qualify(prefix: &str, name: &str) -> String {
 }
 
 fn analysis_from((cluster, xname, lines, size): AnalyzedFn) -> (String, Analysis) {
-    (cluster, Analysis { xname_canonical: xname, type3_lines: lines, size })
+    (cluster, Analysis { xname_canonical: xname, type3_lines: lines, size, canon_dialect: CanonDialect::Rust })
 }
 
 /// One builder so every push site stays uniform.

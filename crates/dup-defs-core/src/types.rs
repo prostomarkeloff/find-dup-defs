@@ -33,6 +33,22 @@ pub struct KindSpec {
     pub fn_like: bool,
 }
 
+/// The structural *dialect* of an [`Analysis::xname_canonical`] — which frontend's unparser shaped
+/// it. Dialect-specific engine passes (the patternology helper-extractor walks `CPython` `ast.dump`
+/// field order) read this to skip canon they cannot soundly analyze, rather than silently
+/// mis-walking a foreign tree. The engine matches on the *capability*, not a language name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CanonDialect {
+    /// `CPython` `ast.dump(annotate_fields=False)` tree shape (the Python frontend).
+    CPythonAst,
+    /// The Rust frontend's `syn`-derived structural dump (`Func`/`Block`/`Let`/`Method`/… tags) —
+    /// the patternology engine has a `RustDialect` for it.
+    Rust,
+    /// Some other structural canonical (e.g. the TypeScript frontend) — opaque to passes that need a
+    /// specific dialect.
+    Other,
+}
+
 /// Full callable analysis precomputed by the frontend — the cross-name + Type-3 inputs the
 /// engine needs (the cluster canonical lives separately on [`Def::cluster_canonical`]).
 ///
@@ -40,11 +56,13 @@ pub struct KindSpec {
 ///   `_v{n}`, top def name blanked); the cross-name pass buckets on this.
 /// * `type3_lines` — per-statement renamed lines for the Type-3 IDF-cosine pass.
 /// * `size` — node count of the alpha-renamed canonical, the cross-name "substance" gate.
+/// * `canon_dialect` — the [`CanonDialect`] of `xname_canonical`, for dialect-specific passes.
 #[derive(Clone, Debug)]
 pub struct Analysis {
     pub xname_canonical: String,
     pub type3_lines: Vec<String>,
     pub size: usize,
+    pub canon_dialect: CanonDialect,
 }
 
 /// One definition lowered to the engine's feature record. Produced by [`Frontend::scan`] with

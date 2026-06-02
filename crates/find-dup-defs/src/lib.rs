@@ -19,6 +19,8 @@
 //! Each cluster is graded ERROR / WARNING / INFO, with optional thickness-based
 //! demotion/escalation passes the caller can request via [`PipelineOpts`].
 
+pub mod patternology;
+mod simgraph;
 pub mod type3;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use dup_defs_core::{Def, Frontend, KindSpec};
+use dup_defs_core::{CanonDialect, Def, Frontend, KindSpec};
 use rayon::prelude::*;
 use serde::Serialize;
 use walkdir::WalkDir;
@@ -53,6 +55,15 @@ pub const SUBSTANCE_NODES: usize = 20;
 pub const SHINGLE_LINES: usize = 3;
 /// Type-3 cluster's min-cosine ≥ this → ERROR (else WARNING).
 pub const TYPE3_ERROR_THETA: f64 = 0.9;
+/// Patternology family's min structural cosine ≥ this → WARNING (else INFO). Patternology never
+/// reaches ERROR — structural similarity is advisory, not a gate.
+pub const PATTERN_WARNING_THETA: f64 = 0.92;
+/// Section offset for patternology findings. The existing per-pass offsets (name 0 / cross-name 1 /
+/// type-3 2) pack kinds tightly (functions 1/2/3, methods 4/5/6, classes 7, …), leaving no slot for
+/// a 4th pass without colliding with the next kind. Patternology is a new advisory layer, so its
+/// sections are filed as an APPENDIX after every existing section via this large base-relative
+/// offset — no existing index moves, so the legacy report ordering is byte-identical.
+pub const PATTERN_SECTION_OFFSET: usize = 1000;
 
 /// Directory-name blacklist for source discovery — virtualenvs, package
 /// caches, build artefacts, vendored tooling, JS bundler outputs.
@@ -273,6 +284,7 @@ pub fn section_index(f: &Finding) -> usize {
         match f.pass {
             "cross-name" => 1,
             "type-3" => 2,
+            "pattern" => PATTERN_SECTION_OFFSET,
             _ => 0,
         }
     } else {
@@ -483,6 +495,126 @@ pub fn pass_type3(defs: &[Def], theta: f64, gpu: GpuMode) -> Vec<Finding> {
         .collect()
 }
 
+/// Pass 4 — **patternology / helper candidates**: collapsible structural duplication. Re-featurizes
+/// every `fn_like` def's alpha-renamed canonical into AST node-type q-grams (see [`patternology`]),
+/// clusters mutually-similar shapes, and keeps only the families whose anti-unification template is
+/// *extractable into one parameterized helper* — the holes are bindable expression-parameters, not
+/// leaky statement-divergences. Each surviving family is a [`patternology::HelperCandidate`] carrying
+/// the proposed helper body, a stable cross-package signature, and the call sites it would replace.
+/// Advisory only — never ERROR — this surfaces DRY violations to refactor, it is not a gate.
+///
+/// `theta` is the structural cosine floor; `support_min` the minimum distinct functions a sub-block
+/// motif must recur in; `gpu` selects the simjoin backend.
+/// One patternology dialect group: (dialect impl, short tag for timing, that group's canonicals,
+/// group-local cluster index → global `defs` index map).
+type PatGroup<'a> = (&'a dyn patternology::Dialect, &'a str, &'a [String], &'a [usize]);
+
+#[must_use]
+pub fn pass_patternology(defs: &[Def], theta: f64, support_min: usize, gpu: GpuMode) -> Vec<Finding> {
+    // Patternology's helper-extractor is dialect-specific (the slot tables + pseudo-source renderer
+    // are shaped per frontend). Partition the fn-like defs by `CanonDialect`, route each to its
+    // `Dialect` impl, and run the engine once per group — never anti-unifying across languages. A
+    // dialect the engine has no impl for (`Other`, e.g. TypeScript today) is skipped rather than
+    // mis-walked.
+    let py = patternology::PyDialect;
+    let rs = patternology::RustDialect;
+    let (mut py_canons, mut py_def_of): (Vec<String>, Vec<usize>) = (Vec::new(), Vec::new());
+    let (mut rs_canons, mut rs_def_of): (Vec<String>, Vec<usize>) = (Vec::new(), Vec::new());
+    for (i, d) in defs.iter().enumerate() {
+        if !d.kind.fn_like {
+            continue;
+        }
+        let Some(a) = &d.analysis else { continue };
+        let (canons, def_of) = match a.canon_dialect {
+            CanonDialect::CPythonAst => (&mut py_canons, &mut py_def_of),
+            CanonDialect::Rust => (&mut rs_canons, &mut rs_def_of),
+            CanonDialect::Other => continue,
+        };
+        if patternology::node_type_seq(&a.xname_canonical).len() >= patternology::MIN_SKELETON_NODES {
+            canons.push(a.xname_canonical.clone());
+            def_of.push(i);
+        }
+    }
+    let cfg = patternology::ExtractCfg::default();
+
+    // One helper-candidate → one Finding, granularity-aware. Whole-function candidates size the LOC
+    // saved from the members' own length; sub-block candidates from the motif's statement count (the
+    // helper body), since only that slice — not the whole host function — collapses. `def_of` maps a
+    // group-local cluster index back to the global `defs` index.
+    let to_finding = |cand: patternology::HelperCandidate, def_of: &[usize]| {
+        let members: Vec<usize> = cand.members.iter().map(|&c| def_of[c]).collect();
+        let distinct_names: BTreeSet<&str> = members.iter().map(|&i| defs[i].name.as_str()).collect();
+        let kind = callable_kind(defs, &members);
+        let args = members.iter().map(|&i| defs[i].args).max().unwrap_or(0);
+        let sub_block = cand.granularity == "sub-block";
+        // Per-site LOC the collapse removes: a sub-block motif is its statement count (`;`-joined
+        // body); a whole-function helper is the function's length.
+        let per_site = if sub_block {
+            cand.body.matches(';').count() + 1
+        } else {
+            members.iter().map(|&i| defs[i].loc).max().unwrap_or(0)
+        };
+        // A collapse keeps one helper + `support` one-line call sites, removing `support` copies of
+        // `per_site` lines: saved ≈ (support − 1)·per_site. A conservative, readable proxy.
+        let loc_saved = cand.support.saturating_sub(1) * per_site;
+        let notes = vec![
+            format!("{}helper: {} ({} param{})", if sub_block { "sub-block " } else { "" }, cand.body, cand.params, if cand.params == 1 { "" } else { "s" }),
+            format!("collapses {} sites, ~{loc_saved} loc saved", cand.support),
+            format!("sig: {}", cand.signature),
+        ];
+        Finding {
+            pass: "pattern",
+            kind,
+            name: distinct_names.iter().copied().collect::<Vec<_>>().join("/"),
+            // Advisory: structural similarity is FP-noisier, so patternology never escalates to
+            // ERROR. A very tight family is WARNING; the rest is INFO.
+            severity: if cand.min_sim >= PATTERN_WARNING_THETA { Severity::Warning } else { Severity::Info },
+            min_sim: Some(cand.min_sim),
+            loc: per_site,
+            args,
+            thickness: thickness(per_site, args, members.len(), cand.min_sim),
+            snippet: defs[members[0]].text_orig.clone(),
+            notes,
+            members: members.iter().map(|&i| member(defs, i)).collect(),
+        }
+    };
+
+    // Run the engine once per dialect group and merge. The whole-vs-sub subset filter is per group
+    // (cluster indices are group-local), applied before mapping through that group's `def_of`.
+    let groups: [PatGroup; 2] = [
+        (&py, "py", &py_canons, &py_def_of),
+        (&rs, "rs", &rs_canons, &rs_def_of),
+    ];
+    let mut findings: Vec<Finding> = Vec::new();
+    for (dialect, tag, canons, def_of) in groups {
+        if canons.len() < 2 {
+            continue;
+        }
+        if std::env::var_os("FDD_TIMING").is_some() {
+            eprintln!("[timing]   pat:N-{tag:<9} {:>6}", canons.len());
+        }
+        let whole = timed("  pat:whole-fn", || {
+            patternology::whole_fn_helpers(dialect, canons, theta, &cfg, gpu.to_concurrency())
+        });
+        // A sub-block motif whose host functions are all already a whole-function family is redundant
+        // — the whole-function helper subsumes it. Keep only sub-blocks spanning functions the
+        // whole-fn pass did NOT collapse (the embedded-idiom case the sub-block miner exists for).
+        let whole_sets: Vec<BTreeSet<usize>> =
+            whole.iter().map(|c| c.members.iter().copied().collect()).collect();
+        let sub: Vec<_> = timed("  pat:subblock", || {
+            patternology::subblock_helpers(dialect, canons, support_min, &cfg)
+        })
+        .into_iter()
+        .filter(|c| {
+            let s: BTreeSet<usize> = c.members.iter().copied().collect();
+            !whole_sets.iter().any(|w| s.is_subset(w))
+        })
+        .collect();
+        findings.extend(whole.into_iter().chain(sub).map(|c| to_finding(c, def_of)));
+    }
+    findings
+}
+
 // ── Backend selection ──────────────────────────────────────────────────────
 
 /// Backend for the name-gated Ratcliff–Obershelp clustering ([`pass_name_gated`]).
@@ -542,6 +674,21 @@ pub struct PipelineOpts {
     pub error_threshold: f64,
     /// Type-3 cosine detection floor (default `0.7`).
     pub type3_theta: f64,
+    /// Run the patternology pass (structural meta-pattern families). Opt-in (default `false`): it is
+    /// informational/codometry, not part of the duplicate gate.
+    pub patternology: bool,
+    /// Patternology structural-cosine detection floor (default `0.85`). Clique-grouping (not
+    /// single-linkage) means a moderate floor no longer risks a chained mega-blob, so this favors
+    /// recall while the clique requirement keeps each family tight (min-sim ≥ this).
+    pub pattern_theta: f64,
+    /// Minimum distinct functions a **sub-block** motif must recur in to be surfaced (default `3`).
+    /// The codometry support floor — below it a "recurring idiom" is just a coincidence.
+    pub pattern_support: usize,
+    /// Drop patternology candidates whose `thickness` is below this (default `0.0` = off, nothing
+    /// implicit). The directive-driven calibration knob: `--calibrate` proposes a value and the user
+    /// applies it explicitly via `-D settings:pattern-min-thickness=…`. Only patternology (`pass ==
+    /// "pattern"`) findings are affected; the duplicate gate is untouched.
+    pub pattern_min_thickness: f64,
     /// Minimum cluster size (default `2`).
     pub min_size: usize,
     /// De-escalate ERRORs whose `thickness` is below this to WARNING (default
@@ -575,6 +722,10 @@ impl PipelineOpts {
             threshold: 0.5,
             error_threshold: 0.85,
             type3_theta: 0.7,
+            patternology: false,
+            pattern_theta: 0.85,
+            pattern_support: 3,
+            pattern_min_thickness: 0.0,
             min_size: 2,
             error_thickness: 0.0,
             warning_thickness: 0.0,
@@ -657,6 +808,16 @@ pub fn cluster(mut defs: Vec<Def>, opts: &PipelineOpts) -> Vec<Finding> {
     }
     if !opts.no_type3 {
         timed("pass3-type3", || findings.extend(pass_type3(&defs, opts.type3_theta, opts.gpu)));
+    }
+    if opts.patternology {
+        timed("pass4-pattern", || findings.extend(pass_patternology(&defs, opts.pattern_theta, opts.pattern_support, opts.gpu)));
+    }
+
+    // Directive-driven patternology calibration: drop advisory candidates below the explicit
+    // thickness floor (`set:pattern-min-thickness`, proposed by `--calibrate`). Default `0.0` → no-op,
+    // nothing implicit. Touches only `pass == "pattern"`; the duplicate gate is untouched.
+    if opts.pattern_min_thickness > 0.0 {
+        findings.retain(|f| f.pass != "pattern" || f.thickness >= opts.pattern_min_thickness);
     }
 
     if opts.error_thickness > 0.0 {

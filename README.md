@@ -110,6 +110,30 @@ callable yielded as top-level functions **and methods** (`Foo.bar` / `Type::meth
 2. **cross-name** — renamed copy-paste: alpha-renamed canonical bucketed, ≥2 distinct names across ≥2 sites.
 3. **Type-3** (ECScan) — IDF-weighted cosine over name-agnostic lines; catches edited renamed copies the exact pass misses.
 
+### Pass 4 — patternology / helper candidates (opt-in, `--patternology`, Python only)
+
+The three passes above find *duplicated functions*. Patternology finds **collapsible duplication** —
+recurring structure that should become one parameterized helper — and is anchored on exactly that
+test: a motif is surfaced only if its anti-unification template (Plotkin LGG of the instances)
+extracts into a clean helper, i.e. its variation points (`?`) are **bindable expression parameters**,
+not leaky statement-divergences (the language-idiom noise like `if x is None: return None`, which is
+*not* extractable, is dropped). Two granularities:
+
+- **whole-function** — families of functions that share a shape (clustered by AST-skeleton cosine,
+  greedy maximal-clique cover so no single-linkage blob) and collapse into one helper.
+- **sub-block** — recurring *statement-window* idioms **embedded** inside otherwise-different
+  functions, found by **support** (how many functions contain the motif), not pairwise similarity —
+  the case whole-function cosine structurally cannot reach. E.g. a get-or-raise guard shared by three
+  unrelated functions → `_v0 = self.?.get(k); if _v0 is None: raise KeyError(k)` (3 params).
+
+Each finding carries the proposed helper body, its parameter count, an estimated LOC saved, and a
+**stable signature key** (holes `?`, atoms verbatim) — the same idiom in different files/packages
+yields the same key, so an external loop (`for pkg in …: find-dup-defs --patternology --json pkg`)
+plus a glue script that groups on the signature gives ecosystem-wide **codometry**. Advisory only —
+never ERROR. Python-only: the extractor walks CPython `ast.dump` field order (gated on a `CanonDialect`
+capability, so the engine still never names a language). Knobs: `--pattern-theta` (whole-fn cosine
+floor, default 0.85), `--pattern-support` (sub-block support floor, default 3).
+
 ### Smart filters (no false-positives from these patterns)
 
 Trivial / boilerplate bodies are dropped at extraction, so they never form a phantom cluster:
@@ -447,6 +471,11 @@ SIMILARITY (name-gated):
   -t, --threshold <F>        Cluster floor (default 0.5)
   -e, --error-threshold <F>  ERROR floor   (default 0.85)
   --type3-theta <F>          Type-3 cosine threshold (default 0.7)
+
+PATTERNOLOGY (opt-in, Python only):
+  --patternology             Surface collapsible-duplication helper candidates (pass 4)
+  --pattern-theta <F>        Whole-fn structural cosine floor (default 0.85)
+  --pattern-support <N>      Sub-block idiom support floor — distinct funcs (default 3)
 
 FILTERS:
   -D, --directive <S>        ACTION:[<KIND>]NAME[@PATH][=NOTE], repeatable. ACTION ∈ suppress

@@ -96,6 +96,22 @@ struct Cli {
     /// Skip the Type-3 (renamed near-copy) pass.
     #[arg(long)]
     no_type3: bool,
+    /// Run the patternology pass: **helper candidates** — collapsible structural duplication (Python
+    /// only). Whole-function families *and* recurring sub-block idioms whose anti-unification template
+    /// extracts into one parameterized helper; each finding carries the proposed helper body, its
+    /// param count, an estimated LOC saved, and a stable cross-package signature. Off by default:
+    /// advisory / codometry, never an ERROR gate.
+    #[arg(long)]
+    patternology: bool,
+    /// Patternology structural-cosine detection floor (whole-function family edge when cosine ≥ this).
+    /// Structural similarity is noisier than textual, so the floor sits higher than `--type3-theta`.
+    /// Families are maximal cliques (every pair ≥ this), so a moderate floor is safe — no blob.
+    #[arg(long, default_value_t = 0.85)]
+    pattern_theta: f64,
+    /// Minimum distinct functions a sub-block idiom must recur in to be surfaced (codometry support
+    /// floor). Below this a "recurring idiom" is a coincidence, not an extractable helper.
+    #[arg(long, default_value_t = 3)]
+    pattern_support: usize,
     /// Only report ERROR-severity clusters.
     #[arg(long)]
     errors_only: bool,
@@ -176,6 +192,15 @@ fn apply_setting(opts: &mut PipelineOpts, key: &str, value: &str) {
                 }
             };
         }
+        // Patternology calibration floor: drop advisory candidates below this thickness. `--calibrate`
+        // proposes a value; the user applies it explicitly here. Default (unset) keeps every candidate.
+        "pattern-min-thickness" => {
+            let Ok(t) = value.parse::<f64>() else {
+                eprintln!("find-dup-defs: settings:pattern-min-thickness expects a float, got {value:?}");
+                std::process::exit(2);
+            };
+            opts.pattern_min_thickness = t;
+        }
         other => eprintln!("find-dup-defs: ignoring unknown settings key {other:?}"),
     }
 }
@@ -193,6 +218,14 @@ mod directive_helper_tests {
         // unknown key is ignored (forward-compatible), not fatal.
         super::apply_setting(&mut opts, "future-knob", "x");
         assert_eq!(opts.max_name_group, Some(256));
+    }
+
+    #[test]
+    fn apply_setting_sets_pattern_min_thickness() {
+        let mut opts = PipelineOpts::with_paths(vec![]);
+        assert_eq!(opts.pattern_min_thickness, 0.0); // default: nothing dropped
+        super::apply_setting(&mut opts, "pattern-min-thickness", "0.55");
+        assert!((opts.pattern_min_thickness - 0.55).abs() < 1e-9);
     }
 
     #[test]
@@ -348,6 +381,12 @@ fn main() {
         threshold: cli.threshold,
         error_threshold: cli.error_threshold,
         type3_theta: cli.type3_theta,
+        patternology: cli.patternology,
+        pattern_theta: cli.pattern_theta,
+        pattern_support: cli.pattern_support,
+        // No CLI flag — directive-only (`-D settings:pattern-min-thickness=…`), applied below via
+        // `extract_settings`. Default 0.0 = nothing dropped.
+        pattern_min_thickness: 0.0,
         min_size: cli.min_size,
         error_thickness: cli.error_thickness,
         warning_thickness: cli.warning_thickness,
@@ -1099,6 +1138,29 @@ fn infer_directives(
             affects_info: 0,
         });
     }
+    // Patternology calibration (only when the advisory pass ran). Candidates are thickness-ranked;
+    // the thin tail — 2-site one-liner copy-paste — is the dominant noise. Propose an *explicit*
+    // floor at the p75 of the patternology thickness distribution: nothing is dropped until the user
+    // pastes the directive, and it touches only `pass == "pattern"` (the duplicate gate is untouched).
+    let pat: Vec<&Finding> = findings.iter().filter(|f| f.pass == "pattern").collect();
+    if pat.len() >= 8 {
+        let mut th: Vec<f64> = pat.iter().map(|f| f.thickness).collect();
+        th.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let floor = percentile_sorted(&th, 0.75);
+        let dropped = pat.iter().filter(|f| f.thickness < floor).count();
+        out.push(InferredDirective {
+            directive: format!("settings:pattern-min-thickness={floor:.2}"),
+            rationale: format!(
+                "{} patternology candidate(s); a thickness floor at p75 ({floor:.2}) drops the thin {dropped} (low-mass 2-site copy-paste), keeping the {} fattest refactor targets",
+                pat.len(),
+                pat.len() - dropped
+            ),
+            affects_total: dropped,
+            affects_error: 0,
+            affects_warning: pat.iter().filter(|f| f.thickness < floor && f.severity == Severity::Warning).count(),
+            affects_info: pat.iter().filter(|f| f.thickness < floor && f.severity == Severity::Info).count(),
+        });
+    }
     if let Some(s) = build_suggestion(
         findings,
         |f| {
@@ -1362,9 +1424,11 @@ fn format_calibration(errs: &[&Finding], warns: &[&Finding], all: &[Finding], la
 
 // ───────────────────────── report (identical to the Python reference) ─────────────────────────
 
-/// A group is "cross-name" when found by a name-agnostic pass (renamed copy-paste).
+/// A group is "cross-name" when found by a name-agnostic pass (renamed copy-paste). Patternology
+/// is also name-agnostic (it joins ≥2 distinct names with `/`), so it shares the alias-matching and
+/// JSON `cross` treatment.
 fn is_cross_name(pass: &str) -> bool {
-    pass == "cross-name" || pass == "type-3"
+    pass == "cross-name" || pass == "type-3" || pass == "pattern"
 }
 
 // `section_index` is provided by the library — see `find_dup_defs::section_index`.
@@ -1418,7 +1482,10 @@ fn group_suffix(f: &Finding) -> String {
 /// is the union of the selected frontends' kinds, deduped by `id` and sorted by section index —
 /// so the default run reproduces the historical 10-section layout, while `--only py` prints only
 /// Python's sections (no empty `interfaces`).
-fn report_sections(frontends: &[&dyn Frontend], warn: f64, error: f64) -> Vec<(usize, String)> {
+/// `include_patterns` adds the patternology appendix sections. It's gated on there actually being
+/// pattern findings (the pass is opt-in) so a normal run prints the historical section list
+/// byte-for-byte — the patternology layer is invisible unless `--patternology` produced something.
+fn report_sections(frontends: &[&dyn Frontend], warn: f64, error: f64, include_patterns: bool) -> Vec<(usize, String)> {
     let sim = format!("AST sim warn={warn} error={error}");
     let mut kinds: Vec<&'static KindSpec> = Vec::new();
     for f in frontends {
@@ -1436,6 +1503,12 @@ fn report_sections(frontends: &[&dyn Frontend], warn: f64, error: f64) -> Vec<(u
         if k.fn_like {
             rows.push((base + 1, format!("duplicate {} (cross-name, exact AST-normalized)", k.noun_plural)));
             rows.push((base + 2, format!("duplicate {} (cross-name Type-3, IDF-weighted cosine)", k.noun_plural)));
+            if include_patterns {
+                rows.push((
+                    base + find_dup_defs::PATTERN_SECTION_OFFSET,
+                    format!("helper candidates in {} (patternology — collapsible duplication)", k.noun_plural),
+                ));
+            }
         }
     }
     rows.sort_by_key(|(idx, _)| *idx);
@@ -1444,7 +1517,8 @@ fn report_sections(frontends: &[&dyn Frontend], warn: f64, error: f64) -> Vec<(u
 
 /// Human-readable per-section report — byte-for-byte the Python `format_report`.
 fn format_report(findings: &[&Finding], frontends: &[&dyn Frontend], warn: f64, error: f64, repo_root: &Path) -> String {
-    let sections = report_sections(frontends, warn, error);
+    let include_patterns = findings.iter().any(|f| f.pass == "pattern");
+    let sections = report_sections(frontends, warn, error, include_patterns);
 
     // `short_path` does two `fs::canonicalize` calls per member (realpath → getattrlist/open/stat
     // per path component) — ~90% of render at scale, repeated for every one of ~200k members. Hoist

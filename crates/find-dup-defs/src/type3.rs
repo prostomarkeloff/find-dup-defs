@@ -27,6 +27,8 @@ use difflib_fast::Concurrency;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::simgraph::{components, cosine};
+
 /// Tokenize one line like Python's `re.compile(r"[A-Za-z_]\w*|\d+|\S")` — Unicode-aware, matching
 /// `findall`. An identifier starts on an ASCII `[A-Za-z_]` then greedily takes Python's `\w`
 /// (Unicode word chars: `is_alphanumeric` or `_`); a run of ASCII digits is `\d+`; any other
@@ -73,59 +75,6 @@ fn tokenize(line: &str) -> Vec<&str> {
 fn is_sync_async(a: &str, b: &str) -> bool {
     (a.len() == b.len() + 1 && a.as_bytes().first() == Some(&b'a') && &a[1..] == b)
         || (b.len() == a.len() + 1 && b.as_bytes().first() == Some(&b'a') && &b[1..] == a)
-}
-
-/// Cosine of two sparse line vectors given their precomputed norms: sorted-merge dot of the shared
-/// line ids over `norm_a · norm_b`. Same IDF-cosine metric as the join; used for the per-cluster
-/// `min_sim` (over all intra-cluster pairs, including the sub-θ ones the join doesn't return).
-fn cosine(a: &[(u32, f64)], b: &[(u32, f64)], na: f64, nb: f64) -> f64 {
-    if na == 0.0 || nb == 0.0 {
-        return 0.0;
-    }
-    let (mut i, mut j) = (0usize, 0usize);
-    let mut dot = 0.0f64;
-    while i < a.len() && j < b.len() {
-        match a[i].0.cmp(&b[j].0) {
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
-            std::cmp::Ordering::Equal => {
-                dot += a[i].1 * b[j].1;
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-    dot / (na * nb)
-}
-
-/// Union-find over edge endpoints → connected components.
-fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
-    while parent[x] != x {
-        parent[x] = parent[parent[x]];
-        x = parent[x];
-    }
-    x
-}
-
-fn components(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usize>> {
-    let mut parent: Vec<usize> = (0..n).collect();
-    let mut seen = vec![false; n];
-    for &(x, y) in edges {
-        seen[x] = true;
-        seen[y] = true;
-        let (rx, ry) = (uf_find(&mut parent, x), uf_find(&mut parent, y));
-        if rx != ry {
-            parent[rx] = ry;
-        }
-    }
-    let mut groups: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
-    for (i, &s) in seen.iter().enumerate() {
-        if s {
-            let r = uf_find(&mut parent, i);
-            groups.entry(r).or_default().push(i);
-        }
-    }
-    groups.into_values().collect()
 }
 
 /// Type-3 clusters of renamed near-copies. Input: each function's normalized lines + name. Output:
