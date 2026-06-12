@@ -130,6 +130,27 @@ impl Severity {
 
 // ── Finding ────────────────────────────────────────────────────────────────
 
+/// Structured patternology payload — the machine-readable form of a pattern finding's `notes`
+/// strings (the anti-unification template, its stable cross-package signature, and the collapse
+/// economics). `Some` only for `pass == "pattern"` findings; the textual passes leave it `None`.
+/// Consumers (e.g. a type-aware fusion layer) group by `signature` and read `template` / `support`
+/// without re-parsing the human note strings.
+#[derive(Clone, Debug, Serialize)]
+pub struct PatternInfo {
+    /// Pseudo-source of the proposed parameterized helper (the LGG template body, holes `?`).
+    pub template: String,
+    /// Stable signature key (the LGG tree, holes `?`, atoms verbatim) — the cross-package group-by key.
+    pub signature: String,
+    /// Parameters the helper would take (= expression-holes).
+    pub params: usize,
+    /// `"whole-fn"` | `"sub-block"` — which pass produced it.
+    pub granularity: &'static str,
+    /// Distinct call sites the family spans (the codometry support count).
+    pub support: usize,
+    /// Estimated LOC removed by collapsing the family into the helper.
+    pub loc_saved: usize,
+}
+
 /// One reported cluster of duplicate definitions.
 #[derive(Clone, Debug)]
 pub struct Finding {
@@ -153,6 +174,9 @@ pub struct Finding {
     pub notes: Vec<String>,
     /// `(file, line 1-indexed, col 0-indexed)` for every member of the cluster.
     pub members: Vec<(String, usize, usize)>,
+    /// Structured patternology payload (template + signature + economics); `Some` only for the
+    /// `"pattern"` pass. Mirrors the `notes` strings in machine-readable form.
+    pub pattern: Option<PatternInfo>,
 }
 
 /// A [`Finding`] is a [`directiva`] directive target: its qualifier is the kind id (so a
@@ -355,6 +379,7 @@ pub fn pass_name_gated(
                             snippet: defs[idxs[c[0]]].text_orig.clone(),
                             notes: Vec::new(),
                             members: c.iter().map(|&k| member(defs, idxs[k])).collect(),
+                            pattern: None,
                         }
                     })
                     .collect::<Vec<_>>();
@@ -380,6 +405,7 @@ pub fn pass_name_gated(
                         snippet: defs[idxs[c[0]]].text_orig.clone(),
                         notes: Vec::new(),
                         members: c.iter().map(|&k| member(defs, idxs[k])).collect(),
+                        pattern: None,
                     }
                 })
                 .collect::<Vec<_>>()
@@ -424,6 +450,7 @@ pub fn pass_cross_name(defs: &[Def], min_size: usize) -> Vec<Finding> {
             snippet: defs[ps[0]].text_orig.clone(),
             notes: Vec::new(),
             members: ps.iter().map(|&p| member(defs, p)).collect(),
+            pattern: None,
         });
     }
     out
@@ -490,6 +517,7 @@ pub fn pass_type3(defs: &[Def], theta: f64, gpu: GpuMode) -> Vec<Finding> {
                 snippet: defs[def_of[cluster[0]]].text_orig.clone(),
                 notes: Vec::new(),
                 members: members.iter().map(|&i| member(defs, i)).collect(),
+                pattern: None,
             })
         })
         .collect()
@@ -580,6 +608,14 @@ pub fn pass_patternology(defs: &[Def], theta: f64, support_min: usize, gpu: GpuM
             snippet: defs[members[0]].text_orig.clone(),
             notes,
             members: members.iter().map(|&i| member(defs, i)).collect(),
+            pattern: Some(PatternInfo {
+                template: cand.body.clone(),
+                signature: cand.signature.clone(),
+                params: cand.params,
+                granularity: cand.granularity,
+                support: cand.support,
+                loc_saved,
+            }),
         }
     };
 

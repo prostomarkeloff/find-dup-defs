@@ -255,6 +255,7 @@ pub fn load_findings(dir: &Path) -> std::io::Result<Vec<Finding>> {
             snippet: String::new(),
             notes: s.notes,
             members: s.members,
+            pattern: None,
         })
         .collect();
     Ok(out)
