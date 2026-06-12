@@ -1,60 +1,44 @@
-<div align="center">
-
 # find-dup-defs
-
-**Find the copy-pasted code your linter can't — rank it by how worth refactoring it is — and surface the recurring shapes that should become one helper.**
 
 [![Rust 2021](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![crates.io](https://img.shields.io/crates/v/find-dup-defs.svg)](https://crates.io/crates/find-dup-defs)
 [![exact difflib](https://img.shields.io/badge/similarity-byte--for--byte%20difflib-blue.svg)](https://crates.io/crates/difflib-fast)
 
-A duplicate-definition detector for **Python, TypeScript, and Rust**. It clusters duplicate &
-near-duplicate top-level definitions — functions, **methods**, classes, constants, `type` aliases,
-TS interfaces / Rust traits — by structural AST canonicalization, grades each cluster
-**ERROR / WARNING / INFO** by a normalized *Thickness* score, and **suggests your project's noise
-filters for you**. Opt into **patternology** and it also finds *collapsible* duplication: the
-recurring structure that should become one parameterized helper.
+Your coding agent is stateless, and your codebase doesn't fit in its context window. So when it
+writes a new function, it can't see that you already wrote that helper three modules over — it
+writes the copy. Over a year of AI-assisted commits, duplication stops being an accident and
+becomes the default.
 
-**One engine, three single-parse frontends** (Ruff · oxc · syn). **2–12× faster than PMD CPD / jscpd.**
-
-</div>
-
----
-
-## Why
-
-[GitClear's 2025 report](https://www.gitclear.com/ai_assistant_code_quality_2025_research) (211M LOC):
-**copy-pasted lines grew 8.3% → 12.3%** of all changes 2021→2024, while *refactored* lines **dropped
-from 25% to under 10%** — for the first time, copy/paste exceeded reuse. AI assistants don't know your
-project's `_helper.py`; they emit the copy. `find-dup-defs` is the gate that catches it, and the
-calibration that tells you which copies are actually worth a PR.
-
----
-
-## Install
+find-dup-defs is the gate that catches it. It clusters duplicate and near-duplicate *definitions*
+— functions, methods, classes, constants, `type` aliases, TS interfaces, Rust traits — across
+Python, TypeScript and Rust; grades each cluster by how much a refactor would actually pay off;
+and calibrates its own noise filters to your tree. One parse per file, three frontends (Ruff, oxc,
+syn), and **2–12× faster than PMD CPD and jscpd** while doing more semantic work than either.
 
 ```bash
 cargo install find-dup-defs
-# …or a prebuilt binary from the Releases page.
 ```
 
----
+or grab a prebuilt binary from the Releases page.
 
-## Quickstart
+## Why
 
-```bash
-# 1. Calibrate — histogram of refactor-worthiness + ready-to-paste noise filters
-find-dup-defs ./src --calibrate
+[GitClear's 2025 report](https://www.gitclear.com/ai_assistant_code_quality_2025_research)
+measured 211M changed lines: copy-pasted lines grew from 8.3% to 12.3% of all changes between 2021
+and 2024, while refactored lines fell from 25% to under 10%. For the first time on record,
+copy/paste exceeded reuse.
 
-# 2. Gate CI on the actionable tail only
-find-dup-defs ./src --error-thickness 0.5 -D @find-dup-defs.directives --errors-only
+That isn't a coincidence, it's a mechanism. A human who half-remembers writing something greps for
+it. An agent can't — it holds a few thousand lines of your repo at once, your `_helpers.py` isn't
+among them, and emitting a fresh copy is locally the path of least resistance. Every copy is
+individually reasonable; the aggregate is a codebase that says the same thing five ways. A linter
+won't flag it, because each copy is valid code. You need something that looks *across* files at the
+definitions themselves.
 
-# 3. (opt-in) Surface helper-extraction candidates
-find-dup-defs ./src --patternology
-```
+## How to?
 
-`--calibrate` is the intended first step: it never gates, it just reports.
+Start with calibration. It never gates anything — it reads your tree and reports back:
 
 ```console
 $ find-dup-defs ./src --calibrate
@@ -72,31 +56,140 @@ suggested thresholds (p50/p75/p90):
     affects: 21 total (10 ERROR, 11 WARNING, 0 INFO)
 ```
 
----
+Three things come out: a histogram of how refactor-worthy your duplication is; threshold
+suggestions at the 50th/75th/90th percentile, each with a real code sample at the cut so you see
+what you'd be gating on; and inferred directives — ready-to-paste `-D` strings for the noise it
+found in *your* tree, each with its rationale and blast radius. Twenty-one clusters living entirely
+under `tests/`? It hands you the de-escalation rule for exactly that.
 
-## What it detects
+Then commit the suggestions you agree with and gate CI on the rest:
 
-Two complementary things, from one parse per file:
+```bash
+find-dup-defs ./src --error-thickness 0.5 -D @find-dup-defs.directives --errors-only
+```
 
-### 1 · Duplicate definitions — the gate
+And, opt-in, surface the duplication that should become a helper rather than just being deleted:
 
-Three passes find *duplicated definitions* and grade them by severity:
+```bash
+find-dup-defs ./src --patternology
+```
+
+Nothing is filtered until a directive says so. Calibration suggests; the committed file decides.
+
+## What it finds, and why not just CPD
+
+Three passes, all from the same single parse per file.
 
 | Pass | Catches | How |
 |---|---|---|
-| **name-gated** | same-named copies | same `(kind, name)` defs clustered by exact Ratcliff–Obershelp similarity on the alpha-renamed canonical |
-| **cross-name** | renamed copy-paste | alpha-renamed canonical bucketed; ≥2 distinct names across ≥2 sites |
-| **Type-3** | edited renamed copies | IDF-weighted cosine over name-agnostic lines — catches what the exact pass misses |
+| **name-gated** | same-named copies | defs sharing a `(kind, name)` clustered by exact Ratcliff–Obershelp similarity on the alpha-renamed canonical (via [`difflib-fast`](https://crates.io/crates/difflib-fast)) |
+| **cross-name** | renamed copy-paste | the alpha-renamed canonical bucketed; ≥2 distinct names across ≥2 files |
+| **Type-3** (ECScan) | renamed *and* edited copies | IDF-weighted cosine over name-agnostic lines, as an exact all-pairs cosine join — catches what byte-identity misses |
 
-Each cluster is graded **ERROR / WARNING / INFO** by its *Thickness* (see below) and is a directive
-target you can suppress / de-escalate / annotate.
+The thing token-based clone detectors (jscpd, PMD CPD) structurally can't do is the middle two
+rows. They match token streams; rename the variables or edit a line and the match is gone.
+find-dup-defs clusters on an **alpha-renamed AST canonical** — every bound local rewritten to
+`_v0, _v1, …`, the def's own name blanked to `_fn` — so a function and its renamed-and-edited twin
+collapse to the same shape. The Type-3 pass goes further still: it builds IDF-weighted per-line
+vectors and runs them through [`difflib-fast`'s](https://crates.io/crates/difflib-fast) `simjoin`,
+an exact L2AP weighted-cosine join (every pair with `cos ≥ θ`, no LSH approximation, asserted
+bit-identical to brute force), then single-linkages the survivors.
 
-### 2 · Patternology — collapsible duplication (opt-in, `--patternology` · Python · TypeScript · Rust)
+So the answer to "why not CPD" isn't one feature, it's the stack: we cluster by *meaning* not
+tokens, we **calibrate the noise ourselves**, we **rank by refactor-payoff** instead of dumping a
+flat list — and we do all of that **2–12× faster** than CPD while doing strictly more work per
+finding. ([Performance](#performance) has the numbers.)
 
-The passes above find duplicate *functions*. Patternology finds the **recurring structure that should
-become one helper** — and surfaces a motif *only if* it actually collapses into a clean,
-reflection-free helper (see [Patternology](#patternology) for the mechanism). Advisory only — never an
-ERROR gate; it's a refactor map, not a CI failure.
+Method receivers (`self`, `cls`, `&self`) are stripped, so a method matches the equivalent free
+function. And the shapes that *look* like duplication but aren't never form clusters in the first
+place:
+
+- **Python / TS** — `@overload` / `@abstractmethod` / Protocol stubs (`...` / `pass` / docstring
+  bodies), `raise NotImplementedError`, dispatch overrides that just `return None / False / 0 /
+  self`, and `@property` setter/deleter accessors (suffixed so a getter never matches its setter).
+- **Rust** — one-line `write!` / `writeln!` `Display`/`Debug` impls, `matches!` predicates,
+  `todo!` / `unimplemented!` / `panic!` / `unreachable!` stubs; and `#[cfg(...)]`-gated same-name
+  siblings (`#[cfg(unix)] fn x` + `#[cfg(windows)] fn x`) collapse to one logical item.
+
+Each surviving cluster lands in a tier: ERROR gates CI, WARNING is for review, INFO is hidden
+unless you ask (`--show-info`, or `--json` where it's always present). `--only py,ts,rs` scopes a
+run to specific frontends.
+
+## Thickness
+
+What moves a cluster between tiers is its thickness — a normalized [0, 1] estimate of how much
+deleting the duplication would pay. It's the number you sort by, and it's exactly this:
+
+```
+T = 0.7 · sat(volume, 30) + 0.1 · sat(args, 5) + 0.2 · sim       sat(x, k) = 1 − exp(−x/k)
+volume = (n_members − 1) · loc        # lines a refactor would actually delete
+```
+
+Volume dominates on purpose — a 60-line function copied four times outranks a 3-line one copied
+six, whatever the similarity scores say. Wide signatures and higher similarity nudge it up. Three
+flags move the cut: `--error-thickness` demotes thin ERRORs to WARNING, `--warning-thickness`
+demotes thin WARNINGs to INFO, and `--escalate-thickness` forces anything thick enough up to ERROR
+(applied last, so it overrides the demotions). Each defaults to `0.0` — off — until calibration
+tells you a number. Sort by T and the biggest refactor is on top.
+
+## Calibration & directives
+
+The tool is meant to tune itself once, then be gated by an explicit, committed config — never by
+hidden heuristics.
+
+`--calibrate` prints the thickness histogram, three percentile-anchored threshold suggestions
+(permissive / balanced / strict at p50 / p75 / p90, each with a concrete code sample at the cut),
+and **inferred directives**: ready-to-paste `-D` strings for the noise patterns it found in your
+tree. It only fires a suggestion when the evidence clears a floor:
+
+| Detected pattern | Floor | Suggested directive |
+|---|---|---|
+| clusters entirely in test dirs | ≥3 | `de-escalate:*@*/{test,tests,__tests__,fixtures,integration,e2e}/*` |
+| clusters in `.test.*` / `.spec.*` files | ≥3 | `de-escalate:*@*.{test,spec}.*` |
+| generated code (`*_pb2*`, `*_grpc*`, `*.gen.*`) | ≥3 | `suppress:*@*_pb2*` |
+| schema migrations | ≥3 | `suppress:*@*migrations/*` |
+| `.d.ts` declaration files | ≥3 | `suppress:*@*.d.ts` |
+| i18n / locale / translation dirs | ≥5 | `suppress:*@*/{locale,locales,i18n,translations}/*` |
+| doc / tutorial / example snippets | ≥5 | `de-escalate:*@*/{examples,tutorial,samples}/*` |
+| Storybook stories | ≥5 | `de-escalate:*@*.stories.*` |
+| vendored / fork snapshot roots | ≥30 | `suppress:*@*<prefix>*` (auto-derived, marker-gated) |
+| `(kind,name)` group > 256 members | — | `settings:max-name-group=256` |
+| patternology candidates present | ≥8 | `settings:pattern-min-thickness=<p75>` |
+
+The vendored detector is marker-gated: it only fires on directories carrying a real vendoring
+signal (`/vendor/`, `/third_party/`, `/util/vs/`, `/fixtures/`, …). Same-name files across dirs
+*without* a marker stay visible — that's genuine cross-layer duplication, not vendoring.
+
+The rule language is [`directiva`](https://crates.io/crates/directiva), one rule per line:
+
+```
+ACTION : [<KIND>] NAME [@PATH] [=NOTE]
+```
+
+`suppress` drops a finding, `de-escalate` / `escalate` move it one tier (stepped and clamped),
+`note` annotates without touching severity, and `set` carries pipeline config
+(`set:max-name-group=256`, `set:gpu=on`, `set:pattern-min-thickness=0.5`). The note travels with
+the rule, so the *why* is still there when someone reads the file a year later:
+
+```bash
+-D 'de-escalate:<methods>Plugin.get_*_hook=intentional plugin no-op API'
+-D 'suppress:<functions>spawn@*lib-rt/*=bootstrap copy, cannot import'
+-D 'escalate:<methods>Lock.*@*/storage/*=must share impl before v1.0'
+
+# keep them in a committed file and point CI at it (one per line; # comments; @- reads stdin)
+-D @find-dup-defs.directives
+```
+
+Globs support `{a,b,c}` alternation, so one paste covers a whole convention family.
+
+## Patternology
+
+The passes above answer "are these two definitions the same?". Patternology answers the next
+question: "this shape that recurs across seven functions — should it be one helper?" It's the same
+engine carried one step further — same alpha-renamed canonical forms, same `Finding` / severity /
+directive pipeline — not a separate tool bolted on. It's opt-in (`--patternology`) and advisory:
+WARNING for a tight family, INFO otherwise, **never an ERROR gate**. A refactor map, not a CI
+failure.
 
 ```console
 $ find-dup-defs ./crates --only rs --patternology     # the tool on its own code
@@ -106,199 +199,120 @@ DUPLICATE FUNCTION [WARNING]: analyze_impl_fn/analyze_item_fn  [ast sim 1.00, n=
   #         (1 param); collapses 2 sites, ~3 loc saved
 ```
 
-The proposed body, parameter count, and LOC saved ride along on the finding (the real output is one
-line; wrapped here). A Python run renders `def …:` pseudo-source the same way.
+### The mechanism
 
----
+A family of instances is folded by **Plotkin anti-unification** (least general generalization) into
+a template with holes `?` at the points where the instances diverge. Folding aligns same-tagged
+nodes by their common prefix and lists by longest-common-subsequence, so it's robust to arity
+divergence — `[A, B, C]` against `[A, C]` generalizes to `[A, ?, C]`, not to a single hole. It's
+also async-insensitive: the fold strips the `Async` tag, so an `async def` and its sync twin
+anti-unify cleanly (the botocore ↔ aiobotocore mirror case).
 
-## Languages
+Then the template has to *survive*, and most don't. A candidate is kept only if its holes are
+**bindable expression parameters** — things you could actually pass to a function. The filters,
+with their real defaults:
 
-| Frontend | Parser | Duplicate passes | Patternology |
-|---|---|:---:|:---:|
-| **Python** (`.py`) | Ruff (PEP 695 / 701) | ✅ | ✅ |
-| **TypeScript** (`.ts` `.tsx` `.mts` `.cts`) | oxc (TS 5.x / JSX / decorators) | ✅ | ✅ |
-| **Rust** (`.rs`) | syn (full item grammar) | ✅ | ✅ |
+- **no statement-holes.** A divergence in statement position can't be passed as an argument — you
+  can't hand a function a missing `if`. Rejected.
+- **no selector-holes.** A varying *method or attribute or keyword name* — `obj.?()`, `?=val` —
+  would need `getattr` / `**{name: v}` reflection to parameterize. A helper that needs reflection
+  isn't a helper, so it's rejected rather than surfaced.
+- **a shared-anchor floor** (≥2). The instances must share real identifiers or literals, not just
+  tree shape. This kills pure-structure coincidences like `? = ?; ? = ?` — two assignments that
+  have nothing to do with each other.
+- **a substantial fixed skeleton** (≥6 shared nodes), **a manageable arity** (≤6 expression-holes
+  → parameters), and **a skeleton that dominates the variation** (fixed / (fixed + holes) ≥ 0.5).
 
-`--only py,ts,rs` scopes a run to specific frontends. Each is a single parse per file; method
-receivers (`self` / `cls` / `&self`) are stripped so a method matches an equivalent free function.
+What's left is a motif that genuinely collapses into one clean, reflection-free helper. The
+proposed body is rendered as readable pseudo-source (`def …:` for Python, `fn …` for Rust, the
+matching shape for TS), and the finding carries its parameter count and an estimated LOC saved.
 
-**Built-in noise filtering** at extraction (these never form phantom clusters):
-- *Python / TS* — `@overload` / `@abstractmethod` / Protocol stubs, `raise NotImplementedError`,
-  `return False / None / 0` dispatch overrides, `@property` + setter/deleter.
-- *Rust* — one-line `write!`/`writeln!` `Display`/`Debug` impls, `matches!` predicates, `todo!`/`panic!`
-  stubs; `#[cfg(...)]`-gated same-name siblings collapse to one logical item.
+### Two granularities
 
----
+- **whole-function** — families that share an entire shape, found by structural tf·idf cosine over
+  node-type q-grams and a **greedy maximal-clique cover** (not connected components, which would
+  single-linkage a whole dense neighborhood into one blob).
+- **sub-block** — a recurring statement-window idiom *embedded* inside otherwise-different
+  functions, mined by **support** — how many functions contain it — not pairwise similarity, which
+  is the case whole-function cosine structurally cannot reach. A fetch-one idiom shared across
+  seven unrelated repository methods comes out as
+  `? = await _v0.execute(?); return ?.scalar_one_or_none()` (3 params).
 
-## Severity & Thickness
+### Codometry
 
-```
-ERROR  ←→  WARNING  ←→  INFO
-  gate       review     hidden by default (JSON-only; --show-info to display)
-```
-
-Three knobs move clusters between tiers:
-
-- `--error-thickness X` — ERROR → WARNING when T < X
-- `--warning-thickness X` — WARNING → INFO when T < X
-- `--escalate-thickness X` — anything with T ≥ X is forced to ERROR
-
-**Thickness** is a normalized [0, 1] "get-me-refactored" score — the single number you sort by:
-
-```
-T = 0.7 · sat(volume, 30) + 0.1 · sat(args, 5) + 0.2 · sim       sat(x, k) = 1 − exp(−x/k)
-volume = (n_members − 1) · loc        # lines you'd actually delete (dominant signal)
-```
-
-Wide signatures read as architecturally chunkier; higher-similarity dups score higher. Sort by T →
-biggest refactor wins first.
-
----
-
-## Calibration & directives
-
-`find-dup-defs` is meant to tune itself, then be gated by an explicit, committed config — never by
-hidden heuristics.
-
-### `--calibrate`
-
-Prints a thickness histogram, three percentile-anchored threshold suggestions (`permissive` /
-`balanced` / `strict`, each with a concrete code sample at the cut), and **inferred directives** —
-ready-to-paste `-D` strings for the noise patterns it found in *your* tree:
-
-| Detected pattern | Suggested directive |
-|---|---|
-| ≥3 clusters entirely in test paths | `de-escalate:*@*/{test,tests,__tests__,fixtures,integration,e2e}/*` |
-| ≥3 in `.test.*` / `.spec.*` files | `de-escalate:*@*.{test,spec}.*` |
-| ≥5 in i18n / locale / translation dirs | `suppress:*@*/{locale,locales,i18n,translations}/*` |
-| ≥3 touching `*_pb2*` / `*_grpc*` | `suppress:*@*_pb2*` |
-| ≥3 under `*/migrations/*` | `suppress:*@*migrations/*` |
-| ≥5 in `.d.ts` / `*.stories.*` | `suppress:*@*.d.ts` · `de-escalate:*@*.stories.*` |
-| vendored snapshot roots (`/util/vs/`, `/vendor/`, …) | `suppress:*@*<prefix>*` (auto-derived, marker-gated) |
-| `(kind,name)` group > 256 members (entry-point names) | `settings:max-name-group=256` |
-| **patternology candidates present** | **`settings:pattern-min-thickness=<p75>`** — drops the thin 2-site tail |
-
-Globs support `{a,b,c}` alternation, so one paste covers a whole convention family. The vendored
-detector is marker-gated — same-name files across dirs *without* a recognized vendored marker are
-treated as real cross-layer duplication, not auto-suppressed.
-
-### Directive language ([`directiva`](https://crates.io/crates/directiva))
-
-```
-ACTION : [<KIND>] NAME [@PATH] [=NOTE]
-```
-
-| Action | Effect |
-|---|---|
-| `suppress` | drop the finding entirely |
-| `de-escalate` / `escalate` | one tier down / up |
-| `note` | annotate, no severity change |
-| `set` | pipeline config (`set:max-name-group=256`, `set:gpu=on`, `set:pattern-min-thickness=0.5`) |
+Every candidate carries a **stable signature key**: the fixed skeleton with holes as `?` and atoms
+verbatim, rendered deterministically. The same idiom in different files — or different *packages* —
+produces the same key. So an external loop turns patternology into a measurement instrument:
 
 ```bash
-# Intentional, per-repo:
--D 'de-escalate:<methods>Plugin.get_*_hook=intentional plugin no-op API'
--D 'suppress:<functions>spawn@*lib-rt/*=bootstrap copy, cannot import'
--D 'escalate:<methods>Lock.*@*/storage/*=must share impl before v1.0'
-
-# Keep them in a committed file and point CI at it (one per line; `#` comments; `@-` reads stdin):
--D @find-dup-defs.directives
+for pkg in $(ls ~/.cargo/registry/src/*/); do
+  find-dup-defs "$pkg" --patternology --json
+done | jq -s 'map(.groups[] | select(.pattern)) | group_by(.pattern.signature)'
 ```
 
-Nothing is filtered until you paste a directive — calibration *suggests*, you *decide*.
+Group by signature across an ecosystem and you get **codometry** — which idioms recur where, at
+what support, weighted by the LOC each collapse would save. Nobody else can produce that number,
+because nobody else carries a cross-package-stable structural key on each finding.
 
----
+The dialect seam is a `Dialect` trait — slot classification plus a pseudo-source renderer — with
+`PyDialect`, `RustDialect` and `TsDialect` behind it. A run partitions defs by language and folds
+each group with its own dialect; Python, TypeScript and Rust functions never anti-unify against
+each other.
 
-## Patternology
-
-> Opt-in via `--patternology`. Advisory: WARNING for a tight family, INFO otherwise — **never ERROR.**
-
-A duplicate-function pass asks "are these two functions the same?". Patternology asks "does this
-recurring *shape* collapse into one parameterized helper?" — and surfaces a motif only when the answer
-is yes. It folds the instances by **Plotkin anti-unification** (least general generalization, made
-robust to arity divergence) into a template with holes `?` at the variation points, then keeps it only
-if the holes are **bindable expression parameters** — not leaky statement divergences and not
-name-identity *selectors* (a varying method/kwarg name would need reflection, so `obj.?()` is rejected,
-not surfaced as a "helper"). Pure-structure coincidences (`? = ?; ? = ?`) are dropped by a
-shared-anchor floor.
-
-Two granularities:
-
-- **whole-function** — families that share a shape, clustered by structural tf·idf cosine with a
-  **greedy maximal-clique cover** (no single-linkage blob), collapsed into one helper.
-- **sub-block** — a recurring *statement-window* idiom **embedded** inside otherwise-different
-  functions, found by **support** (how many functions contain it), not pairwise similarity — the case
-  whole-function cosine structurally cannot reach. E.g. a fetch-one idiom shared by seven unrelated
-  repository methods → `? = await _v0.execute(?); return ?.scalar_one_or_none()` (3 params).
-
-**Language-agnostic engine.** The mechanism lives behind a `Dialect` trait; adding a language is a
-trait impl (slot classification + a pseudo-source renderer), the engine core is untouched. Ships with
-`PyDialect` (CPython `ast.dump`), `RustDialect` (`rs-canon`) and `TsDialect` (`ts-canon`). A run
-**partitions defs by language** and folds each group with its own dialect — Python, TypeScript and
-Rust functions never anti-unify against each other.
-
-Each finding carries the proposed helper body (rendered as readable pseudo-source), its parameter
-count, an estimated LOC saved, and a **stable signature key** (holes `?`, atoms verbatim): the same
-idiom in different files/packages yields the same key, so an external loop
-(`for pkg in …: find-dup-defs --patternology --json pkg`) + a glue script grouping on the signature
-gives ecosystem-wide **codometry**.
-
-Knobs: `--pattern-theta` (whole-fn cosine floor, default 0.85), `--pattern-support` (sub-block support
-floor, default 3), and `-D settings:pattern-min-thickness=<F>` (drop candidates below a thickness floor
-— calibrated by `--calibrate`).
-
----
+Knobs: `--pattern-theta` (whole-fn cosine floor, default 0.85), `--pattern-support` (sub-block
+support floor, default 3), and `-D settings:pattern-min-thickness=<F>` to drop the thin two-site
+tail (`--calibrate` suggests the value).
 
 ## Performance
 
-`hyperfine --warmup 1 --runs 3`, macOS arm64, vs [jscpd@4](https://github.com/kucherenko/jscpd) and
-[PMD CPD 7.24](https://pmd.github.io/) (both Python-mode, same tree):
+This is the part the tool is fastest at being smug about. `hyperfine --warmup 1 --runs 3`, macOS
+arm64, against [jscpd@4](https://github.com/kucherenko/jscpd) and [PMD CPD 7.24](https://pmd.github.io/),
+both in Python mode on the same trees:
 
-| Repo (Python files) | find-dup-defs | PMD CPD | jscpd |
+| repo (Python files) | find-dup-defs | PMD CPD | jscpd |
 |---|---|---|---|
-| `pip` (633) | **0.18 s** | 0.87 s (4.9×) | 3.21 s (18.2×) |
-| `mypy` (155) | **0.18 s** | 0.81 s (4.6×) | 1.47 s (8.4×) |
-| `sympy` (1 589) | **1.22 s** | 4.29 s (3.5×) | 15.18 s (12.4×) |
-| `django` (2 910) | **1.01 s** | 2.08 s (2.1×) | 9.67 s (9.6×) |
+| `pip` (633) | 0.18 s | 0.87 s (4.9×) | 3.21 s (18.2×) |
+| `mypy` (155) | 0.18 s | 0.81 s (4.6×) | 1.47 s (8.4×) |
+| `sympy` (1 589) | 1.22 s | 4.29 s (3.5×) | 15.18 s (12.4×) |
+| `django` (2 910) | 1.01 s | 2.08 s (2.1×) | 9.67 s (9.6×) |
 
-It does **more** semantic work (alpha-renamed canonical, IDF cosine, severity grading, calibration)
-and is still **3–12× faster** — Rust + rayon, single-parse frontends, no JVM/Node tax. Throughput on
-`django` (426K SLOC): **~422K SLOC/s** vs PMD ~205K, jscpd ~44K.
+It does more semantic work than either — alpha-renamed canonicals, an exact IDF cosine join,
+severity grading, calibration — and is still 3–12× faster, because it's Rust + rayon over
+single-parse frontends with no JVM or Node startup to amortize. Throughput on `django` (426K SLOC)
+is ~422K SLOC/s, against PMD's ~205K and jscpd's ~44K.
 
 <details>
-<summary><b>GPU acceleration (optional, macOS / Metal)</b></summary>
+<summary>GPU acceleration (optional, macOS / Metal) — and why it rarely matters</summary>
 
-`difflib-fast` can offload the name-gated Ratcliff–Obershelp clustering to the Apple-Silicon GPU via
-its stateful `Rationer` handle — wired in but **off by default** and gated twice: build with
-`--features gpu`, enable at runtime with `-D 'settings:gpu=on'` (`on` / `gpu+cpu` / `gpu` / `off`).
-Only large all-ASCII same-name groups (≥ ~300 members) route to Metal; everything else stays on CPU,
-and output is **byte-for-byte identical** in every mode.
+[`difflib-fast`](https://crates.io/crates/difflib-fast) can offload the name-gated Ratcliff–Obershelp
+clustering to the Apple-Silicon GPU via its `Rationer` handle. It's off by default and gated twice:
+build with `--features gpu`, enable with `-D 'settings:gpu=on'` (`on` / `gpu+cpu` / `gpu` / `off`).
+Only large all-ASCII same-name groups (≥ ~300 members) route to Metal; everything else stays on
+CPU, and the output is byte-for-byte identical in every mode.
 
-**Honest read — it rarely helps end-to-end.** The GPU only accelerates clustering of a *single* large
-group (`difflib-fast`'s own bench: 1.1–1.4× there), while the tool's real shape is *many* mostly-small
-groups (the 0.6–0.99× case). On `rustc/tests/ui` (20 425 files, with `functions:main ×12 678`):
-`gpu=off` 33.97 s vs `gpu=on` 33.62 s — a tie. Keep CPU for everyday runs.
+In practice it rarely helps end-to-end. The GPU accelerates clustering of a *single* large group
+(1.1–1.4× in `difflib-fast`'s own bench), but this tool's real workload is many mostly-small
+groups. On `rustc/tests/ui` (20 425 files, with `fn main` × 12 678): `gpu=off` 33.97 s,
+`gpu=on` 33.62 s. A tie. Keep CPU for everyday runs.
 </details>
 
----
+## On real repos
 
-## Benchmarks — real repos
+Ten production TypeScript repos (vscode, the TS compiler, vue, angular, svelte, nest, astro,
+prisma, next.js, excalidraw; ≈6M SLOC), with `--calibrate`, the inferred directives, and the
+balanced thickness cut — raw ERROR count drops 94% on average:
 
-**10 production TypeScript repos** (vscode, the TS compiler, vue, angular, svelte, nest, astro,
-prisma, next.js, excalidraw; ≈6M SLOC). `--calibrate` + auto-inferred directives + balanced thickness
-cut raw ERROR count by **94% on average**:
-
-| Repo | LOC | Raw ERROR | After | %cut | Top remaining cluster |
+| repo | LOC | raw ERROR | after | %cut | top remaining cluster |
 |---|---:|---:|---:|---:|---|
-| microsoft/vscode | 3.1M | 5428 | 174 | **97%** | `registerCLIChatCommands` 771 LOC |
-| microsoft/TypeScript | 265k | 1840 | 9 | **100%** | `NavigationBarItem` interface |
-| vercel/next.js | 756k | 489 | 26 | **95%** | `defaultLoader` 115 LOC |
-| angular/angular | 1.0M | 627 | 54 | **91%** | `conditionalCreate/conditionalBranchCreate` |
-| prisma/prisma | 222k | 322 | 68 | **79%** | `fieldToColumnType` 95 LOC × 3 adapters |
+| microsoft/vscode | 3.1M | 5428 | 174 | 97% | `registerCLIChatCommands` 771 LOC |
+| microsoft/TypeScript | 265k | 1840 | 9 | 100% | `NavigationBarItem` interface |
+| vercel/next.js | 756k | 489 | 26 | 95% | `defaultLoader` 115 LOC |
+| angular/angular | 1.0M | 627 | 54 | 91% | `conditionalCreate/conditionalBranchCreate` |
+| prisma/prisma | 222k | 322 | 68 | 79% | `fieldToColumnType` 95 LOC × 3 adapters |
 
-**28 large Python repos** (≈8M SLOC). Auto-applied directives cut raw ERROR by **67% on average**:
+Twenty-eight large Python repos (≈8M SLOC), auto-applied directives, 67% average cut:
 
-| Repo | Raw ERROR | After | %cut | Top remaining cluster |
+| repo | raw ERROR | after | %cut | top remaining cluster |
 |---|---:|---:|---:|---|
 | home-assistant/core | 4475 | 850 | 81% | `ConfigFlow.async_step_*` (n=178) |
 | apache/airflow | 2203 | 337 | 84% | `CloudComposerGetEnvironmentOperator` (n=18) |
@@ -306,33 +320,29 @@ cut raw ERROR count by **94% on average**:
 | scipy/scipy | 492 | 140 | 71% | `dct/dst/idct/idst` (n=4) |
 | pandas-dev/pandas | 406 | 78 | 80% | `read_csv/read_table` (n=2) |
 
-Concrete wins this surfaced: `pip` Version `__lt__…__gt__` ×6 → one `_compare` helper (−130 lines);
-`scipy` `dct/dst/idct/idst` ×4 → a factory (−330 lines); `scikit-learn`
-`BaseSGD{Classifier,Regressor}._fit` — a textbook sibling-estimator dupe.
+What's left at the top is the kind of thing a human reviewer would also flag. `pip`'s Version
+`__lt__…__gt__` ×6 collapse into one `_compare` helper, −130 lines. `scipy`'s `dct/dst/idct/idst`
+×4 want a factory, −330 lines. `scikit-learn`'s `BaseSGD{Classifier,Regressor}._fit` is a
+sibling-estimator dupe waiting for a shared impl. The vendored snapshots, test fixtures, `.d.ts`
+and Storybook noise is gone before you read a line.
 
-The top remaining clusters are PR candidates a human reviewer would also flag, with the noise
-(vendored snapshots, test fixtures, `.d.ts`, Storybook) automatically removed.
+## For agents
 
----
-
-## AI-agent integration
+The JSON output is built so an agent never has to round-trip to the filesystem. Each finding ships
+the full source of one member (`groups[].snippet`), every location (`members[]` as file:line), the
+thickness for prioritization, the kind/severity/similarity, and any directive annotations
+(`notes[]`). Pattern findings additionally carry a structured `pattern` object — `template`,
+`signature`, `params`, `granularity`, `support`, `loc_saved` — so a consumer groups by signature
+without parsing prose.
 
 ```bash
-# 1. Calibrate → JSON
+# calibrate → JSON, then scan with the chosen tuning + inferred directives
 find-dup-defs ./repo --calibrate --json > calib.json
-
-# 2. Full scan with the agent's chosen tuning + inferred directives
 find-dup-defs ./repo \
   --error-thickness <calib> \
   $(jq -r '.inferred_directives[].directive | "-D \"" + . + "\""' calib.json) \
   --errors-only --json > findings.json
-
-# 3. Each finding ships everything to write a PR — no FS roundtrips:
-#    groups[].snippet (full source of one member) · members[] (every file:line)
-#    · thickness (priority) · notes[] (directive annotations)
 ```
-
----
 
 ## Architecture
 
@@ -349,19 +359,19 @@ Six crates, layered so the engine never depends on a frontend and the contract c
  canon canon            (engine depends on the contract + each frontend, NOT on find-dup-defs-canon)
 ```
 
-| crate | role |
-|---|---|
-| [`find-dup-defs`](crates/find-dup-defs) | engine + CLI; frontend-agnostic, clusters a `Vec<Def>` and never names a language |
-| [`dup-defs-core`](crates/dup-defs-core) | the engine↔frontend **contract** (`Def` / `KindSpec` / `Analysis` / `Frontend` / `LineMap`) |
-| [`find-dup-defs-canon`](crates/find-dup-defs-canon) | **shared frontend helpers** between the contract and the frontends — no duplication across the three |
-| [`py-canon`](crates/py-canon) · [`ts-canon`](crates/ts-canon) · [`rs-canon`](crates/rs-canon) | the Python / TypeScript / Rust frontends (Ruff · oxc · syn) |
+[`find-dup-defs`](crates/find-dup-defs) is the engine and CLI; it clusters a `Vec<Def>` and never
+names a language. [`dup-defs-core`](crates/dup-defs-core) is the engine↔frontend contract — `Def`,
+`KindSpec`, `Analysis`, the `Frontend` trait. [`find-dup-defs-canon`](crates/find-dup-defs-canon)
+holds the helpers the frontends share (the alpha-rename, the kind vocabulary, `count_loc`).
+[`py-canon`](crates/py-canon), [`ts-canon`](crates/ts-canon) and [`rs-canon`](crates/rs-canon) are
+the frontends (Ruff, oxc, syn). Adding a language is one more `<lang>-canon` crate implementing
+`Frontend` — plus a `Dialect` impl if it wants patternology — and no engine changes.
 
-Adding a language = one more `<lang>-canon` frontend implementing `Frontend` (and, for patternology, a
-`Dialect` impl) — no engine changes. The similarity engine is the exact Ratcliff–Obershelp + simjoin
-port [`difflib-fast`](https://github.com/prostomarkeloff/difflib-fast). Dogfooded on its own source to
-**0 ERROR** (`find-dup-defs crates -D @find-dup-defs.directives`).
-
----
+The similarity engine underneath is [`difflib-fast`](https://github.com/prostomarkeloff/difflib-fast),
+an exact Ratcliff–Obershelp + L2AP cosine-join port. And the tool eats its own cooking: this
+workspace gates to **0 ERROR** under `find-dup-defs crates -D @find-dup-defs.directives`. (The file
+`crates/find-dup-defs/src/simgraph.rs` exists because an earlier run flagged the cosine/union-find
+helpers that `type3` and `patternology` had each copied — so they were extracted into one module.)
 
 ## CLI reference
 
@@ -370,61 +380,59 @@ USAGE:  find-dup-defs [OPTIONS] <PATHS>...
 
 LANGUAGES
   --only <CODES>            Restrict to frontends (py,ts,rs). Default: all found in PATHS.
+  --kinds <K,…>             functions,methods,classes,interfaces,constants,type-aliases
 
 SEVERITY (thickness ladder)
   --error-thickness <F>     Demote ERROR → WARNING if T < F   (default 0.0 = off)
   --warning-thickness <F>   Demote WARNING → INFO  if T < F   (default 0.0 = off)
-  --escalate-thickness <F>  Promote anything → ERROR if T ≥ F (default 0.0 = off)
+  --escalate-thickness <F>  Promote anything → ERROR if T ≥ F (default 0.0 = off, applied last)
 
 SIMILARITY
-  -t, --threshold <F>       Name-gated cluster floor (default 0.5)
-  -e, --error-threshold <F> Name-gated ERROR floor   (default 0.85)
-  --type3-theta <F>         Type-3 cosine floor       (default 0.7)
+  -t, --threshold <F>       Name-gated cluster floor   (default 0.5)
+  -e, --error-threshold <F> Name-gated ERROR floor     (default 0.85)
+  --type3-theta <F>         Type-3 cosine floor        (default 0.7)
+  --max-name-group <N>      Skip name-gated clustering for (kind,name) groups > N
 
-PATTERNOLOGY (opt-in · Python + TypeScript + Rust · advisory, never ERROR)
+PATTERNOLOGY (opt-in · advisory, never ERROR)
   --patternology            Surface collapsible-duplication helper candidates
   --pattern-theta <F>       Whole-fn structural cosine floor (default 0.85)
   --pattern-support <N>     Sub-block idiom support floor     (default 3)
-                            (drop the thin tail with -D settings:pattern-min-thickness=<F>)
 
-FILTERS
+FILTERS / MODES
   -D, --directive <S>       ACTION:[<KIND>]NAME[@PATH][=NOTE], repeatable. ACTION ∈
                             suppress / de-escalate / escalate / note / set:KEY=VALUE.
-                            `@PATH` reads a directive file (`#` comments; `@-` = stdin).
-                            Globs: * ? {a,b} [a-z] (+ \ escapes).
-  --kinds <K,…>             functions,methods,classes,interfaces,constants,type-aliases
+                            `@PATH` reads a directive file (# comments; @- = stdin).
   --min-size <N>            Only clusters with ≥ N members (default 2)
-  --max-name-group <N>      Skip name-gated clustering for (kind,name) groups > N
   --errors-only             Filter output to ERROR
   --show-info               Include INFO in the human report
-
-MODES
   --calibrate               Histogram + threshold suggestions + inferred directives
   --json                    Machine-readable output
   --no-cross-name / --no-type3   Skip pass 2 / pass 3
 ```
 
----
-
 ## Limitations
 
-- **Python / TypeScript / Rust** today; patternology covers **all three**. New languages are a
-  `<lang>-canon` sibling — PRs welcome.
-- Rust patternology is **initial**: `rs-canon` splices statement bodies as node children rather than
-  lists, so long-body alignment is prefix-only, and macro internals are opaque.
-- TypeScript patternology surfaces top-level `function` declarations and arrow / function-expression
-  `const`s; class **methods** don't participate (their slice doesn't re-parse as a standalone
-  function, so they carry no patternology canonical — they're still covered by the duplicate passes).
-- **Type-4** (semantic equivalence, different syntax → same logic) — out of scope.
-- **Token-level** sub-expression duplication — out of scope; pair with jscpd / PMD CPD if you need it.
-- Calibration is heuristic — the thickness formula constants were tuned on the benchmark corpora above;
-  your codebase may want different.
+The honest ledger:
+
+- Python, TypeScript and Rust today; patternology covers all three. A new language is a
+  `<lang>-canon` sibling crate.
+- Rust patternology is the youngest of the three: `rs-canon` splices statement bodies as node
+  children rather than lists, so long-body alignment is prefix-only, and macro internals are
+  opaque.
+- TypeScript patternology sees top-level `function` declarations and arrow / function-expression
+  `const`s. Class methods don't participate — their slice doesn't re-parse as a standalone
+  function, so they carry no patternology canonical. The duplicate passes still cover them.
+- Type-4 clones (same logic, different syntax) are out of scope.
+- Token-level sub-expression duplication is out of scope too; pair with jscpd or PMD CPD if you
+  need it.
+- The thickness constants were tuned on the benchmark corpora above. Your codebase may want
+  different ones — that's what `--calibrate` is for.
 
 ---
 
 <div align="center">
 
-**Copy-paste has nowhere to hide.**
+**Copy-paste has nowhere left to hide.**
 
 Made with ⚡ by [@prostomarkeloff](https://github.com/prostomarkeloff)
 

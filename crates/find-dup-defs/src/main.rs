@@ -14,7 +14,7 @@ use clap::Parser;
 use dup_defs_core::{Def, Frontend, KindSpec};
 use find_dup_defs::{
     cluster, collect_defs, large_name_groups, pass_cross_name, pass_name_gated, pass_type3,
-    section_index, timed, Finding, GpuMode, PipelineOpts, Severity,
+    section_index, timed, Finding, GpuMode, PatternInfo, PipelineOpts, Severity,
 };
 use serde::Serialize;
 
@@ -1579,6 +1579,10 @@ struct JsonGroup {
     members: Vec<JsonMember>,
     allowlist_key: String,
     notes: Vec<String>,
+    /// Structured patternology payload — present only for `pass == "pattern"` findings; the textual
+    /// passes omit it. Lets a consumer group by `signature` / read `template` without parsing `notes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pattern: Option<PatternInfo>,
 }
 
 #[derive(Serialize)]
@@ -1606,6 +1610,7 @@ fn render_json(findings: &[Finding], repo_root: &Path) -> String {
                 members: f.members.iter().map(|(file, line, _)| JsonMember { file: short_path(file, repo_root), line: *line }).collect(),
                 allowlist_key: format!("{rule} {}", f.name),
                 notes: f.notes.clone(),
+                pattern: f.pattern.clone(),
             }
         })
         .collect();
