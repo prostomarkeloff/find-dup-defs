@@ -1,0 +1,42 @@
+# PyPI packaging for the `find-dup-defs` CLI. This ships the compiled Rust binary as a
+# platform wheel (the "ruff model"): `pip install find-dup-defs` / `uvx find-dup-defs` drops
+# the `find-dup-defs` executable on PATH. There is no importable Python module — maturin's
+# `bin` bindings wrap the binary as a console script, nothing more.
+#
+# Build backend is maturin; the version is read from the crate's Cargo.toml (single source of
+# truth). Wheels are built per platform in CI (see .github/workflows/wheels.yml); publishing is
+# done manually with `uv publish`.
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "find-dup-defs"
+dynamic = ["version"]
+description = "Find duplicate / near-duplicate top-level definitions across a codebase via clone clustering — Python, Rust, and TypeScript frontends, plus an opt-in structural helper-extraction pass."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+# Bin-only wheel: no Python code runs, so any CPython/PyPy that can install a wheel works.
+requires-python = ">=3.8"
+authors = [{ name = "prostomarkeloff" }]
+keywords = ["duplicate", "clone", "refactor", "lint", "ast"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Build Tools",
+]
+
+[project.urls]
+Repository = "https://github.com/prostomarkeloff/find-dup-defs"
+Homepage = "https://github.com/prostomarkeloff/find-dup-defs"
+
+[tool.maturin]
+# Package the workspace binary crate, not the virtual workspace root.
+manifest-path = "crates/find-dup-defs/Cargo.toml"
+# Wrap the compiled `find-dup-defs` binary as a console script (no PyO3 module).
+bindings = "bin"
+# Read `version` from the crate's Cargo.toml.

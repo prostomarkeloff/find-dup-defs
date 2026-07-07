@@ -1,6 +1,9 @@
 # Rust build artifacts
 target/
 
+# Python wheel/sdist build output (built in CI; published manually via `uv publish`)
+dist/
+
 # profiling output
 *.json.gz
 flame.svg
