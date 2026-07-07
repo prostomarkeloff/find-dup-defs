@@ -3,6 +3,7 @@
 [![Rust 2021](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![crates.io](https://img.shields.io/crates/v/find-dup-defs.svg)](https://crates.io/crates/find-dup-defs)
+[![PyPI](https://img.shields.io/pypi/v/find-dup-defs.svg)](https://pypi.org/project/find-dup-defs/)
 [![exact difflib](https://img.shields.io/badge/similarity-byte--for--byte%20difflib-blue.svg)](https://crates.io/crates/difflib-fast)
 
 Your coding agent is stateless, and your codebase doesn't fit in its context window. So when it
@@ -15,6 +16,20 @@ find-dup-defs is the gate that catches it. It clusters duplicate and near-duplic
 Python, TypeScript and Rust; grades each cluster by how much a refactor would actually pay off;
 and calibrates its own noise filters to your tree. One parse per file, three frontends (Ruff, oxc,
 syn), and **2–12× faster than PMD CPD and jscpd** while doing more semantic work than either.
+
+Run it without installing anything:
+
+```bash
+uvx find-dup-defs ./src
+```
+
+Prebuilt wheels for Linux, macOS and Windows are on PyPI — no Rust toolchain needed:
+
+```bash
+pip install find-dup-defs        # or: uv tool install find-dup-defs
+```
+
+Or install from crates.io (builds from source):
 
 ```bash
 cargo install find-dup-defs
