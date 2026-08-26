@@ -191,6 +191,7 @@ pub fn load_defs(dir: &Path) -> std::io::Result<Vec<Def>> {
                     size: a.size,
                     canon_dialect: dialect_from(&a.dialect, a.cpython_ast),
                 }),
+                thickness: None,
             }
         })
         .collect();
@@ -256,6 +257,7 @@ pub fn load_findings(dir: &Path) -> std::io::Result<Vec<Finding>> {
             notes: s.notes,
             members: s.members,
             pattern: None,
+            facets: Vec::new(),
         })
         .collect();
     Ok(out)

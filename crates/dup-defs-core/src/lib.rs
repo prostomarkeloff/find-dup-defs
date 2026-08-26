@@ -7,4 +7,4 @@ mod loc;
 mod types;
 
 pub use loc::LineMap;
-pub use types::{Analysis, CanonDialect, Def, Frontend, KindSpec};
+pub use types::{Analysis, CanonDialect, Def, Frontend, KindSpec, ScanOpts};

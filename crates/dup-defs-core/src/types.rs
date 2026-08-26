@@ -90,6 +90,37 @@ pub struct Def {
     pub text_orig: String,
     pub cluster_canonical: Option<String>,
     pub analysis: Option<Analysis>,
+    /// Frontend-supplied refactor-payoff score in `[0, 1]`, overriding the engine's default
+    /// [`crate::Def`]-agnostic [`thickness`](../find_dup_defs/fn.thickness.html) formula for
+    /// clusters of this def. `None` (every body kind) ⇒ the default formula, unchanged.
+    ///
+    /// The default is `volume = (n − 1) · loc` — lines a refactor deletes — which assumes a bigger
+    /// cluster is a bigger win. That assumption inverts for units whose "body" is derived rather
+    /// than written: a use profile shared by fifty definitions is not fifty times the payoff, it is
+    /// evidence the profile is a language idiom. A frontend that knows its unit's economics scores
+    /// it here; the engine takes the cluster's minimum, so a cluster is never thicker than its
+    /// thinnest member.
+    pub thickness: Option<f64>,
+}
+
+/// What the caller asked this run to produce. Some kinds cost real work — a second walk of every
+/// file, an extra canonicalization per definition — and emitting them unasked would both slow the
+/// default run and print sections nobody wanted. A frontend consults this to decide which of its
+/// kinds are worth computing, so the choice lives in the CLI (`--kinds`) rather than in a side
+/// channel.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScanOpts<'a> {
+    /// Kind ids the caller named (`--kinds functions,lenses`), or `None` for "the default set".
+    pub kinds: Option<&'a [String]>,
+}
+
+impl ScanOpts<'_> {
+    /// True when the caller named this kind explicitly. `None` (no `--kinds`) means the default
+    /// set, which never includes the opt-in kinds — hence `false` rather than `true` here.
+    #[must_use]
+    pub fn wants(&self, id: &str) -> bool {
+        self.kinds.is_some_and(|ks| ks.iter().any(|k| k == id))
+    }
 }
 
 /// A language frontend: walks a set of files and lowers each definition to a [`Def`], computing
@@ -100,9 +131,10 @@ pub trait Frontend: Sync {
     fn lang(&self) -> &'static str;
     /// File extensions this frontend claims (without the dot), e.g. `["ts", "tsx"]`.
     fn extensions(&self) -> &'static [&'static str];
-    /// Every kind this frontend can emit. The binary unions these across the selected frontends
-    /// to build the report's section list, so `--only py` prints only Python's sections.
-    fn kinds(&self) -> &'static [&'static KindSpec];
+    /// Every kind this frontend emits *for this run*. The binary unions these across the selected
+    /// frontends to build the report's section list, so `--only py` prints only Python's sections
+    /// and an opt-in kind contributes a section exactly when it was asked for.
+    fn kinds(&self, opts: &ScanOpts) -> &'static [&'static KindSpec];
     /// Parse each file once and return its definitions as [`Def`]s with canon precomputed.
-    fn scan(&self, files: &[Arc<str>]) -> Vec<Def>;
+    fn scan(&self, files: &[Arc<str>], opts: &ScanOpts) -> Vec<Def>;
 }

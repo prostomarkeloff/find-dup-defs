@@ -22,7 +22,7 @@ fn main() {
         .collect();
     files.sort();
 
-    let defs = Python.scan(&files);
+    let defs = Python.scan(&files, &dup_defs_core::ScanOpts::default());
     let mut canon: Vec<String> = defs
         .iter()
         .filter(|d| d.kind.id == "functions")

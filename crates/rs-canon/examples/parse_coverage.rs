@@ -37,7 +37,7 @@ fn main() {
     }
     // Count defs via the real frontend (skips files that fail to parse).
     let arcs: Vec<Arc<str>> = files.iter().map(|f| Arc::from(f.as_str())).collect();
-    let defs = <Rust as dup_defs_core::Frontend>::scan(&Rust, &arcs).len();
+    let defs = <Rust as dup_defs_core::Frontend>::scan(&Rust, &arcs, &dup_defs_core::ScanOpts::default()).len();
 
     println!(
         "files={} parse_ok={ok} parse_fail={fail} ({:.2}% fail) defs={defs}",
