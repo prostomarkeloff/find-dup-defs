@@ -8,7 +8,7 @@
 use std::fs;
 use std::sync::Arc;
 
-use dup_defs_core::{Def, Frontend, KindSpec};
+use dup_defs_core::{Def, Frontend, KindSpec, ScanOpts};
 use rayon::prelude::*;
 
 use crate::defs::scan_source;
@@ -29,10 +29,10 @@ impl Frontend for TypeScript {
     fn extensions(&self) -> &'static [&'static str] {
         &["ts", "tsx", "mts", "cts"]
     }
-    fn kinds(&self) -> &'static [&'static KindSpec] {
+    fn kinds(&self, _opts: &ScanOpts) -> &'static [&'static KindSpec] {
         KINDS
     }
-    fn scan(&self, files: &[Arc<str>]) -> Vec<Def> {
+    fn scan(&self, files: &[Arc<str>], _opts: &ScanOpts) -> Vec<Def> {
         files
             .par_iter()
             .flat_map(|f| fs::read_to_string(&**f).map_or_else(|_| Vec::new(), |src| scan_source(&src, f)))
@@ -43,14 +43,14 @@ impl Frontend for TypeScript {
 #[cfg(test)]
 mod tests {
     use super::TypeScript;
-    use dup_defs_core::Frontend;
+    use dup_defs_core::{Frontend, ScanOpts};
 
     #[test]
     fn registry_metadata() {
         let ts = TypeScript;
         assert_eq!(ts.lang(), "ts");
         assert_eq!(ts.extensions(), &["ts", "tsx", "mts", "cts"]);
-        assert_eq!(ts.kinds().len(), 6);
-        assert!(ts.kinds().iter().any(|k| k.id == "interfaces"), "interfaces is a TS kind");
+        assert_eq!(ts.kinds(&ScanOpts::default()).len(), 6);
+        assert!(ts.kinds(&ScanOpts::default()).iter().any(|k| k.id == "interfaces"), "interfaces is a TS kind");
     }
 }

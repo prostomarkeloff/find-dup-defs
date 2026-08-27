@@ -10,7 +10,7 @@ use ts_canon::TypeScript;
 fn main() {
     let file = env::args().nth(1).expect("usage: canon_one <file>");
     let files = vec![Arc::<str>::from(file.as_str())];
-    let defs = TypeScript.scan(&files);
+    let defs = TypeScript.scan(&files, &dup_defs_core::ScanOpts::default());
     eprintln!("found {} defs in {file}", defs.len());
     for (i, d) in defs.iter().enumerate() {
         let canon_len = d.cluster_canonical.as_deref().map_or(0, str::len);

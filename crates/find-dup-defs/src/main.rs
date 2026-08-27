@@ -78,6 +78,12 @@ struct Cli {
     max_name_group: Option<usize>,
     /// Restrict to these kinds (comma-separated:
     /// functions,methods,classes,interfaces,constants,type-aliases).
+    ///
+    /// Naming `lenses` additionally enables the lens kind (Python only), which is never in the
+    /// default set: it clusters a definition by *perspectives other than its body* — what it calls,
+    /// how it branches, how it fails, what it declares, how it is used elsewhere — each fact tagged
+    /// with the lens it came from, so a finding reports which perspectives agreed. It costs a
+    /// second walk of every file, hence opt-in.
     #[arg(long, value_delimiter = ',')]
     kinds: Option<Vec<String>>,
     /// Restrict the scan to specific language frontends (comma-separated). Default: every
@@ -132,7 +138,8 @@ struct Cli {
     ///            (WARNING → ERROR) | `note` (attach text, no severity change) | `set` (pipeline
     ///            config, e.g. `set:max-name-group=256`).
     /// `<KIND>` ∈ `<functions>` | `<methods>` | `<classes>` | `<interfaces>` | `<constants>` |
-    ///            `<type-aliases>` (optional; `<*>` or omitted = any). Matched exactly.
+    ///            `<type-aliases>` | `<lenses>` (optional; `<*>` or omitted = any). Matched
+    ///            exactly, so a rule written for one kind is inert for every other.
     /// `NAME`   glob on the cluster's dup name (`Class.method` or `a/b/c` for cross-name).
     ///          `*` any run, `?` one byte, `{a,b}` alternation, `[a-z]` char-class. Tested
     ///          against each `/`-separated alias.
@@ -298,7 +305,14 @@ fn render_bench(spec: &str, findings: &[Finding], selected: &[&dyn Frontend], cl
     let mut ms: Vec<f64> = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = std::time::Instant::now();
-        let r = format_report(&visible, selected, cli.threshold, cli.error_threshold, &cli.repo_root);
+        let r = format_report(
+            &visible,
+            selected,
+            cli.threshold,
+            cli.error_threshold,
+            &cli.repo_root,
+            &dup_defs_core::ScanOpts { kinds: cli.kinds.as_deref() },
+        );
         std::hint::black_box(&r);
         ms.push(t.elapsed().as_secs_f64() * 1000.0);
     }
@@ -421,7 +435,7 @@ fn main() {
 
     // One scan → defs. The cheap `(kind, name)` group sizes feed the directive-inferrer's
     // `settings:max-name-group` suggestion (independent of clustering and the cap); then cluster.
-    let defs = collect_defs(&selected, &opts.paths);
+    let defs = collect_defs(&selected, &opts.paths, &dup_defs_core::ScanOpts { kinds: opts.kinds.as_deref() });
     // Dump the scanned defs for snapshot benches (see the FDD_SNAPSHOT path above).
     // Cheap: dump just the Type-3 inputs (scan → dump → exit), no 2.6GB defs.json.
     if let Ok(dir) = std::env::var("FDD_DUMP_T3") {
@@ -445,7 +459,11 @@ fn main() {
             let mut ms: Vec<f64> = Vec::with_capacity(iters);
             for _ in 0..iters {
                 let t = std::time::Instant::now();
-                let d = collect_defs(&selected, &opts.paths);
+                let d = collect_defs(
+                    &selected,
+                    &opts.paths,
+                    &dup_defs_core::ScanOpts { kinds: opts.kinds.as_deref() },
+                );
                 std::hint::black_box(d.len());
                 ms.push(t.elapsed().as_secs_f64() * 1000.0);
             }
@@ -539,7 +557,14 @@ fn main() {
             } else {
                 findings.iter().filter(|f| f.severity != Severity::Info).collect()
             };
-            format_report(&visible, &selected, cli.threshold, cli.error_threshold, &cli.repo_root)
+            format_report(
+                &visible,
+                &selected,
+                cli.threshold,
+                cli.error_threshold,
+                &cli.repo_root,
+                &dup_defs_core::ScanOpts { kinds: cli.kinds.as_deref() },
+            )
         }
     });
     print!("{report}");
@@ -1466,6 +1491,14 @@ fn group_suffix(f: &Finding) -> String {
         Some(t) => format!("  [{t}, {metrics}]"),
         None => format!("  [{metrics}]"),
     };
+    // Which perspectives agreed, and by how many facts each — the answer to "why did these
+    // cluster", which the similarity score cannot give: it says how close, never through what.
+    let base = if f.facets.is_empty() {
+        base
+    } else {
+        let votes: Vec<String> = f.facets.iter().map(|(k, n)| format!("{k}×{n}")).collect();
+        format!("{base}  votes[{}]: {}", f.facets.len(), votes.join(" "))
+    };
     // Notes from matching directives — visible right next to the finding so the next reviewer
     // sees the override reason without grepping. Multiple notes join with `; ` to stay on one
     // line; the JSON form keeps them as a structured array.
@@ -1485,11 +1518,17 @@ fn group_suffix(f: &Finding) -> String {
 /// `include_patterns` adds the patternology appendix sections. It's gated on there actually being
 /// pattern findings (the pass is opt-in) so a normal run prints the historical section list
 /// byte-for-byte — the patternology layer is invisible unless `--patternology` produced something.
-fn report_sections(frontends: &[&dyn Frontend], warn: f64, error: f64, include_patterns: bool) -> Vec<(usize, String)> {
+fn report_sections(
+    frontends: &[&dyn Frontend],
+    warn: f64,
+    error: f64,
+    include_patterns: bool,
+    scan_opts: &dup_defs_core::ScanOpts,
+) -> Vec<(usize, String)> {
     let sim = format!("AST sim warn={warn} error={error}");
     let mut kinds: Vec<&'static KindSpec> = Vec::new();
     for f in frontends {
-        for &k in f.kinds() {
+        for &k in f.kinds(scan_opts) {
             if !kinds.iter().any(|e| e.id == k.id) {
                 kinds.push(k);
             }
@@ -1516,9 +1555,16 @@ fn report_sections(frontends: &[&dyn Frontend], warn: f64, error: f64, include_p
 }
 
 /// Human-readable per-section report — byte-for-byte the Python `format_report`.
-fn format_report(findings: &[&Finding], frontends: &[&dyn Frontend], warn: f64, error: f64, repo_root: &Path) -> String {
+fn format_report(
+    findings: &[&Finding],
+    frontends: &[&dyn Frontend],
+    warn: f64,
+    error: f64,
+    repo_root: &Path,
+    scan_opts: &dup_defs_core::ScanOpts,
+) -> String {
     let include_patterns = findings.iter().any(|f| f.pass == "pattern");
-    let sections = report_sections(frontends, warn, error, include_patterns);
+    let sections = report_sections(frontends, warn, error, include_patterns, scan_opts);
 
     // `short_path` does two `fs::canonicalize` calls per member (realpath → getattrlist/open/stat
     // per path component) — ~90% of render at scale, repeated for every one of ~200k members. Hoist
@@ -1579,6 +1625,10 @@ struct JsonGroup {
     members: Vec<JsonMember>,
     allowlist_key: String,
     notes: Vec<String>,
+    /// `(facet, shared facts)` per perspective the cluster agrees on, strongest first. Omitted
+    /// entirely when the frontend tags no facts, so the default document is unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    facets: Vec<(String, usize)>,
     /// Structured patternology payload — present only for `pass == "pattern"` findings; the textual
     /// passes omit it. Lets a consumer group by `signature` / read `template` without parsing `notes`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1610,6 +1660,7 @@ fn render_json(findings: &[Finding], repo_root: &Path) -> String {
                 members: f.members.iter().map(|(file, line, _)| JsonMember { file: short_path(file, repo_root), line: *line }).collect(),
                 allowlist_key: format!("{rule} {}", f.name),
                 notes: f.notes.clone(),
+                facets: f.facets.clone(),
                 pattern: f.pattern.clone(),
             }
         })

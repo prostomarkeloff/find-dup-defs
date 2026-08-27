@@ -71,6 +71,29 @@ pub mod kinds {
     /// `UPPER_SNAKE` module/namespace constants (`const` / `static`).
     pub static CONSTANTS: KindSpec =
         KindSpec { id: "constants", label: "CONSTANT", noun_plural: "constants", section: 0, body: false, fn_like: false };
+    /// **Use profile** — a definition canonicalized by its *use sites* rather than its body: the
+    /// multiset of statements across the tree that mention its name, alpha-renamed with the
+    /// definition itself as the anchor (`_t0`) and its attribute accesses as positional `_a{n}`.
+    /// Where the body kinds answer "what is this thing", this one answers "how is it handled" —
+    /// so two subsystems whose *bodies* diverged but whose *handling* is identical (the same
+    /// primitive re-invented) cluster together. `fn_like` so the cross-name and Type-3 passes run
+    /// over it; `section` sits after every body kind.
+    pub static USE_PROFILES: KindSpec =
+        KindSpec { id: "use-profiles", label: "USE_PROFILE", noun_plural: "use profiles", section: 10, body: true, fn_like: true };
+    /// **Lens consensus** — one definition seen through every enabled lens at once, stitched into a
+    /// single record. Each lens contributes its facts under its own prefix (`control:if`,
+    /// `outgoing:.commit`), so the Type-3 pass's IDF-weighted cosine *is* the vote: agreeing through
+    /// several lenses raises the score, agreeing through one barely moves it, and a fact the whole
+    /// corpus shares (`control:return`) is weighted to nothing without anyone naming it as noise.
+    /// A cross-name exact match here means every lens agreed at once.
+    pub static LENSES: KindSpec = KindSpec {
+        id: "lenses",
+        label: "LENSES",
+        noun_plural: "lens consensus",
+        section: 20,
+        body: true,
+        fn_like: true,
+    };
     /// `type X = …` aliases (note the space in `noun_plural`, distinct from the hyphenated `id`).
     pub static TYPE_ALIASES: KindSpec =
         KindSpec { id: "type-aliases", label: "TYPE_ALIAS", noun_plural: "type aliases", section: 9, body: false, fn_like: false };
@@ -87,6 +110,7 @@ pub fn kind_spec(id: &str) -> Option<&'static KindSpec> {
         "interfaces" => &kinds::INTERFACES,
         "constants" => &kinds::CONSTANTS,
         "type-aliases" => &kinds::TYPE_ALIASES,
+        "lenses" => &kinds::LENSES,
         _ => return None,
     })
 }

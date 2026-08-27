@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use dup_defs_core::{CanonDialect, Def, Frontend, KindSpec};
+use dup_defs_core::{CanonDialect, Def, Frontend, KindSpec, ScanOpts};
 use rayon::prelude::*;
 use serde::Serialize;
 use walkdir::WalkDir;
@@ -177,6 +177,12 @@ pub struct Finding {
     /// Structured patternology payload (template + signature + economics); `Some` only for the
     /// `"pattern"` pass. Mirrors the `notes` strings in machine-readable form.
     pub pattern: Option<PatternInfo>,
+    /// Per-facet agreement: `(facet, shared facts)` for every facet the cluster's members agree on,
+    /// strongest first. Empty unless the frontend tags its `type3_lines` as `facet:fact` — see
+    /// [`facet_votes`]. What it answers is "*why* did these cluster": a definition can look like
+    /// another through one perspective and not through six, and only the tally distinguishes the
+    /// two cases.
+    pub facets: Vec<(String, usize)>,
 }
 
 /// A [`Finding`] is a [`directiva`] directive target: its qualifier is the kind id (so a
@@ -192,6 +198,39 @@ impl directiva::Target for Finding {
     }
     fn matches_scope(&self, pat: &directiva::Pattern) -> bool {
         self.members.iter().any(|(file, _, _)| pat.matches(file))
+    }
+}
+
+/// How much a frontend-supplied [`Def::thickness`] is discounted by weak agreement: at `min_sim`
+/// 0 a cluster keeps this fraction of its score, at 1 it keeps all of it. A frontend score says how
+/// *interesting* a member is on its own — how rare its facts are — which is a potential, not a
+/// finding. Whether the cluster realized that potential is what `min_sim` measures, so the two are
+/// combined multiplicatively rather than added: a member full of rare facts that only half-matches
+/// its cluster should not outrank one that matched exactly.
+const AGREEMENT_FLOOR: f64 = 0.6;
+
+/// The cluster's refactor-payoff score: the minimum of the members' frontend-supplied
+/// [`Def::thickness`], scaled by how tightly the cluster agrees, or the engine's default
+/// [`thickness`] formula when any member lacks a score. Taking the minimum keeps a cluster from
+/// reading as thicker than its thinnest member — the same conservative convention as `min_sim`
+/// itself. (The default formula already folds `sim` in at 0.2 weight, hence the scaling here
+/// applying only to the override path.)
+fn cluster_thickness(
+    defs: &[Def],
+    members: impl IntoIterator<Item = usize>,
+    min_sim: f64,
+    fallback: impl FnOnce() -> f64,
+) -> f64 {
+    let mut best: Option<f64> = None;
+    for i in members {
+        match defs[i].thickness {
+            Some(t) => best = Some(best.map_or(t, |b: f64| b.min(t))),
+            None => return fallback(),
+        }
+    }
+    match best {
+        Some(t) => t * (AGREEMENT_FLOOR + (1.0 - AGREEMENT_FLOOR) * min_sim.clamp(0.0, 1.0)),
+        None => fallback(),
     }
 }
 
@@ -212,6 +251,49 @@ pub fn thickness(loc: usize, args: usize, n_members: usize, sim: f64) -> f64 {
     0.7 * volume_score + 0.1 * args_score + 0.2 * sim
 }
 
+/// Which facets a cluster agrees on, and by how many facts each.
+///
+/// A frontend that projects a definition through several perspectives tags each fact with the one
+/// it came from (`control:if`, `outgoing:.commit`). The engine stays ignorant of what those tags
+/// mean; it intersects the members' facts and counts what survives per tag. A cluster carried by
+/// one facet and a cluster every facet agrees on are very different findings, and the similarity
+/// score alone cannot tell them apart — it says how close, never through what.
+///
+/// Empty when the facts carry no tags, so an untagged frontend pays nothing and reports nothing.
+fn facet_tag(fact: &str) -> Option<&str> {
+    let (head, _) = fact.split_once(':')?;
+    let tagged = !head.is_empty()
+        && head.len() <= 16
+        && head.bytes().all(|b| b.is_ascii_lowercase() || b == b'-');
+    tagged.then_some(head)
+}
+
+#[must_use]
+fn facet_votes(defs: &[Def], members: impl IntoIterator<Item = usize>) -> Vec<(String, usize)> {
+    let mut shared: Option<BTreeSet<&str>> = None;
+    for i in members {
+        let Some(a) = &defs[i].analysis else { return Vec::new() };
+        let facts: BTreeSet<&str> = a.type3_lines.iter().map(String::as_str).collect();
+        shared = Some(match shared {
+            None => facts,
+            Some(prev) => prev.intersection(&facts).copied().collect(),
+        });
+    }
+    let mut per_facet: BTreeMap<&str, usize> = BTreeMap::new();
+    for fact in shared.unwrap_or_default() {
+        // A tag is a bare lowercase word before the colon. Ordinary source lines contain colons
+        // too (`def _fn(_v0):`, `for _v0 in _v1:`), so anything else is an untagged fact and is
+        // counted under no facet rather than under a bogus one.
+        if let Some(tag) = facet_tag(fact) {
+            *per_facet.entry(tag).or_insert(0) += 1;
+        }
+    }
+    let mut out: Vec<(String, usize)> =
+        per_facet.into_iter().map(|(k, v)| (k.to_owned(), v)).collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
 // ── File collection ────────────────────────────────────────────────────────
 
 /// Index of the first frontend that claims `path`'s extension, if any.
@@ -226,7 +308,7 @@ fn frontend_for(frontends: &[&dyn Frontend], path: &Path) -> Option<usize> {
 /// they are deduplicated and sorted before scanning (the engine re-sorts defs afterwards, so
 /// this is defense-in-depth for determinism).
 #[must_use]
-pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf]) -> Vec<Def> {
+pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf], opts: &ScanOpts) -> Vec<Def> {
     let per_frontend: Vec<BTreeSet<Arc<str>>> = timed("discovery", || {
         let mut per_frontend: Vec<BTreeSet<Arc<str>>> = vec![BTreeSet::new(); frontends.len()];
         let mut route = |path: &Path| {
@@ -263,7 +345,7 @@ pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf]) -> Vec<Def> 
         let mut defs = Vec::new();
         for (fi, files) in per_frontend.into_iter().enumerate() {
             let files: Vec<Arc<str>> = files.into_iter().collect();
-            defs.extend(frontends[fi].scan(&files));
+            defs.extend(frontends[fi].scan(&files, opts));
         }
         defs
     };
@@ -375,11 +457,14 @@ pub fn pass_name_gated(
                             min_sim: Some(min_sim),
                             loc,
                             args,
-                            thickness: thickness(loc, args, c.len(), min_sim),
+                            thickness: cluster_thickness(defs, c.iter().map(|&k| idxs[k]), min_sim, || {
+                                thickness(loc, args, c.len(), min_sim)
+                            }),
                             snippet: defs[idxs[c[0]]].text_orig.clone(),
                             notes: Vec::new(),
                             members: c.iter().map(|&k| member(defs, idxs[k])).collect(),
                             pattern: None,
+                            facets: facet_votes(defs, c.iter().map(|&k| idxs[k])),
                         }
                     })
                     .collect::<Vec<_>>();
@@ -401,11 +486,14 @@ pub fn pass_name_gated(
                         min_sim: Some(min_sim),
                         loc,
                         args,
-                        thickness: thickness(loc, args, c.len(), min_sim),
+                        thickness: cluster_thickness(defs, c.iter().map(|&k| idxs[k]), min_sim, || {
+                            thickness(loc, args, c.len(), min_sim)
+                        }),
                         snippet: defs[idxs[c[0]]].text_orig.clone(),
                         notes: Vec::new(),
                         members: c.iter().map(|&k| member(defs, idxs[k])).collect(),
                         pattern: None,
+                        facets: facet_votes(defs, c.iter().map(|&k| idxs[k])),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -446,11 +534,15 @@ pub fn pass_cross_name(defs: &[Def], min_size: usize) -> Vec<Finding> {
             min_sim: None,
             loc,
             args,
-            thickness: thickness(loc, args, ps.len(), 1.0),
+            // Cross-name is an exact match by construction, so agreement is total.
+            thickness: cluster_thickness(defs, ps.iter().copied(), 1.0, || {
+                thickness(loc, args, ps.len(), 1.0)
+            }),
             snippet: defs[ps[0]].text_orig.clone(),
             notes: Vec::new(),
             members: ps.iter().map(|&p| member(defs, p)).collect(),
             pattern: None,
+            facets: facet_votes(defs, ps.iter().copied()),
         });
     }
     out
@@ -513,11 +605,14 @@ pub fn pass_type3(defs: &[Def], theta: f64, gpu: GpuMode) -> Vec<Finding> {
                 min_sim: Some(min_sim),
                 loc,
                 args,
-                thickness: thickness(loc, args, cluster.len(), min_sim),
+                thickness: cluster_thickness(defs, members.iter().copied(), min_sim, || {
+                    thickness(loc, args, cluster.len(), min_sim)
+                }),
                 snippet: defs[def_of[cluster[0]]].text_orig.clone(),
                 notes: Vec::new(),
                 members: members.iter().map(|&i| member(defs, i)).collect(),
                 pattern: None,
+                facets: facet_votes(defs, members.iter().copied()),
             })
         })
         .collect()
@@ -608,6 +703,7 @@ pub fn pass_patternology(defs: &[Def], theta: f64, support_min: usize, gpu: GpuM
             snippet: defs[members[0]].text_orig.clone(),
             notes,
             members: members.iter().map(|&i| member(defs, i)).collect(),
+            facets: Vec::new(),
             pattern: Some(PatternInfo {
                 template: cand.body.clone(),
                 signature: cand.signature.clone(),
@@ -793,7 +889,8 @@ impl PipelineOpts {
 /// [`section_index`] + name + first member) and renders.
 #[must_use]
 pub fn scan_and_cluster(opts: &PipelineOpts, frontends: &[&dyn Frontend]) -> Vec<Finding> {
-    cluster(collect_defs(frontends, &opts.paths), opts)
+    let scan_opts = ScanOpts { kinds: opts.kinds.as_deref() };
+    cluster(collect_defs(frontends, &opts.paths, &scan_opts), opts)
 }
 
 /// Group definitions by `(kind, name)` and return the groups with at least `min_members`,

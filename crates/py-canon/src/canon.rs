@@ -292,16 +292,60 @@ struct Dump<'a> {
     /// walked, so nested defs keep their decorators. Lets a node-based canonical (from a file AST,
     /// decorators present) match the text-based one byte-for-byte.
     top_def_pending: bool,
+    /// **Use-profile mode.** `Some(name)` ⇒ this dump canonicalizes a *use site* of the definition
+    /// called `name`: every `Name(name)` becomes the anchor `_t0`, and every attribute read directly
+    /// off it (`name.foo`) is emitted marked as `#foo#` for the caller to renumber positionally.
+    /// `None` (every existing caller) ⇒ byte-identical to the historical behaviour.
+    anchor: Option<&'a str>,
+    /// **Module-scope mode.** Names the module itself binds — its imports, its top-level
+    /// definitions and assignments, and the fields its classes declare. They are renamed wherever
+    /// they occur, *including in attribute position* (`row.stored_at`), which the local set never
+    /// reaches. What survives is the grammar of talking to things the module did not define:
+    /// `session.get(…)`, `.filter(…).delete()`. `None` ⇒ historical behaviour.
+    scope: Option<&'a HashSet<String>>,
 }
 
 impl<'a> Dump<'a> {
     fn new(src: &'a str, locals: Option<&'a HashSet<String>>) -> Self {
-        Self { count: 0, src, locals, map: HashMap::new(), blanked: false, top_def_pending: true }
+        Self {
+            count: 0,
+            src,
+            locals,
+            map: HashMap::new(),
+            blanked: false,
+            top_def_pending: true,
+            anchor: None,
+            scope: None,
+        }
+    }
+
+    /// Use-profile mode: as [`Dump::new`], but with `anchor` as the definition whose use site is
+    /// being canonicalized. See the [`Dump::anchor`] field.
+    fn with_anchor(src: &'a str, locals: Option<&'a HashSet<String>>, anchor: &'a str) -> Self {
+        Self { anchor: Some(anchor), ..Dump::new(src, locals) }
+    }
+
+    /// Module-scope mode: `locals` carries the union of the function's own bound names and the
+    /// module's, `scope` the module's alone (the set that also applies in attribute position).
+    fn with_scope(
+        src: &'a str,
+        locals: &'a HashSet<String>,
+        scope: &'a HashSet<String>,
+    ) -> Self {
+        Self { scope: Some(scope), ..Dump::new(src, Some(locals)) }
     }
 
     /// In cross-name mode, rewrite a bound local to its positional `_v{n}` placeholder.
     fn rename_id(&mut self, id: &str) -> String {
         find_dup_defs_canon::alpha_rename(&mut self.map, self.locals, id)
+    }
+
+    /// An attribute whose name the *module* declares (a field of one of its classes) is a slot too:
+    /// `row.stored_at` and `entry.refreshed` name the same position in two copies of one shape.
+    /// Attributes of things the module did not define (`session.get`) are left alone — they are the
+    /// grammar the shape is written in.
+    fn rename_attr(&mut self, attr: &str) -> String {
+        find_dup_defs_canon::alpha_rename(&mut self.map, self.scope, attr)
     }
 
     /// Emit one AST node `name(field, …)` applying the `show_empty=False` + keyword-switch rule.
@@ -457,7 +501,22 @@ impl<'a> Dump<'a> {
     }
 
     fn keyword(&mut self, kw: &Keyword) -> String {
-        let arg = kw.arg.as_ref().map(|id| repr_str(id.id.as_str()));
+        self.keyword_at(kw, false)
+    }
+
+    /// `on_anchor` ⇒ this keyword names the anchored definition's own declared surface (it is an
+    /// argument of a call on the anchor itself), so its name is a slot and gets marked `#name#` —
+    /// the same treatment `X.name` receives. `X(key=…)` and `X.key` are the same attribute reached
+    /// through different grammar; erasing one but not the other would split a profile in half.
+    fn keyword_at(&mut self, kw: &Keyword, on_anchor: bool) -> String {
+        let arg = kw.arg.as_ref().map(|id| {
+            let name = id.id.as_str();
+            if on_anchor {
+                repr_str(&format!("#{name}#"))
+            } else {
+                repr_str(&self.rename_attr(name))
+            }
+        });
         let value = self.expr(&kw.value);
         self.node("keyword", vec![("arg", opt(arg)), ("value", F::P(value))])
     }
@@ -694,22 +753,45 @@ impl<'a> Dump<'a> {
     fn expr(&mut self, expr: &Expr) -> String {
         match expr {
             Expr::Name(n) => {
-                let id = self.rename_id(n.id.as_str());
+                // In use-profile mode the anchored definition's own name is the slot, not a free
+                // name: it is exactly the identity we are erasing one level up.
+                let id = if self.anchor == Some(n.id.as_str()) {
+                    "_t0".to_owned()
+                } else {
+                    self.rename_id(n.id.as_str())
+                };
                 let ctx = self.ctx(n.ctx);
                 self.node("Name", vec![("id", F::P(repr_str(&id))), ("ctx", F::P(ctx))])
             }
             Expr::Attribute(a) => {
+                // An attribute read straight off the anchor (`X.foo`) is part of the anchor's own
+                // declared surface, so it is a slot too — marked here, renumbered positionally by
+                // the caller once the whole profile is assembled and canonically ordered.
+                let on_anchor = self
+                    .anchor
+                    .is_some_and(|a0| matches!(a.value.as_ref(), Expr::Name(n) if n.id.as_str() == a0));
                 let value = self.expr(&a.value);
                 let ctx = self.ctx(a.ctx);
+                let attr = if on_anchor {
+                    format!("#{}#", a.attr.id.as_str())
+                } else {
+                    self.rename_attr(a.attr.id.as_str())
+                };
                 self.node(
                     "Attribute",
-                    vec![("value", F::P(value)), ("attr", F::P(repr_str(a.attr.id.as_str()))), ("ctx", F::P(ctx))],
+                    vec![("value", F::P(value)), ("attr", F::P(repr_str(&attr))), ("ctx", F::P(ctx))],
                 )
             }
             Expr::Call(c) => {
+                // A call *on the anchor* (`X(a=…, b=…)`) names the anchor's declared surface
+                // through its keywords — the constructor form of `X.a`. See `keyword_at`.
+                let on_anchor = self
+                    .anchor
+                    .is_some_and(|a0| matches!(c.func.as_ref(), Expr::Name(n) if n.id.as_str() == a0));
                 let func = self.expr(&c.func);
                 let args: Vec<String> = c.arguments.args.iter().map(|a| self.expr(a)).collect();
-                let keywords: Vec<String> = c.arguments.keywords.iter().map(|k| self.keyword(k)).collect();
+                let keywords: Vec<String> =
+                    c.arguments.keywords.iter().map(|k| self.keyword_at(k, on_anchor)).collect();
                 self.node("Call", vec![("func", F::P(func)), ("args", flist(args)), ("keywords", flist(keywords))])
             }
             Expr::BinOp(b) => {
@@ -894,7 +976,16 @@ impl<'a> Dump<'a> {
             Stmt::ClassDef(c) => {
                 let strip_deco = self.top_def_pending; // capture + clear BEFORE walking the body
                 self.top_def_pending = false;
-                let name = c.name.id.as_str().to_owned();
+                // Cross-name mode blanks the *top* definition's own name so two structurally equal
+                // definitions under different names collapse to one canonical. `FunctionDef` has
+                // always done this; a class shape needs the same treatment, and `blanked` keeps it
+                // to the top node (a class nested inside an already-blanked function is untouched).
+                let name = if self.locals.is_some() && !self.blanked {
+                    self.blanked = true;
+                    "_fn".to_owned()
+                } else {
+                    c.name.id.as_str().to_owned()
+                };
                 let (bases, keywords) = match &c.arguments {
                     Some(a) => {
                         let bases = a.args.iter().map(|b| self.expr(b)).collect();
@@ -2296,6 +2387,85 @@ pub(crate) fn analyze_stmt(stmt: &Stmt, src: &str) -> Option<AnalyzedFn> {
 /// classes without a re-parse.
 pub(crate) fn cluster_canonical_node(stmt: &Stmt, src: &str) -> String {
     Dump::new(src, None).stmt(stmt)
+}
+
+/// Bound-local set of a definition — the same alpha-rename target set the body canon uses
+/// ([`Collect`]), exposed so the use-profile canon renames a site's locals identically. For a
+/// `FunctionDef` this is params + every assignment/loop/with/except/import/walrus/comprehension
+/// target; for any other statement, just the targets it binds.
+pub(crate) fn collect_locals(stmt: &Stmt) -> HashSet<String> {
+    let mut collect = Collect::default();
+    if let Stmt::FunctionDef(func) = stmt {
+        collect.add_params(&func.parameters);
+    }
+    collect.visit_stmt(stmt);
+    collect.bound
+}
+
+/// Canonicalize one **use site** of `anchor`: the statement's tag plus its *direct* expressions
+/// (the caller stops at nested-statement boundaries, so a compound statement contributes its
+/// header, not its body). Locals rename to `_v{n}` exactly as in the body canon, the anchor itself
+/// becomes `_t0`, and attributes read off the anchor come back marked `#name#` for the caller to
+/// renumber once the whole profile is canonically ordered. Returns `(canonical, node_count)`.
+pub(crate) fn canon_site(
+    tag: &str,
+    exprs: &[&Expr],
+    src: &str,
+    locals: &HashSet<String>,
+    anchor: &str,
+) -> (String, usize) {
+    let mut dump = Dump::with_anchor(src, Some(locals), anchor);
+    let parts: Vec<String> = exprs.iter().map(|e| dump.expr(e)).collect();
+    (format!("{tag}({})", parts.join(", ")), dump.count)
+}
+
+/// Analyze a top-level definition in **module scope**: the alpha-rename set is the module's own
+/// bound names plus the definition's locals, so every identity the module introduced becomes a slot
+/// and only the grammar of external calls survives. See [`Dump::scope`].
+pub(crate) fn analyze_in_scope(stmt: &Stmt, src: &str, scope: &HashSet<String>) -> AnalyzedFn {
+    let cluster_canonical = Dump::new(src, None).stmt(stmt);
+    let mut collect = Collect::default();
+    if let Stmt::FunctionDef(func) = stmt {
+        collect.add_params(&func.parameters);
+    }
+    collect.visit_stmt(stmt);
+    let mut locals = collect.bound;
+    locals.extend(scope.iter().cloned());
+    let mut dump = Dump::with_scope(src, &locals, scope);
+    let xname_canonical = dump.stmt(stmt);
+    let size = dump.count;
+    let lines = unparse_lines(stmt, src, &locals, dump.map);
+    (cluster_canonical, xname_canonical, lines, size)
+}
+
+/// Every name the module binds at top level: imports, `def`/`class` names, module-level assignment
+/// targets, and the fields declared in its class bodies. Purely structural — "did this file
+/// introduce this name" — with no notion of what any of them mean.
+pub(crate) fn module_bound_names(module: &[Stmt]) -> HashSet<String> {
+    let mut collect = Collect::default();
+    for stmt in module {
+        match stmt {
+            Stmt::FunctionDef(f) => {
+                collect.bound.insert(f.name.id.as_str().to_owned());
+            }
+            Stmt::ClassDef(c) => {
+                collect.bound.insert(c.name.id.as_str().to_owned());
+                // Class body assignments are the fields the module declares.
+                for inner in &c.body {
+                    match inner {
+                        Stmt::Assign(a) => a.targets.iter().for_each(|t| collect.add_target(t)),
+                        Stmt::AnnAssign(a) => collect.add_target(&a.target),
+                        _ => {}
+                    }
+                }
+            }
+            Stmt::Assign(a) => a.targets.iter().for_each(|t| collect.add_target(t)),
+            Stmt::AnnAssign(a) => collect.add_target(&a.target),
+            Stmt::Import(_) | Stmt::ImportFrom(_) => collect.visit_stmt(stmt),
+            _ => {}
+        }
+    }
+    collect.bound
 }
 
 fn analyze_one(text: &str) -> Option<AnalyzedFn> {

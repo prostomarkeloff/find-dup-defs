@@ -174,6 +174,7 @@ impl Builder<'_> {
             text_orig,
             cluster_canonical,
             analysis,
+            thickness: None,
         });
     }
 }

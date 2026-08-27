@@ -278,6 +278,99 @@ Knobs: `--pattern-theta` (whole-fn cosine floor, default 0.85), `--pattern-suppo
 support floor, default 3), and `-D settings:pattern-min-thickness=<F>` to drop the thin two-site
 tail (`--calibrate` suggests the value).
 
+## Lenses
+
+Every pass above canonicalizes one text — the definition's body — and varies only how much identity
+it strips. That is one axis. A **lens** varies the text instead: it projects the same definition
+onto a different question and throws the rest away.
+
+The case that motivates it: two caches, one storing a JSONB blob and one storing typed columns,
+sharing no identifier anywhere. Same architecture, written twice.
+
+```console
+$ find-dup-defs ./cache_a ./cache_b
+No cross-file duplicates.
+```
+
+Nothing, and the reason is exact — the model's own name is a *free* name in the body canonical, so
+`session.get(JsonCache, k)` and `db.get(ThumbEntry, i)` never meet. Erase what the module itself
+introduced (imports, sibling definitions, class fields — renamed in attribute position too, which
+the local set never reaches) and what survives is the grammar of talking to things the module did
+not define:
+
+```console
+$ find-dup-defs ./cache_a ./cache_b --kinds lenses
+DUPLICATE LENSES [WARNING]: cache_get/thumb_lookup    [normalized-exact, T=0.60, n=2, loc=7]
+    votes[5]: control×3 effects×1 outgoing×1 scope×1 signature×1
+DUPLICATE LENSES [WARNING]: cache_put/thumb_store     [normalized-exact, T=0.65, n=2, loc=8]
+    votes[5]: control×2 effects×2 outgoing×2 scope×1 signature×1
+DUPLICATE LENSES [WARNING]: cache_evict/thumb_purge   [normalized-exact, T=0.73, n=2, loc=2]
+    votes[4]: effects×3 outgoing×3 scope×1 signature×1
+```
+
+Ten lenses, each answering one question:
+
+| lens | question | keeps |
+|---|---|---|
+| `outgoing` | what does it depend on? | the *set* of callees the module did not introduce |
+| `effects` | what protocol does it drive? | the same callees in call *order* |
+| `control` | how does it branch? | the if/for/while/try/return/raise skeleton, with nesting |
+| `failures` | how does it fail? | raised and caught exception types |
+| `resources` | what does it hold open? | context expressions of `with` blocks |
+| `signature` | what contract does it offer? | arity shape and annotation names — what it *has*, never what it lacks |
+| `decorators` | what role does it play? | decorator names |
+| `schema` | what shape does it declare? | column types and their options, as an unordered *set* |
+| `scope` | what does its body do? | the body with every name its module introduced erased |
+| `use` | how is it handled? | the statements elsewhere in the tree that mention it |
+
+Two of them needed their own treatment. **`schema`** compares declarations, where order is not
+meaning and the literals *are* identities: facts are sorted as a set, and `__tablename__`, index
+names and foreign-key targets are dropped while the `ForeignKey` / `Index` call survives — that a
+column references something is shape, which table it references is identity. Column types stay
+verbatim despite being imported: they are the grammar a schema is written in. **`use`** cannot be
+computed from a definition alone, so its facts are merged in after the tree is walked; assembly is
+by name, with no import resolution and no call graph — the assumption the name-gated pass has
+always made.
+
+### Agreement is the signal
+
+All ten stitch into **one** record, each fact tagged with the lens it came from
+(`control:if`, `outgoing:.commit`, `schema:col Text nullable`). The Type-3 pass's IDF-weighted
+cosine over those lines then *is* the vote — nothing new had to be built. Agreeing through several
+lenses raises the score, agreeing through one barely moves it, and a fact the whole corpus shares
+(`control:return`) is weighted to nothing without anyone declaring it noise. A cross-name exact
+match means every lens agreed at once.
+
+Each finding reports which lenses agreed and by how many facts, because similarity alone says how
+close two definitions are and never *through what*. Measured on one production tree, mean thickness
+climbs with the count — 0.71 at one vote, 0.79 at three, 0.89 at five, 0.92 at six — even though the
+score is computed from corpus IDF and knows nothing about votes. The two are independent estimates
+of the same thing, which is the best evidence the weighting works that could be had without tuning
+it to fit.
+
+A lens is only safe if its facts are either rare (informative) or universal (IDF ≈ 0). Many facts of
+*middling* frequency are the failure mode: `signature` used to emit `posonly 0` / `kwonly 0` /
+`async 0` for every ordinary function — seven facts about nothing — and dominated two thirds of all
+findings on that tree, collapsing thousands of unrelated definitions into one cluster. It now reports
+only what a signature *has*. Worth checking for any lens you add.
+
+### What it finds that the body passes cannot
+
+| | |
+|---|---|
+| a `Timeout` and a `Delay` enricher differing in one call, fifteen lines of identical plumbing | `sim 0.98` |
+| `MediaConfigResource` twice — the legacy and the authenticated media endpoint, differing in one regex | `sim 1.00` |
+| five `Delete*Command` classes on one template, one of them annotated `list[Dashboard]` by copy-paste | `sim 1.00` |
+| the same OAuth setup step in two self-hosted integrations, 49 lines each | `sim 1.00` |
+| six `TypeGuard` predicates across three files, docstrings included | `normalized-exact` |
+| `AmplitudeClient` in six places, the shared-library copy *behind* the forks that grew a feature | `sim 0.55` |
+
+A finding carried by a single lens is weak by construction — the vote count is there to be read.
+
+Opt in with `--kinds lenses` (Python only). The kind exists exactly when asked for, so the section
+list, the default report and the default JSON are byte-identical without it. Directives address it
+like any other kind — `-D 'suppress:<lenses>*@*/legacy/*=deliberate parallel port'`.
+
 ## Performance
 
 This is the part the tool is fastest at being smug about. `hyperfine --warmup 1 --runs 3`, macOS
@@ -348,7 +441,10 @@ the full source of one member (`groups[].snippet`), every location (`members[]` 
 thickness for prioritization, the kind/severity/similarity, and any directive annotations
 (`notes[]`). Pattern findings additionally carry a structured `pattern` object — `template`,
 `signature`, `params`, `granularity`, `support`, `loc_saved` — so a consumer groups by signature
-without parsing prose.
+without parsing prose. Lens findings carry `facets` — `[[lens, shared facts], …]`, strongest first —
+so a consumer can rank by *how many perspectives agreed* rather than by similarity alone, or filter
+to the ones a single lens carried. The field is omitted when a run produces no tagged facts, so the
+default document is unchanged.
 
 ```bash
 # calibrate → JSON, then scan with the chosen tuning + inferred directives
@@ -396,6 +492,7 @@ USAGE:  find-dup-defs [OPTIONS] <PATHS>...
 LANGUAGES
   --only <CODES>            Restrict to frontends (py,ts,rs). Default: all found in PATHS.
   --kinds <K,…>             functions,methods,classes,interfaces,constants,type-aliases
+                            + `lenses` (opt-in, py only) — see Lenses
 
 SEVERITY (thickness ladder)
   --error-thickness <F>     Demote ERROR → WARNING if T < F   (default 0.0 = off)
@@ -407,6 +504,10 @@ SIMILARITY
   -e, --error-threshold <F> Name-gated ERROR floor     (default 0.85)
   --type3-theta <F>         Type-3 cosine floor        (default 0.7)
   --max-name-group <N>      Skip name-gated clustering for (kind,name) groups > N
+
+LENSES (opt-in · py only)
+  --kinds lenses            Cluster by perspectives other than the body; each finding reports
+                            which lenses agreed (`votes[n]: control×3 outgoing×2 …`)
 
 PATTERNOLOGY (opt-in · advisory, never ERROR)
   --patternology            Surface collapsible-duplication helper candidates
@@ -437,6 +538,12 @@ The honest ledger:
 - TypeScript patternology sees top-level `function` declarations and arrow / function-expression
   `const`s. Class methods don't participate — their slice doesn't re-parse as a standalone
   function, so they carry no patternology canonical. The duplicate passes still cover them.
+- Lenses are Python-only. Nine of the ten read the definition's own tree and would port to another
+  frontend as-is; `use` needs the tree-wide mention index that `py-canon` builds.
+- The `use` lens assembles by name with no import resolution, which holds while top-level names are
+  effectively unique (measured: 2435 distinct across 2444 classes in one production tree) and
+  degrades on trees where one name covers hundreds of definitions — the case `--max-name-group`
+  exists for.
 - Type-4 clones (same logic, different syntax) are out of scope.
 - Token-level sub-expression duplication is out of scope too; pair with jscpd or PMD CPD if you
   need it.

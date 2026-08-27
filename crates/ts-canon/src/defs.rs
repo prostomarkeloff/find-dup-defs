@@ -180,6 +180,7 @@ fn build_def(
         text_orig: text,
         cluster_canonical,
         analysis,
+        thickness: None,
     }
 }
 

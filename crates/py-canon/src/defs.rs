@@ -23,12 +23,12 @@
 use std::sync::Arc;
 
 use find_dup_defs_canon::{count_loc, is_upper_snake};
-use dup_defs_core::{Analysis, CanonDialect, Def, KindSpec, LineMap};
+use dup_defs_core::{Analysis, CanonDialect, Def, KindSpec, LineMap, ScanOpts};
 use ruff_python_ast::{Expr, Parameters, Stmt};
 use ruff_python_parser::parse_module;
 
 use crate::canon::{analyze_functions, analyze_stmt, ast_canonical, cluster_canonical_node};
-use crate::frontend::{kind_spec, METHODS};
+use crate::frontend::{enabled_lenses, kind_spec, METHODS};
 
 /// Total parameter count: posonly + args + kwonly + (`*args` if present) + (`**kwargs` if
 /// present). For methods this includes the receiver (`self` / `cls`) — that's what the user
@@ -310,6 +310,7 @@ fn method_defs(source: &str, stmt: &Stmt, lines: &LineMap, file: &Arc<str>, pare
                     text_orig,
                     cluster_canonical,
                     analysis,
+                    thickness: None,
                 });
             }
             Stmt::ClassDef(_) => method_defs(source, inner, lines, file, &parent, out),
@@ -319,11 +320,16 @@ fn method_defs(source: &str, stmt: &Stmt, lines: &LineMap, file: &Arc<str>, pare
 }
 
 /// Scan one Python source string → its definitions as [`Def`]s with canon precomputed.
-pub(crate) fn scan_source(source: &str, file: &Arc<str>) -> Vec<Def> {
+pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec<Def> {
     let Ok(parsed) = parse_module(source) else { return Vec::new() };
     let module = parsed.into_syntax();
     let lines = LineMap::new(source);
     let mut defs: Vec<Def> = Vec::new();
+    // Module scope is a property of the file, so it is collected once before any definition is
+    // canonicalized against it.
+    let lenses = enabled_lenses(opts);
+    // Every lens reads the module's own bound names, so they are collected once per file.
+    let scope = (!lenses.is_empty()).then(|| crate::canon::module_bound_names(&module.body));
     for stmt in &module.body {
         if matches!(stmt, Stmt::ClassDef(_)) {
             method_defs(source, stmt, &lines, file, "", &mut defs);
@@ -334,6 +340,24 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>) -> Vec<Def> {
         let loc = count_loc(&text_orig);
         let kind = kind_spec(kind_id);
         let (cluster_canonical, analysis) = top_def_canon(kind, stmt, source);
+        if let Some(scope) = &scope {
+            // The `scope` lens contributes a single fact: the whole body canonicalized with every
+            // name the module introduced erased. One fact rather than one per statement, because
+            // what it asserts is all-or-nothing — two bodies either reduce to the same shape or
+            // they do not — and as one rare string it carries the IDF weight that claim deserves.
+            // Functions only. A class's body *is* its declaration, which the `schema` lens already
+            // decomposes into one fact per field; `scope` would add the whole thing back as a
+            // single string that is unique per class — pure denominator, no shared numerator, and
+            // it pushed genuinely-matching declarations below the cosine floor.
+            let scope_lines = if kind.id == "functions" {
+                vec![crate::canon::analyze_in_scope(stmt, source, scope).1]
+            } else {
+                Vec::new()
+            };
+            crate::lenses::lens_def(
+                &lenses, stmt, &name, file, line, col, loc, scope, &scope_lines, &mut defs,
+            );
+        }
         defs.push(Def {
             lang: "py",
             kind,
@@ -346,6 +370,7 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>) -> Vec<Def> {
             text_orig,
             cluster_canonical,
             analysis,
+            thickness: None,
         });
     }
     defs
@@ -354,6 +379,7 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>) -> Vec<Def> {
 #[cfg(test)]
 mod tests {
     use super::{apply_receiver_strip, scan_source};
+    use dup_defs_core::ScanOpts;
     use ruff_python_ast::Stmt;
     use ruff_python_parser::parse_module;
     use std::sync::Arc;
@@ -361,7 +387,7 @@ mod tests {
     /// `(kind id, name, text_orig)` triples — the extraction shape the old tests asserted on.
     fn triples(src: &str) -> Vec<(String, String, String)> {
         let file: Arc<str> = Arc::from("<test>");
-        scan_source(src, &file).into_iter().map(|d| (d.kind.id.to_owned(), d.name, d.text_orig)).collect()
+        scan_source(src, &file, &ScanOpts::default()).into_iter().map(|d| (d.kind.id.to_owned(), d.name, d.text_orig)).collect()
     }
 
     fn names(src: &str) -> Vec<String> {
@@ -485,7 +511,7 @@ mod tests {
             "class C:\n    def method(self, x, y):\n        if x > y:\n            return x\n        return y\n",
         );
         let file: Arc<str> = Arc::from("<test>");
-        let defs = scan_source(src, &file);
+        let defs = scan_source(src, &file, &ScanOpts::default());
         let free = defs.iter().find(|d| d.name == "free").expect("free fn");
         assert_eq!(free.loc, 4, "free loc: {}", free.loc);
         assert_eq!(free.args, 3, "free args: {}", free.args);
@@ -576,7 +602,7 @@ mod tests {
         ] {
             // Only top-level functions/classes use the node-based path AND have `text_orig`
             // equal to the canon input (methods strip the receiver, so they're excluded here).
-            for d in scan_source(src, &file).iter().filter(|d| matches!(d.kind.id, "functions" | "classes")) {
+            for d in scan_source(src, &file, &ScanOpts::default()).iter().filter(|d| matches!(d.kind.id, "functions" | "classes")) {
                 assert_eq!(d.cluster_canonical.as_deref(), Some(ast_canonical(&d.text_orig).as_str()), "cc mismatch for {:?}", d.name);
                 if d.kind.fn_like {
                     let slice = analyze_functions(std::slice::from_ref(&d.text_orig)).into_iter().next().flatten().expect("analyzes");
