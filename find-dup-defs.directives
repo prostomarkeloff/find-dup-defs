@@ -1,13 +1,20 @@
 # find-dup-defs self-dogfood directives.
 #
 # The genuinely-shareable canon logic (alpha-rename, count_loc, is_upper_snake, the KindSpec
-# constants, AnalyzedFn) was extracted into the `canon-core` crate. What remains below is
+# constants, AnalyzedFn, the lens machinery, the dotted-path form) lives in `dup-defs-core`. What
+# remains below is
 # IRREDUCIBLE cross-frontend structure: each `*-canon` crate implements the same Frontend contract
 # over a *different* parser AST (Ruff / syn / oxc), so these can't be merged into one function
 # without erasing the per-crate API. De-escalated (ERROR -> WARNING) rather than suppressed, so they
 # stay visible as advisory.
 #
 # Usage: find-dup-defs crates -D @find-dup-defs.directives
+
+# The golden fixtures are duplicated ON PURPOSE — they exist to be found. Suppressed rather than
+# de-escalated: an advisory finding about a file whose whole job is to contain the finding is not
+# advice, it is the fixture reading its own label back. Without this the gate has always been red on
+# the fixtures alone, which is why the claim of "0 ERROR" had quietly stopped being true.
+suppress:*@*/tests/fixtures/*=fixture duplication is the fixture
 
 # Per-frontend kind subset — Python declares 5 kinds, Rust/TS 6 (interfaces). Different content.
 de-escalate:<constants>KINDS@*canon/src/frontend.rs=per-frontend kind subset, not duplication
@@ -29,3 +36,22 @@ de-escalate:<methods>*::scan@*canon/src/frontend.rs=Frontend trait impl, identic
 
 # The Collect visitor — same shape, but walks a different AST (Ruff/syn/oxc node types) per crate.
 de-escalate:<classes>Collect@*canon/src/canon.rs=per-language AST visitor, different node types
+
+# The perspective walks. Same shape three times over three parser ASTs — the same irreducibility as
+# `Collect` above, one rung up: each answers the ten lens questions from Ruff / syn / oxc nodes, and
+# merging them would mean one walk that knows all three grammars.
+de-escalate:<functions>callable_facts@*canon/src/lenses.rs=per-language lens projection
+de-escalate:<functions>used_names@*canon/src/canon.rs=per-language identifier walk
+de-escalate:<classes>Walked@*canon/src/lenses.rs=per-language fact record, different node types
+de-escalate:<methods>Walk::tag@*canon/src/lenses.rs=thin per-crate forwarder to dup_defs_core::lens::control_tag
+de-escalate:<methods>Walk::nested@*canon/src/lenses.rs=per-language depth guard
+de-escalate:<methods>FactWalk::nested@*canon/src/lenses.rs=per-language depth guard
+
+# The statement-stream walkers — one per language that has block structure to walk, over its own AST.
+de-escalate:<classes>StreamWalk@*canon/src/canon.rs=per-language statement walker, different node types
+de-escalate:<methods>StreamWalk::push@*canon/src/canon.rs=thin per-crate accumulator
+
+# The opt-in `lenses` kind list and the trait method that selects it — per-frontend by construction,
+# same reason as `KINDS` above.
+de-escalate:<constants>KINDS_WITH_LENSES@*canon/src/frontend.rs=per-frontend kind subset, not duplication
+de-escalate:<methods>*::kinds@*canon/src/frontend.rs=Frontend trait impl, per-frontend kind list

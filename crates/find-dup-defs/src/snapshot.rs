@@ -192,6 +192,9 @@ pub fn load_defs(dir: &Path) -> std::io::Result<Vec<Def>> {
                     canon_dialect: dialect_from(&a.dialect, a.cpython_ast),
                 }),
                 thickness: None,
+                // A snapshot replays the body passes; the perspective facets are not serialized, and
+                // a pass that reads them sees "nothing reported" rather than a fabricated stream.
+                facets: dup_defs_core::Facets::default(),
             }
         })
         .collect();

@@ -13,7 +13,7 @@ build-backend = "maturin"
 [project]
 name = "find-dup-defs"
 dynamic = ["version"]
-description = "Find duplicate / near-duplicate top-level definitions across a codebase via clone clustering — Python, Rust, and TypeScript frontends, plus an opt-in structural helper-extraction pass."
+description = "Find duplicate / near-duplicate top-level definitions across a codebase via clone clustering — Python, Rust, and TypeScript frontends, plus opt-in passes for structural helper extraction, perspective lenses, and divergence between definitions about one thing."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

@@ -14,7 +14,7 @@ use crate::defs::scan_source;
 
 // The `KindSpec` vocabulary is shared across frontends — re-exported from `find-dup-defs-canon` so callers
 // (`crate::frontend::METHODS`, …) are unchanged. Python declares five kinds; `interfaces` is TS-only.
-pub use find_dup_defs_canon::kinds::{
+pub use dup_defs_core::kinds::{
     CLASSES, CONSTANTS, FUNCTIONS, LENSES, METHODS, TYPE_ALIASES,
 };
 
@@ -27,23 +27,16 @@ static KINDS: &[&KindSpec] = &[&FUNCTIONS, &METHODS, &CLASSES, &CONSTANTS, &TYPE
 static KINDS_WITH_LENSES: &[&KindSpec] =
     &[&FUNCTIONS, &METHODS, &CLASSES, &CONSTANTS, &TYPE_ALIASES, &LENSES];
 
-/// Lenses that vote when the `lenses` kind is asked for. All of them: a lens is a weight on one
-/// scale rather than a separate question, and the corpus IDF already silences the ones a given tree
-/// has nothing to say through.
-pub(crate) fn enabled_lenses(opts: &ScanOpts) -> Vec<crate::lenses::Lens> {
-    if opts.wants("lenses") {
-        crate::lenses::Lens::all().to_vec()
-    } else {
-        Vec::new()
-    }
-}
+// Which lenses vote, and the record they stitch into, are the shared module's — re-exported here so
+// the frontend's own call sites read the same as they did.
+pub(crate) use dup_defs_core::lens::enabled_lenses;
 
 /// Map the extraction's kind string to its `&'static KindSpec`. Internal to the frontend — the
 /// engine never does this; it reads `KindSpec` fields directly. Delegates to the shared vocabulary
 /// rather than re-listing it: a second copy of the same id→spec table drifts the moment a kind is
 /// added to one and not the other.
 pub(crate) fn kind_spec(id: &str) -> &'static KindSpec {
-    find_dup_defs_canon::kind_spec(id)
+    dup_defs_core::kind_spec(id)
         .unwrap_or_else(|| unreachable!("py-canon emitted unknown kind {id:?}"))
 }
 
@@ -77,8 +70,8 @@ impl Frontend for Python {
             // The `use` lens sees a definition from outside, so its facts exist only once every
             // file has been read; scoring is corpus-relative for the same reason.
             let facts = crate::uses::use_facts(files, &defs);
-            crate::lenses::merge_use_facts(&mut defs, facts);
-            crate::lenses::score_lens_defs(&mut defs);
+            dup_defs_core::lens::merge_use_facts(&mut defs, facts);
+            dup_defs_core::lens::score_lens_defs(&mut defs);
         }
         defs
     }

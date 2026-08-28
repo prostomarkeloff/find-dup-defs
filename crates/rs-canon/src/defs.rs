@@ -22,15 +22,16 @@
 
 use std::sync::Arc;
 
-use dup_defs_core::{Analysis, CanonDialect, Def, KindSpec, LineMap};
+use dup_defs_core::{Analysis, CanonDialect, Def, Facets, KindSpec, LineMap, ScanOpts};
+use std::collections::HashMap;
 use syn::spanned::Spanned;
 use syn::{Attribute, Block, Expr, FnArg, ImplItem, Item, Signature, Stmt, TraitItem, Type};
 
 use crate::canon::{
     analyze_impl_fn, analyze_item_fn, analyze_trait_fn, enum_canon, struct_canon, trait_canon,
-    union_canon, AnalyzedFn,
+    union_canon, used_names, AnalyzedFn,
 };
-use find_dup_defs_canon::{count_loc, is_upper_snake};
+use dup_defs_core::{count_loc, is_upper_snake};
 
 use crate::frontend::{CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
 
@@ -134,8 +135,56 @@ fn qualify(prefix: &str, name: &str) -> String {
     }
 }
 
-fn analysis_from((cluster, xname, lines, size): AnalyzedFn) -> (String, Analysis) {
-    (cluster, Analysis { xname_canonical: xname, type3_lines: lines, size, canon_dialect: CanonDialect::Rust })
+/// What a definition contributes beyond its location: its canonical forms and, for a callable, the
+/// facets the perspective passes read.
+///
+/// One value rather than three parameters on [`Builder::push`], because the three are not
+/// independent — a body-only kind has a cluster canonical and nothing else, a callable has all of
+/// them — and passing them separately means every non-callable call site spells out two `None`s and
+/// a `default()` that say nothing.
+struct DefCanon {
+    cluster: Option<String>,
+    analysis: Option<Analysis>,
+    facets: Facets,
+}
+
+impl DefCanon {
+    /// A body-bearing kind clustered by its canonical text alone (struct, enum, trait).
+    fn body(cluster: Option<String>) -> Self {
+        Self { cluster, analysis: None, facets: Facets::default() }
+    }
+
+    /// A callable: canonical forms, statement stream, and the paths it reaches.
+    fn callable(analyzed: AnalyzedFn, block: &syn::Block, imports: &HashMap<String, Arc<str>>) -> Self {
+        let AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, statements, size } = analyzed;
+        Self {
+            cluster: Some(cluster_canonical),
+            analysis: Some(Analysis {
+                xname_canonical,
+                type3_lines,
+                size,
+                canon_dialect: CanonDialect::Rust,
+            }),
+            facets: Facets { statements, reaches: reached_paths(block, imports) },
+        }
+    }
+}
+
+/// The dotted paths one callable reaches: for every path head it mentions that the file `use`d, the
+/// whole path that name stands for.
+///
+/// Resolved here rather than in the engine because only the frontend knows what its language calls a
+/// path and what a `use` binds. What the engine gets is the answer, in the one dotted form every
+/// language normalizes to.
+fn reached_paths(block: &syn::Block, imports: &HashMap<String, Arc<str>>) -> Vec<Arc<str>> {
+    if imports.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Arc<str>> =
+        used_names(block).iter().filter_map(|name| imports.get(name).map(Arc::clone)).collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// One builder so every push site stays uniform.
@@ -143,11 +192,39 @@ struct Builder<'a> {
     source: &'a str,
     lines: &'a LineMap<'a>,
     file: &'a Arc<str>,
+    /// What each name this file `use`s stands for — resolved once, read by every callable.
+    imports: HashMap<String, Arc<str>>,
+    /// Which lenses this run asked for; empty when it did not ask.
+    lenses: Vec<dup_defs_core::lens::Lens>,
+    /// Names the file itself introduced — what every lens erases before it looks.
+    file_names: std::collections::HashSet<String>,
     out: &'a mut Vec<Def>,
 }
 
 impl Builder<'_> {
-    #[allow(clippy::too_many_arguments)]
+    /// One lens [`Def`] for this definition, when the run asked for lenses and the projection has
+    /// enough to say. The record, the thinness floor and the scoring are the shared module's.
+    fn push_lens(
+        &mut self,
+        name: &str,
+        attrs: &[Attribute],
+        span: proc_macro2::Span,
+        facts: &dup_defs_core::lens::LensFacts,
+    ) {
+        if self.lenses.is_empty() {
+            return;
+        }
+        let (start, end) = def_range(self.source, attrs, span);
+        let (line, col) = self.lines.loc0(start);
+        let loc = count_loc(&self.source[start..end]);
+        let site = dup_defs_core::lens::DefSite { name, file: self.file, line, col, loc };
+        if let Some(def) =
+            dup_defs_core::lens::lens_def("rs", CanonDialect::Rust, &site, &self.lenses, facts)
+        {
+            self.out.push(def);
+        }
+    }
+
     fn push(
         &mut self,
         kind: &'static KindSpec,
@@ -155,9 +232,9 @@ impl Builder<'_> {
         attrs: &[Attribute],
         span: proc_macro2::Span,
         args: usize,
-        cluster_canonical: Option<String>,
-        analysis: Option<Analysis>,
+        canon: DefCanon,
     ) {
+        let DefCanon { cluster: cluster_canonical, analysis, facets } = canon;
         let (start, end) = def_range(self.source, attrs, span);
         let (line, col) = self.lines.loc0(start);
         let text_orig = self.source[start..end].to_owned();
@@ -175,6 +252,7 @@ impl Builder<'_> {
             cluster_canonical,
             analysis,
             thickness: None,
+            facets,
         });
     }
 }
@@ -192,43 +270,63 @@ fn walk_item(item: &Item, prefix: &str, b: &mut Builder) {
             if is_trivial_block(&f.block) {
                 return;
             }
-            let (cluster, analysis) = analysis_from(analyze_item_fn(f));
+            if !b.lenses.is_empty() {
+                let scope = crate::canon::scope_canonical(&f.sig, &f.block, &b.file_names);
+                let facts =
+                    crate::lenses::callable_facts(&f.sig, &f.block, &f.attrs, &b.file_names, scope);
+                b.push_lens(&qualify(prefix, &f.sig.ident.to_string()), &f.attrs, f.span(), &facts);
+            }
+            let canon = DefCanon::callable(analyze_item_fn(f), &f.block, &b.imports);
             b.push(
                 &FUNCTIONS,
                 qualify(prefix, &f.sig.ident.to_string()),
                 &f.attrs,
                 f.span(),
                 count_args(&f.sig),
-                Some(cluster),
-                Some(analysis),
+                canon,
             );
         }
         Item::Struct(s) => {
-            b.push(&CLASSES, qualify(prefix, &s.ident.to_string()), &s.attrs, s.span(), 0, Some(struct_canon(s)), None);
+            if !b.lenses.is_empty() {
+                let facts = crate::lenses::struct_facts(s, &b.file_names);
+                b.push_lens(&qualify(prefix, &s.ident.to_string()), &s.attrs, s.span(), &facts);
+            }
+            b.push(&CLASSES, qualify(prefix, &s.ident.to_string()), &s.attrs, s.span(), 0, DefCanon::body(Some(struct_canon(s))));
         }
         Item::Enum(e) => {
-            b.push(&CLASSES, qualify(prefix, &e.ident.to_string()), &e.attrs, e.span(), 0, Some(enum_canon(e)), None);
+            if !b.lenses.is_empty() {
+                let facts = crate::lenses::enum_facts(e, &b.file_names);
+                b.push_lens(&qualify(prefix, &e.ident.to_string()), &e.attrs, e.span(), &facts);
+            }
+            b.push(&CLASSES, qualify(prefix, &e.ident.to_string()), &e.attrs, e.span(), 0, DefCanon::body(Some(enum_canon(e))));
         }
         Item::Union(u) => {
-            b.push(&CLASSES, qualify(prefix, &u.ident.to_string()), &u.attrs, u.span(), 0, Some(union_canon(u)), None);
+            b.push(&CLASSES, qualify(prefix, &u.ident.to_string()), &u.attrs, u.span(), 0, DefCanon::body(Some(union_canon(u))));
         }
         Item::Trait(t) => {
-            b.push(&INTERFACES, qualify(prefix, &t.ident.to_string()), &t.attrs, t.span(), 0, Some(trait_canon(t)), None);
+            b.push(&INTERFACES, qualify(prefix, &t.ident.to_string()), &t.attrs, t.span(), 0, DefCanon::body(Some(trait_canon(t))));
             let owner = qualify(prefix, &t.ident.to_string());
             for ti in &t.items {
                 if let TraitItem::Fn(tf) = ti {
                     if tf.default.is_none() || is_trivial_block(tf.default.as_ref().unwrap()) {
                         continue;
                     }
-                    let (cluster, analysis) = analysis_from(analyze_trait_fn(tf).unwrap());
+                    let body = tf.default.as_ref().expect("checked above");
+                    if !b.lenses.is_empty() {
+                        let scope = crate::canon::scope_canonical(&tf.sig, body, &b.file_names);
+                        let facts =
+                            crate::lenses::callable_facts(&tf.sig, body, &tf.attrs, &b.file_names, scope);
+                        b.push_lens(&format!("{owner}::{}", tf.sig.ident), &tf.attrs, tf.span(), &facts);
+                    }
+                    let canon =
+                        DefCanon::callable(analyze_trait_fn(tf).expect("has a default body"), body, &b.imports);
                     b.push(
                         &METHODS,
                         format!("{owner}::{}", tf.sig.ident),
                         &tf.attrs,
                         tf.span(),
                         count_args(&tf.sig),
-                        Some(cluster),
-                        Some(analysis),
+                        canon,
                     );
                 }
             }
@@ -240,27 +338,32 @@ fn walk_item(item: &Item, prefix: &str, b: &mut Builder) {
                     if is_trivial_block(&f.block) {
                         continue;
                     }
-                    let (cluster, analysis) = analysis_from(analyze_impl_fn(f));
+                    if !b.lenses.is_empty() {
+                        let scope = crate::canon::scope_canonical(&f.sig, &f.block, &b.file_names);
+                        let facts =
+                            crate::lenses::callable_facts(&f.sig, &f.block, &f.attrs, &b.file_names, scope);
+                        b.push_lens(&format!("{owner}::{}", f.sig.ident), &f.attrs, f.span(), &facts);
+                    }
+                    let canon = DefCanon::callable(analyze_impl_fn(f), &f.block, &b.imports);
                     b.push(
                         &METHODS,
                         format!("{owner}::{}", f.sig.ident),
                         &f.attrs,
                         f.span(),
                         count_args(&f.sig),
-                        Some(cluster),
-                        Some(analysis),
+                        canon,
                     );
                 }
             }
         }
         Item::Const(c) if is_upper_snake(&c.ident.to_string()) => {
-            b.push(&CONSTANTS, qualify(prefix, &c.ident.to_string()), &c.attrs, c.span(), 0, None, None);
+            b.push(&CONSTANTS, qualify(prefix, &c.ident.to_string()), &c.attrs, c.span(), 0, DefCanon::body(None));
         }
         Item::Static(s) if is_upper_snake(&s.ident.to_string()) => {
-            b.push(&CONSTANTS, qualify(prefix, &s.ident.to_string()), &s.attrs, s.span(), 0, None, None);
+            b.push(&CONSTANTS, qualify(prefix, &s.ident.to_string()), &s.attrs, s.span(), 0, DefCanon::body(None));
         }
         Item::Type(t) => {
-            b.push(&TYPE_ALIASES, qualify(prefix, &t.ident.to_string()), &t.attrs, t.span(), 0, None, None);
+            b.push(&TYPE_ALIASES, qualify(prefix, &t.ident.to_string()), &t.attrs, t.span(), 0, DefCanon::body(None));
         }
         Item::Mod(m) => {
             if let Some((_, items)) = &m.content {
@@ -276,11 +379,24 @@ fn walk_item(item: &Item, prefix: &str, b: &mut Builder) {
 /// empty vec if the file doesn't parse (syn is not error-recovering — a single bad file drops
 /// out rather than poisoning the run).
 #[must_use]
-pub fn scan_source(source: &str, file: &Arc<str>) -> Vec<Def> {
+pub fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec<Def> {
     let Ok(ast) = syn::parse_file(source) else { return Vec::new() };
     let lines = LineMap::new(source);
     let mut out = Vec::new();
-    let mut b = Builder { source, lines: &lines, file, out: &mut out };
+    // The file's `use` table, resolved once: what each bound name stands for.
+    let imports: HashMap<String, Arc<str>> = crate::canon::file_imports(&ast).into_iter().collect();
+    let lenses = dup_defs_core::lens::enabled_lenses(opts);
+    // Every lens reads the file's own bound names, so they are collected once per file.
+    let file_names = (!lenses.is_empty()).then(|| crate::lenses::file_bound_names(&ast));
+    let mut b = Builder {
+        source,
+        lines: &lines,
+        file,
+        imports,
+        lenses,
+        file_names: file_names.unwrap_or_default(),
+        out: &mut out,
+    };
     walk_items(&ast.items, "", &mut b);
     // Collapse `#[cfg(...)]`-gated siblings: two items with the same (kind, qualified name) in one
     // file only compile when they're mutually-exclusive `cfg` alternatives (`#[cfg(unix)] fn x`
@@ -295,15 +411,128 @@ pub fn scan_source(source: &str, file: &Arc<str>) -> Vec<Def> {
 #[cfg(test)]
 mod tests {
     use super::scan_source;
+    use dup_defs_core::ScanOpts;
     use std::sync::Arc;
 
     fn defs(src: &str) -> Vec<(String, String)> {
         let f: Arc<str> = Arc::from("t.rs");
-        scan_source(src, &f).into_iter().map(|d| (d.kind.id.to_owned(), d.name)).collect()
+        scan_source(src, &f, &ScanOpts::default()).into_iter().map(|d| (d.kind.id.to_owned(), d.name)).collect()
     }
 
     fn names_of_kind(src: &str, kind: &str) -> Vec<String> {
         defs(src).into_iter().filter(|(k, _)| k == kind).map(|(_, n)| n).collect()
+    }
+
+    fn lens_record(src: &str, name: &str) -> Vec<String> {
+        let f: Arc<str> = Arc::from("t.rs");
+        let kinds = vec!["lenses".to_owned()];
+        let opts = ScanOpts { kinds: Some(&kinds) };
+        scan_source(src, &f, &opts)
+            .into_iter()
+            .find(|d| d.kind.id == "lenses" && d.name == name)
+            .map(|d| d.analysis.expect("lens analysis").type3_lines)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn lenses_are_absent_unless_the_run_asks_for_them() {
+        let src = "fn f(x: u8) -> u8 {\n    if x > 0 {\n        g(x);\n    }\n    x\n}\n";
+        let f: Arc<str> = Arc::from("t.rs");
+        let defs = scan_source(src, &f, &ScanOpts::default());
+        assert!(defs.iter().all(|d| d.kind.id != "lenses"), "the default run stays byte-identical");
+    }
+
+    #[test]
+    fn a_rust_callable_projects_through_every_lens_it_can_answer() {
+        let src = "fn f(x: u8) -> Result<u8, MyError> {\n    let _guard = lock();\n    for i in 0..x {\n        emit(i);\n    }\n    if x == 0 {\n        return Err(MyError::Empty);\n    }\n    Ok(x)\n}\n";
+        let facts = lens_record(src, "f");
+        assert!(facts.contains(&"outgoing:emit".to_owned()), "{facts:?}");
+        assert!(facts.contains(&"effects:lock".to_owned()), "{facts:?}");
+        assert!(facts.contains(&"control:for".to_owned()), "{facts:?}");
+        assert!(facts.contains(&"control:+return".to_owned()), "nesting rides on the tag: {facts:?}");
+        // The path is kept whole: the enum is the failure family, the variant the failure.
+        assert!(facts.contains(&"failures:MyError::Empty".to_owned()), "{facts:?}");
+        assert!(facts.contains(&"signature:ret:Result".to_owned()), "{facts:?}");
+        assert!(facts.iter().any(|f| f.starts_with("scope:")), "the widest rung rides as one fact: {facts:?}");
+    }
+
+    #[test]
+    fn a_binding_never_read_again_is_what_rust_holds_open() {
+        // Rust has no `with`. Its answer to "what does it hold open" is a guard — a binding whose
+        // value is never read again and whose only job is to live until the scope ends. Structural,
+        // not a list of blessed names: the same call bound to a name that IS read is not a guard.
+        let guard = "fn f() -> u8 {\n    let _g = lock();\n    0\n}\n";
+        let used = "fn f() -> u8 {\n    let g = lock();\n    g.value()\n}\n";
+        assert!(lens_record(guard, "f").contains(&"resources:lock".to_owned()), "{:?}", lens_record(guard, "f"));
+        assert!(!lens_record(used, "f").contains(&"resources:lock".to_owned()), "{:?}", lens_record(used, "f"));
+    }
+
+    #[test]
+    fn a_struct_declares_a_shape_as_a_set() {
+        let a = "#[derive(Clone)]\nstruct S { a: u8, b: Vec<String> }\n";
+        let b = "#[derive(Clone)]\nstruct S { b: Vec<String>, a: u8 }\n";
+        // A declaration is a set: the same struct with its fields reordered is the same struct.
+        assert_eq!(lens_record(a, "S"), lens_record(b, "S"));
+        assert!(lens_record(a, "S").contains(&"decorators:derive".to_owned()));
+    }
+
+    #[test]
+    fn a_callable_reports_its_statement_stream_with_nesting() {
+        let src = "fn f(xs: &[u8]) -> u8 {\n    for x in xs {\n        g(*x);\n    }\n    0\n}\n";
+        let f: Arc<str> = Arc::from("t.rs");
+        let defs = scan_source(src, &f, &ScanOpts::default());
+        let d = defs.iter().find(|d| d.name == "f").expect("f");
+        let depths: Vec<u16> = d.facets.statements.iter().map(|s| s.depth).collect();
+        // Header at 0, body at 1, and the call inside the loop at 2. Rust's control flow is
+        // expressions, so this is exactly the structure `type3_lines` cannot show: there the whole
+        // `for` — loop and body together — is one line.
+        assert_eq!(depths, vec![0, 1, 2, 1], "statements: {:?}", d.facets.statements);
+        assert!(d.facets.statements[0].line.starts_with("Func("), "the head is the definition itself");
+        assert!(d.facets.statements[1].line.starts_with("For("), "the loop contributes a header");
+    }
+
+    #[test]
+    fn an_if_else_chain_keeps_its_branches_as_siblings() {
+        let src = "fn f(n: u8) -> u8 {\n    if n > 1 {\n        g();\n    } else if n > 0 {\n        h();\n    } else {\n        k();\n    }\n    n\n}\n";
+        let f: Arc<str> = Arc::from("t.rs");
+        let defs = scan_source(src, &f, &ScanOpts::default());
+        let d = defs.iter().find(|d| d.name == "f").expect("f");
+        let shape: Vec<(u16, String)> = d
+            .facets
+            .statements
+            .iter()
+            .map(|s| (s.depth, s.line.split('(').next().unwrap_or("").to_owned()))
+            .collect();
+        // An `else if` is a sibling of its `else`, not a level deeper — what the source means, and
+        // what Python's `elif` renders as, so the two languages' streams stay comparable.
+        assert_eq!(
+            shape,
+            vec![
+                (0, "Func".into()),
+                (1, "If".into()),
+                (2, "ExprStmt".into()),
+                (1, "Else".into()),
+                (1, "If".into()),
+                (2, "ExprStmt".into()),
+                (1, "Else".into()),
+                (2, "ExprStmt".into()),
+                (1, "Tail".into()),
+            ],
+            "statements: {:?}",
+            d.facets.statements
+        );
+    }
+
+    #[test]
+    fn a_callable_reports_the_use_paths_it_reaches() {
+        let src = "use a::b::c;\nuse d::e as z;\nuse q::*;\n\nfn f() -> u8 {\n    c()\n}\n";
+        let f: Arc<str> = Arc::from("t.rs");
+        let defs = scan_source(src, &f, &ScanOpts::default());
+        let d = defs.iter().find(|d| d.name == "f").expect("f");
+        let reaches: Vec<&str> = d.facets.reaches.iter().map(|r| &**r).collect();
+        // `c` is used and its whole path reported; `z` is bound and never touched; the glob binds
+        // nothing this can attribute a use to, and inventing reach for it would be a guess.
+        assert_eq!(reaches, vec!["a.b.c"]);
     }
 
     #[test]
@@ -425,7 +654,7 @@ fn real(x: i32) -> i32 { let y = x + 1; y * 2 }
         // method's canon does not mention a `self` param slot.
         let src = "struct S;\nimpl S { fn add(&self, a: i32, b: i32) -> i32 { let t = a + b; t } }\nfn add_free(a: i32, b: i32) -> i32 { let t = a + b; t }\n";
         let f: Arc<str> = Arc::from("t.rs");
-        let all = scan_source(src, &f);
+        let all = scan_source(src, &f, &ScanOpts::default());
         let method = all.iter().find(|d| d.name == "S::add").expect("method");
         let free = all.iter().find(|d| d.name == "add_free").expect("free fn");
         // xname canonicals are equal once the receiver is dropped and names are alpha-renamed.

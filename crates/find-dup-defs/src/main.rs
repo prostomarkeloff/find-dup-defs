@@ -109,6 +109,20 @@ struct Cli {
     /// advisory / codometry, never an ERROR gate.
     #[arg(long)]
     patternology: bool,
+    /// Run the converge pass: **divergence** — where two definitions about the same thing stop
+    /// agreeing. Two anchors on one currency: a shared statement (same words, different names ⇒ one
+    /// decision made in two ways) and a shared subject, the module both reach (same entity and same
+    /// shape, different words ⇒ one procedure written twice). Off by default and always advisory —
+    /// the output is a ranked list with no threshold, never an ERROR gate. Works for every language
+    /// whose frontend fills the statement stream and the reach set.
+    #[arg(long)]
+    converge: bool,
+    /// How many converge findings of each kind (pairs, families) to report, strongest first.
+    /// `0` prints every one. Capped by default because converge reports a *ranking* with no
+    /// threshold in it, where every other pass reports a set — and a ranking's tail is the part the
+    /// ordering exists to push away, not a set of weaker findings.
+    #[arg(long, default_value_t = find_dup_defs::DEFAULT_CONVERGE_TOP)]
+    converge_top: usize,
     /// Patternology structural-cosine detection floor (whole-function family edge when cosine ≥ this).
     /// Structural similarity is noisier than textual, so the floor sits higher than `--type3-theta`.
     /// Families are maximal cliques (every pair ≥ this), so a moderate floor is safe — no blob.
@@ -396,6 +410,8 @@ fn main() {
         error_threshold: cli.error_threshold,
         type3_theta: cli.type3_theta,
         patternology: cli.patternology,
+        converge: cli.converge,
+        converge_top: cli.converge_top,
         pattern_theta: cli.pattern_theta,
         pattern_support: cli.pattern_support,
         // No CLI flag — directive-only (`-D settings:pattern-min-thickness=…`), applied below via
@@ -512,10 +528,24 @@ fn main() {
     }
     // Detection/section order (constants, fn-name-gated, fn-cross-name, fn-Type-3, classes,
     // type-aliases), then within a section by name and first member — deterministic + reproducible.
+    //
+    // 🔴 Except converge, which is a **ranking**: its sections are ordered strongest first. Every
+    // other pass reports a set — a cluster either is a duplicate or is not, and alphabetical order is
+    // as good as any and reproduces byte-for-byte. Converge reports a list with no threshold, where
+    // the order *is* the finding; alphabetical there buries the answer under whatever happens to
+    // start with an underscore. Its sections sit past every other one (`CONVERGE_SECTION_OFFSET`), so
+    // no other section's bytes move.
     timed("sort-find", || {
         findings.sort_by(|a, b| {
             section_index(a)
                 .cmp(&section_index(b))
+                .then_with(|| {
+                    if a.pass.starts_with("converge") {
+                        b.thickness.partial_cmp(&a.thickness).unwrap_or(std::cmp::Ordering::Equal)
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
                 .then(a.name.cmp(&b.name))
                 .then(a.members[0].cmp(&b.members[0]))
         });
@@ -1523,6 +1553,7 @@ fn report_sections(
     warn: f64,
     error: f64,
     include_patterns: bool,
+    include_converge: bool,
     scan_opts: &dup_defs_core::ScanOpts,
 ) -> Vec<(usize, String)> {
     let sim = format!("AST sim warn={warn} error={error}");
@@ -1548,6 +1579,16 @@ fn report_sections(
                     format!("helper candidates in {} (patternology — collapsible duplication)", k.noun_plural),
                 ));
             }
+            if include_converge {
+                rows.push((
+                    base + find_dup_defs::converge::CONVERGE_SECTION_OFFSET,
+                    format!("divergences in {} (converge — one thing done twice, and where they part)", k.noun_plural),
+                ));
+                rows.push((
+                    base + find_dup_defs::converge::FAMILY_SECTION_OFFSET,
+                    format!("families of {} (converge — many places, one subject, one shape)", k.noun_plural),
+                ));
+            }
         }
     }
     rows.sort_by_key(|(idx, _)| *idx);
@@ -1564,7 +1605,8 @@ fn format_report(
     scan_opts: &dup_defs_core::ScanOpts,
 ) -> String {
     let include_patterns = findings.iter().any(|f| f.pass == "pattern");
-    let sections = report_sections(frontends, warn, error, include_patterns, scan_opts);
+    let include_converge = findings.iter().any(|f| f.pass == "converge" || f.pass == "converge-family");
+    let sections = report_sections(frontends, warn, error, include_patterns, include_converge, scan_opts);
 
     // `short_path` does two `fs::canonicalize` calls per member (realpath → getattrlist/open/stat
     // per path component) — ~90% of render at scale, repeated for every one of ~200k members. Hoist

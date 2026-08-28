@@ -19,6 +19,7 @@
 //! Each cluster is graded ERROR / WARNING / INFO, with optional thickness-based
 //! demotion/escalation passes the caller can request via [`PipelineOpts`].
 
+pub mod converge;
 pub mod patternology;
 mod simgraph;
 pub mod type3;
@@ -64,6 +65,11 @@ pub const PATTERN_WARNING_THETA: f64 = 0.92;
 /// sections are filed as an APPENDIX after every existing section via this large base-relative
 /// offset — no existing index moves, so the legacy report ordering is byte-identical.
 pub const PATTERN_SECTION_OFFSET: usize = 1000;
+
+/// Default `--converge-top`: how many divergences of each kind are worth reading in one sitting.
+/// Not a threshold on what is a finding — the pass has none — but on how much of a ranking a report
+/// should be.
+pub const DEFAULT_CONVERGE_TOP: usize = 50;
 
 /// Directory-name blacklist for source discovery — virtualenvs, package
 /// caches, build artefacts, vendored tooling, JS bundler outputs.
@@ -391,6 +397,8 @@ pub fn section_index(f: &Finding) -> usize {
             "cross-name" => 1,
             "type-3" => 2,
             "pattern" => PATTERN_SECTION_OFFSET,
+            "converge" => converge::CONVERGE_SECTION_OFFSET,
+            "converge-family" => converge::FAMILY_SECTION_OFFSET,
             _ => 0,
         }
     } else {
@@ -826,6 +834,12 @@ pub struct PipelineOpts {
     /// applies it explicitly via `-D settings:pattern-min-thickness=…`. Only patternology (`pass ==
     /// "pattern"`) findings are affected; the duplicate gate is untouched.
     pub pattern_min_thickness: f64,
+    /// Run the converge pass (divergence, by two anchors). Opt-in (default `false`) and always
+    /// advisory: its output is a ranked list with no threshold, which is not a thing to gate on.
+    pub converge: bool,
+    /// How many converge findings of each kind to report, strongest first; `0` reports all of them.
+    /// See [`converge::pass_converge`] for why this pass is capped when no other is.
+    pub converge_top: usize,
     /// Minimum cluster size (default `2`).
     pub min_size: usize,
     /// De-escalate ERRORs whose `thickness` is below this to WARNING (default
@@ -860,6 +874,8 @@ impl PipelineOpts {
             error_threshold: 0.85,
             type3_theta: 0.7,
             patternology: false,
+            converge: false,
+            converge_top: DEFAULT_CONVERGE_TOP,
             pattern_theta: 0.85,
             pattern_support: 3,
             pattern_min_thickness: 0.0,
@@ -949,6 +965,9 @@ pub fn cluster(mut defs: Vec<Def>, opts: &PipelineOpts) -> Vec<Finding> {
     }
     if opts.patternology {
         timed("pass4-pattern", || findings.extend(pass_patternology(&defs, opts.pattern_theta, opts.pattern_support, opts.gpu)));
+    }
+    if opts.converge {
+        timed("pass5-converge", || findings.extend(converge::pass_converge(&defs, opts.converge_top)));
     }
 
     // Directive-driven patternology calibration: drop advisory candidates below the explicit

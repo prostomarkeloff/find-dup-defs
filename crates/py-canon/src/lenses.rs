@@ -1,4 +1,13 @@
-//! **Lenses** — the perspective axis, the one that is *not* a rung of the erasure ladder.
+//! **Lenses for Python** — the AST walk, and only the AST walk.
+//!
+//! The vocabulary (which lenses exist, what they are called), the stitching of their facts into one
+//! record, the merge of use-site facts and the corpus scoring all live in
+//! [`dup_defs_core::lens`], shared by every frontend. What is here is the part that genuinely
+//! cannot be shared: how Ruff's AST answers each of the ten questions.
+//!
+//! That split is why lenses stopped being a Python-only feature. The questions were never
+//! Python-specific — every language has "what does this call" and "how does this fail" — but the
+//! machinery around them used to live in this file.
 //!
 //! The ladder (locals → own name → module names → everything) always canonicalizes the same text:
 //! the definition's body. A lens canonicalizes a *different projection* of the same definition, so
@@ -36,70 +45,11 @@
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
-use dup_defs_core::{Analysis, CanonDialect, Def};
+use dup_defs_core::{CanonDialect, Def};
+pub(crate) use dup_defs_core::lens::Lens;
+use dup_defs_core::lens::{lens_def as shared_lens_def, DefSite, LensFacts};
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{self as ast, Expr, Stmt};
-
-use crate::frontend::LENSES;
-
-/// A projection with fewer facts than this carries no shape — two definitions that each call one
-/// external thing match trivially. The lens counterpart of the Type-3 `SHINGLE_LINES` floor.
-const MIN_FACTS: usize = 3;
-
-/// The perspectives. Each is a `(Def → Vec<String>)` projection plus the kind it is reported under.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Lens {
-    Outgoing,
-    Effects,
-    Control,
-    Failures,
-    Resources,
-    Signature,
-    Decorators,
-    Schema,
-    /// The body itself, with every name the module introduced erased — the widest rung of the
-    /// erasure ladder, seated here as a perspective among the rest.
-    Scope,
-    /// The definition's *use sites*: the statements elsewhere in the tree that mention its name.
-    /// Unlike every other lens this cannot be computed from the definition alone, so its facts are
-    /// merged in by [`merge_use_facts`] once the whole tree has been walked.
-    Use,
-}
-
-impl Lens {
-    /// The prefix this lens stamps on its facts, so the stitched record stays attributable and two
-    /// lenses can never accidentally agree on the same string.
-    pub(crate) fn tag(self) -> &'static str {
-        match self {
-            Lens::Outgoing => "outgoing",
-            Lens::Effects => "effects",
-            Lens::Control => "control",
-            Lens::Failures => "failures",
-            Lens::Resources => "resources",
-            Lens::Signature => "signature",
-            Lens::Decorators => "decorators",
-            Lens::Schema => "schema",
-            Lens::Scope => "scope",
-            Lens::Use => "use",
-        }
-    }
-
-    /// Every lens, in report order.
-    pub(crate) fn all() -> [Lens; 10] {
-        [
-            Lens::Outgoing,
-            Lens::Effects,
-            Lens::Control,
-            Lens::Failures,
-            Lens::Resources,
-            Lens::Signature,
-            Lens::Decorators,
-            Lens::Schema,
-            Lens::Scope,
-            Lens::Use,
-        ]
-    }
-}
 
 // ── Fact collection ────────────────────────────────────────────────────────
 
@@ -178,7 +128,7 @@ impl<'a> FactWalk<'a> {
     }
 
     fn tag(&mut self, tag: &str) {
-        self.facts.control.push(format!("{}{tag}", "+".repeat(self.depth.min(4))));
+        self.facts.control.push(dup_defs_core::lens::control_tag(self.depth, tag));
     }
 
     fn nested(&mut self, f: impl FnOnce(&mut Self)) {
@@ -433,27 +383,27 @@ fn project(
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
-/// Facts from *every* enabled lens, each prefixed with its lens tag. Fewer than [`MIN_FACTS`]
-/// facts overall ⇒ nothing to say about this definition.
-fn stitched_facts(
+/// This definition's answers, one bucket per enabled lens — the whole of what a frontend
+/// contributes. Prefixing, the thinness floor and the record itself are the shared module's.
+fn fill(
     lenses: &[Lens],
     stmt: &Stmt,
     bound: &HashSet<String>,
     facts: &Facts,
     scope_lines: &[String],
-) -> Vec<String> {
-    let mut out = Vec::new();
+) -> LensFacts {
+    let mut out = LensFacts::new();
     for &lens in lenses {
-        let tag = lens.tag();
-        out.extend(
-            project(lens, stmt, bound, facts, scope_lines).into_iter().map(|f| format!("{tag}:{f}")),
-        );
+        out.extend(lens, project(lens, stmt, bound, facts, scope_lines));
     }
     out
 }
 
-/// One [`Def`] per definition, carrying every enabled lens's view of it. `bound` is the module's own
-/// bound-name set (rung 3), so every lens sees past the identities the module introduced.
+/// Push one lens [`Def`] for this definition, when the enabled lenses have enough to say.
+///
+/// `bound` is the module's own bound-name set (rung 3), so every lens sees past the identities the
+/// module introduced; `scope_lines` is the module-scope rendering of the body, which the caller
+/// computes because it needs the shared canonicalizer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lens_def(
     lenses: &[Lens],
@@ -471,114 +421,10 @@ pub(crate) fn lens_def(
         return;
     }
     let facts = FactWalk::run(stmt, bound);
-    let stitched = stitched_facts(lenses, stmt, bound, &facts, scope_lines);
-    if stitched.len() < MIN_FACTS {
-        return;
-    }
-    let canonical = stitched.join(" ");
-    out.push(Def {
-        lang: "py",
-        kind: &LENSES,
-        name: name.to_owned(),
-        file: Arc::clone(file),
-        line,
-        col,
-        loc,
-        args: stitched.len(),
-        text_orig: stitched.join("\n"),
-        cluster_canonical: Some(canonical.clone()),
-        analysis: Some(Analysis {
-            xname_canonical: canonical,
-            size: stitched.len(),
-            type3_lines: stitched,
-            canon_dialect: CanonDialect::CPythonAst,
-        }),
-        // Filled in by `score_lens_defs` once the whole corpus is known.
-        thickness: None,
-    });
-}
-
-/// Fold each definition's use sites into its lens record. These are the only facts that cannot be
-/// computed from the definition alone — they live in every *other* file — so they are merged here,
-/// once the tree has been walked, rather than during the per-file scan. They arrive already
-/// prefixed by channel (`use:` / `usectx:` / `cooc:`), which is why nothing is tagged here.
-pub(crate) fn merge_use_facts(defs: &mut [Def], mut facts: std::collections::HashMap<String, Vec<String>>) {
-    for d in defs.iter_mut() {
-        if d.kind.id != "lenses" {
-            continue;
-        }
-        let Some(extra) = facts.remove(&d.name) else { continue };
-        let Some(a) = d.analysis.as_mut() else { continue };
-        a.type3_lines.extend(extra);
-        a.type3_lines.sort();
-        a.size = a.type3_lines.len();
-        let canonical = a.type3_lines.join(" ");
-        a.xname_canonical.clone_from(&canonical);
-        d.text_orig = a.type3_lines.join("\n");
-        d.args = a.type3_lines.len();
-        d.cluster_canonical = Some(canonical);
-    }
-}
-
-/// Saturation constant for a stitched record's information mass — what counts as "a substantial
-/// record". Calibrated so a handful of distinctive facts clears half scale on the trees this was
-/// measured against.
-const LENS_MASS_K: f64 = 10.0;
-
-/// Score every lens record against the corpus, once scanning is done.
-///
-/// A fact's weight is its IDF over the corpus of lens records, so what counts as signal is decided
-/// by the tree rather than by a list: `control:return` is in nearly every record and weighs nothing,
-/// while `outgoing:.skip_locked` is rare and weighs a lot. The count of *lenses* that actually spoke
-/// rides alongside, because a record whose facts all come from one lens is one opinion, not a
-/// consensus — the same reason the ladder's `n` is evidence rather than volume.
-pub(crate) fn score_lens_defs(defs: &mut [Def]) {
-    let mass_k = LENS_MASS_K;
-    let mut df: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    let mut corpus = 0usize;
-    for d in defs.iter() {
-        if d.kind.id != "lenses" {
-            continue;
-        }
-        corpus += 1;
-        if let Some(a) = &d.analysis {
-            for fact in a.type3_lines.iter().map(String::as_str).collect::<BTreeSet<_>>() {
-                *df.entry(fact).or_insert(0) += 1;
-            }
-        }
-    }
-    if corpus == 0 {
-        return;
-    }
-    #[allow(clippy::cast_precision_loss)]
-    let n = corpus as f64;
-    let scores: Vec<Option<f64>> = defs
-        .iter()
-        .map(|d| {
-            if d.kind.id != "lenses" {
-                return None;
-            }
-            let a = d.analysis.as_ref()?;
-            let mut mass = 0.0f64;
-            let mut lenses_heard: BTreeSet<&str> = BTreeSet::new();
-            for fact in a.type3_lines.iter().map(String::as_str).collect::<BTreeSet<_>>() {
-                #[allow(clippy::cast_precision_loss)]
-                let idf = (n / df.get(fact).copied().unwrap_or(1).max(1) as f64).ln();
-                mass += idf.max(0.0);
-                if let Some((tag, _)) = fact.split_once(':') {
-                    lenses_heard.insert(tag);
-                }
-            }
-            let mass_score = 1.0 - (-mass / mass_k).exp();
-            #[allow(clippy::cast_precision_loss)]
-            let breadth = 1.0 - (-(lenses_heard.len() as f64) / 2.0).exp();
-            Some(0.7 * mass_score + 0.3 * breadth)
-        })
-        .collect();
-    for (d, score) in defs.iter_mut().zip(scores) {
-        if let Some(s) = score {
-            d.thickness = Some(s);
-        }
+    let filled = fill(lenses, stmt, bound, &facts, scope_lines);
+    let site = DefSite { name, file, line, col, loc };
+    if let Some(def) = shared_lens_def("py", CanonDialect::CPythonAst, &site, lenses, &filled) {
+        out.push(def);
     }
 }
 
@@ -596,7 +442,8 @@ mod tests {
         let bound = module_bound_names(&module.body);
         for stmt in &module.body {
             let facts = super::FactWalk::run(stmt, &bound);
-            let projected = super::stitched_facts(&[lens], stmt, &bound, &facts, &[]);
+            let projected =
+                dup_defs_core::lens::stitch(&[lens], &super::fill(&[lens], stmt, &bound, &facts, &[]));
             if !projected.is_empty() {
                 return projected;
             }
@@ -693,7 +540,7 @@ mod tests {
         let b = "from .timing import moment\nclass B: pass\ndef fetch(db, i, age):\n    e = db.get(B, i)\n    if e is None:\n        return None\n    if moment() - e.stamp > age:\n        return None\n    return e.payload\n";
         let (fa, fb) = (project_first(a, Lens::Control), project_first(b, Lens::Control));
         // Guard against agreeing vacuously: an empty projection equals an empty projection.
-        assert!(fa.len() >= super::MIN_FACTS, "the control lens projected nothing: {fa:?}");
+        assert!(fa.len() >= dup_defs_core::lens::MIN_FACTS, "the control lens projected nothing: {fa:?}");
         assert_eq!(fa, fb, "the control lens disagreed");
     }
 }

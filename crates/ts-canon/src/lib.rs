@@ -7,6 +7,7 @@
 mod canon;
 mod defs;
 mod frontend;
+mod lenses;
 
 pub use canon::{analyze_functions, ast_canonical, ast_canonical_many, AnalyzedFn};
 pub use dup_defs_core::LineMap;

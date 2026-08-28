@@ -34,8 +34,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use find_dup_defs_canon::{count_loc, is_upper_snake};
-use dup_defs_core::{Analysis, CanonDialect, Def, KindSpec, LineMap};
+use dup_defs_core::{count_loc, is_upper_snake};
+use dup_defs_core::{Analysis, CanonDialect, Def, Facets, KindSpec, LineMap, ScanOpts, Statement as CoreStatement};
+use std::collections::{HashMap, HashSet};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     BindingPattern, Class, ClassElement, Declaration, Decorator, ExportDefaultDeclarationKind,
@@ -137,24 +138,70 @@ fn is_trivial_function_body(body: Option<&FunctionBody<'_>>) -> bool {
 /// `ast_canonical`), so a function re-parses once instead of twice; class methods (whose slice
 /// doesn't re-parse as a standalone function) and non-callable body kinds fall back to
 /// `ast_canonical`.
-fn canon_for(kind: &KindSpec, text: &str) -> (Option<String>, Option<Analysis>) {
+fn canon_for(kind: &KindSpec, text: &str) -> (Option<String>, Option<Analysis>, Vec<CoreStatement>) {
     if !kind.body {
-        return (None, None);
+        return (None, None, Vec::new());
     }
     if kind.fn_like {
         match analyze_functions(&[text.to_owned()]).into_iter().next().flatten() {
-            Some((cc, xname, lines, size)) => {
-                (Some(cc), Some(Analysis { xname_canonical: xname, type3_lines: lines, size, canon_dialect: CanonDialect::Other }))
-            }
-            None => (Some(ast_canonical(text)), None),
+            Some(a) => (
+                Some(a.cluster_canonical),
+                Some(Analysis {
+                    xname_canonical: a.xname_canonical,
+                    type3_lines: a.type3_lines,
+                    size: a.size,
+                    canon_dialect: CanonDialect::Other,
+                }),
+                a.statements,
+            ),
+            None => (Some(ast_canonical(text)), None, Vec::new()),
         }
     } else {
-        (Some(ast_canonical(text)), None)
+        (Some(ast_canonical(text)), None, Vec::new())
+    }
+}
+
+/// What the lens projections need about the module they sit in — carried as one value so a new
+/// extractor cannot pick up one half of it and quietly skip the other.
+pub(crate) struct LensCtx {
+    pub lenses: Vec<dup_defs_core::lens::Lens>,
+    pub module_names: HashSet<String>,
+}
+
+impl LensCtx {
+    fn wanted(&self) -> bool {
+        !self.lenses.is_empty()
+    }
+
+    /// One lens [`Def`], when the run asked for lenses and the projection has enough to say.
+    fn emit(
+        &self,
+        name: &str,
+        at: &Site<'_>,
+        facts: &dup_defs_core::lens::LensFacts,
+        out: &mut Vec<Def>,
+    ) {
+        let (start, end) = at.span;
+        let (line, col) = at.lines.loc0(start);
+        let loc = count_loc(&at.source[start..end]);
+        let site = dup_defs_core::lens::DefSite { name, file: at.file, line, col, loc };
+        if let Some(def) = dup_defs_core::lens::lens_def(
+            "ts",
+            CanonDialect::Other,
+            &site,
+            &self.lenses,
+            facts,
+        ) {
+            out.push(def);
+        }
     }
 }
 
 /// Build a [`Def`] for the definition spanning `source[start..end]` (TypeScript has no receiver
 /// strip, so the canon input equals `text_orig`).
+// The parameters are the file's four constants plus this definition's four coordinates; bundling
+// either half into a struct would only move the same eight values behind a name that adds nothing.
+#[allow(clippy::too_many_arguments)]
 fn build_def(
     kind: &'static KindSpec,
     name: String,
@@ -163,11 +210,13 @@ fn build_def(
     source: &str,
     (start, end): (usize, usize),
     args: usize,
+    imports: &HashMap<String, Arc<str>>,
 ) -> Def {
     let text = source[start..end].to_owned();
     let loc = count_loc(&text);
     let (line, col) = lines.loc0(start);
-    let (cluster_canonical, analysis) = canon_for(kind, &text);
+    let (cluster_canonical, analysis, statements) = canon_for(kind, &text);
+    let reaches = crate::canon::reached_paths(&statements, imports);
     Def {
         lang: "ts",
         kind,
@@ -181,39 +230,137 @@ fn build_def(
         cluster_canonical,
         analysis,
         thickness: None,
+        facets: Facets { statements, reaches },
     }
 }
 
 // ─────────────────────────── per-kind extractors ───────────────────────────
 
+/// Where a definition sits in the file being walked — the four values every emitter needs and none
+/// of them varies within one definition.
+struct Site<'a> {
+    source: &'a str,
+    lines: &'a LineMap<'a>,
+    file: &'a Arc<str>,
+    span: (usize, usize),
+}
+
+/// One callable's shape, whatever syntax spelled it: a `function`, an arrow bound to a `const`, or a
+/// method. Bundled because the five travel together and an emitter that took them apart would let a
+/// new call site pass four of them and forget the fifth.
+struct Callable<'a, 'b> {
+    params: &'a oxc_ast::ast::FormalParameters<'b>,
+    body: &'a [oxc_ast::ast::Statement<'b>],
+    return_type: Option<&'a oxc_ast::ast::TSType<'b>>,
+    decorators: &'a [oxc_ast::ast::Decorator<'b>],
+    is_async: bool,
+}
+
+/// The lens record for a `function` / arrow / method body, pushed alongside its body def.
+fn emit_callable_lens(
+    name: &str,
+    callable: &Callable<'_, '_>,
+    at: &Site<'_>,
+    ctx: &LensCtx,
+    out: &mut Vec<Def>,
+) {
+    if !ctx.wanted() {
+        return;
+    }
+    let scope = crate::canon::scope_canonical(callable.params, callable.body, &ctx.module_names);
+    let facts = crate::lenses::callable_facts(
+        callable.params,
+        callable.body,
+        callable.return_type,
+        callable.decorators,
+        callable.is_async,
+        &ctx.module_names,
+        scope,
+    );
+    ctx.emit(name, at, &facts, out);
+}
+
 /// `function foo(...) { ... }` — top-level. Returns `None` for trivial-body / anonymous fns.
-fn function_def(f: &Function<'_>, source: &str, lines: &LineMap, file: &Arc<str>) -> Option<Def> {
+fn function_def(f: &Function<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, _ctx: &LensCtx) -> Option<Def> {
     let id = f.id.as_ref()?;
     if is_trivial_function_body(f.body.as_deref()) {
         return None;
     }
     let (start, end) = (u(f.span.start), u(f.span.end));
-    Some(build_def(&FUNCTIONS, id.name.to_string(), file, lines, source, (start, end), count_args(&f.params)))
+    Some(build_def(&FUNCTIONS, id.name.to_string(), file, lines, source, (start, end), count_args(&f.params), imports))
+}
+
+/// The lens record for a top-level `function`, pushed next to its body def.
+fn emit_function_lens(
+    f: &Function<'_>,
+    source: &str,
+    lines: &LineMap,
+    file: &Arc<str>,
+    ctx: &LensCtx,
+    out: &mut Vec<Def>,
+) {
+    let (Some(id), Some(body)) = (f.id.as_ref(), f.body.as_deref()) else { return };
+    let callable = Callable {
+        params: &f.params,
+        body: &body.statements,
+        return_type: f.return_type.as_ref().map(|r| &r.type_annotation),
+        decorators: &[],
+        is_async: f.r#async,
+    };
+    let at = Site { source, lines, file, span: (u(f.span.start), u(f.span.end)) };
+    emit_callable_lens(id.name.as_str(), &callable, &at, ctx, out);
 }
 
 /// A class declaration as a whole — `class Foo { ... }`, decorators excluded.
-fn class_def(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>) -> Option<Def> {
+fn class_def(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, _ctx: &LensCtx) -> Option<Def> {
     let id = c.id.as_ref()?;
     let start = keyword_start(source, u(c.span.start), last_decorator_end(&c.decorators));
     let end = u(c.span.end);
-    Some(build_def(&CLASSES, id.name.to_string(), file, lines, source, (start, end), 0))
+    Some(build_def(&CLASSES, id.name.to_string(), file, lines, source, (start, end), 0, imports))
+}
+
+/// The lens record for a class — what it declares and under what decorators.
+fn emit_class_lens(
+    c: &Class<'_>,
+    source: &str,
+    lines: &LineMap,
+    file: &Arc<str>,
+    ctx: &LensCtx,
+    out: &mut Vec<Def>,
+) {
+    let (Some(id), true) = (c.id.as_ref(), ctx.wanted()) else { return };
+    let start = keyword_start(source, u(c.span.start), last_decorator_end(&c.decorators));
+    let facts = crate::lenses::class_facts(c, &ctx.module_names);
+    ctx.emit(id.name.as_str(), &Site { source, lines, file, span: (start, u(c.span.end)) }, &facts, out);
+}
+
+/// The lens record for an interface — the shape it declares.
+fn emit_interface_lens(
+    i: &TSInterfaceDeclaration<'_>,
+    source: &str,
+    lines: &LineMap,
+    file: &Arc<str>,
+    ctx: &LensCtx,
+    out: &mut Vec<Def>,
+) {
+    if !ctx.wanted() {
+        return;
+    }
+    let facts = crate::lenses::interface_facts(i, &ctx.module_names);
+    let at = Site { source, lines, file, span: (u(i.span.start), u(i.span.end)) };
+    ctx.emit(i.id.name.as_str(), &at, &facts, out);
 }
 
 /// `type X = ...`.
-fn type_alias_def(t: &TSTypeAliasDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>) -> Option<Def> {
+fn type_alias_def(t: &TSTypeAliasDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, _ctx: &LensCtx) -> Option<Def> {
     let (start, end) = (u(t.span.start), u(t.span.end));
-    Some(build_def(&TYPE_ALIASES, t.id.name.to_string(), file, lines, source, (start, end), 0))
+    Some(build_def(&TYPE_ALIASES, t.id.name.to_string(), file, lines, source, (start, end), 0, imports))
 }
 
 /// `interface X { ... }`.
-fn interface_def(i: &TSInterfaceDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>) -> Option<Def> {
+fn interface_def(i: &TSInterfaceDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, _ctx: &LensCtx) -> Option<Def> {
     let (start, end) = (u(i.span.start), u(i.span.end));
-    Some(build_def(&INTERFACES, i.id.name.to_string(), file, lines, source, (start, end), 0))
+    Some(build_def(&INTERFACES, i.id.name.to_string(), file, lines, source, (start, end), 0, imports))
 }
 
 /// A `const`/`let`/`var` declaration may carry several declarators (`const a = 1, b = 2`).
@@ -221,7 +368,7 @@ fn interface_def(i: &TSInterfaceDeclaration<'_>, source: &str, lines: &LineMap, 
 /// - arrow / function-expression initializer ⇒ `functions` (dominant TS form).
 /// - `const NAME` with `UPPER_SNAKE_CASE` name + non-function initializer ⇒ `constants`.
 /// - destructuring patterns bind nothing nameable ⇒ skipped.
-fn variable_decls(v: &VariableDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, out: &mut Vec<Def>) {
+fn variable_decls(v: &VariableDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, ctx: &LensCtx, out: &mut Vec<Def>) {
     let is_const = matches!(v.kind, VariableDeclarationKind::Const);
     for decl in &v.declarations {
         let BindingPattern::BindingIdentifier(id) = &decl.id else { continue };
@@ -238,7 +385,15 @@ fn variable_decls(v: &VariableDeclaration<'_>, source: &str, lines: &LineMap, fi
                 }
                 let start = u(v.span.start); // include the `const`/`let`/`var` keyword
                 let end = u(decl.span.end);
-                out.push(build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&arrow.params)));
+                let callable = Callable {
+                    params: &arrow.params,
+                    body: &arrow.body.statements,
+                    return_type: arrow.return_type.as_ref().map(|r| &r.type_annotation),
+                    decorators: &[],
+                    is_async: arrow.r#async,
+                };
+                emit_callable_lens(&name, &callable, &Site { source, lines, file, span: (start, end) }, ctx, out);
+                out.push(build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&arrow.params), imports));
             }
             Expression::FunctionExpression(fexpr) => {
                 if is_trivial_function_body(fexpr.body.as_deref()) {
@@ -246,12 +401,22 @@ fn variable_decls(v: &VariableDeclaration<'_>, source: &str, lines: &LineMap, fi
                 }
                 let start = u(v.span.start);
                 let end = u(decl.span.end);
-                out.push(build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&fexpr.params)));
+                if let Some(body) = fexpr.body.as_deref() {
+                    let callable = Callable {
+                        params: &fexpr.params,
+                        body: &body.statements,
+                        return_type: fexpr.return_type.as_ref().map(|r| &r.type_annotation),
+                        decorators: &[],
+                        is_async: fexpr.r#async,
+                    };
+                    emit_callable_lens(&name, &callable, &Site { source, lines, file, span: (start, end) }, ctx, out);
+                }
+                out.push(build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&fexpr.params), imports));
             }
             _ if is_const && is_upper_snake(&name) => {
                 let start = u(decl.span.start);
                 let end = u(decl.span.end);
-                out.push(build_def(&CONSTANTS, name, file, lines, source, (start, end), 0));
+                out.push(build_def(&CONSTANTS, name, file, lines, source, (start, end), 0, imports));
             }
             _ => {}
         }
@@ -280,7 +445,10 @@ fn property_key_name(key: &PropertyKey<'_>) -> String {
 }
 
 /// Methods of one class, surfaced as `kind = "methods"` with class-qualified names.
-fn class_method_defs(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>, parent_chain: &str, out: &mut Vec<Def>) {
+// The file's four constants plus the class's own three; bundling either half behind a name would
+// only move the same values, and the file half already has one (`Site`) built per definition.
+#[allow(clippy::too_many_arguments)]
+fn class_method_defs(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, ctx: &LensCtx, parent_chain: &str, out: &mut Vec<Def>) {
     let Some(class_id) = c.id.as_ref() else { return };
     let class_name = class_id.name.as_str();
     let parent = if parent_chain.is_empty() {
@@ -301,53 +469,66 @@ fn class_method_defs(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<st
                 None => format!("{parent}.{key_name}"),
             };
             let args = count_args(&m.value.params);
-            out.push(build_def(&METHODS, name, file, lines, source, (start, end), args));
+            if let Some(body) = m.value.body.as_deref() {
+                let callable = Callable {
+                    params: &m.value.params,
+                    body: &body.statements,
+                    return_type: m.value.return_type.as_ref().map(|r| &r.type_annotation),
+                    decorators: &m.decorators,
+                    is_async: m.value.r#async,
+                };
+                emit_callable_lens(&name, &callable, &Site { source, lines, file, span: (start, end) }, ctx, out);
+            }
+            out.push(build_def(&METHODS, name, file, lines, source, (start, end), args, imports));
         }
     }
 }
 
 // ─────────────────────────── per-statement dispatch ───────────────────────────
 
-fn process_top_stmt(stmt: &Statement<'_>, source: &str, lines: &LineMap, file: &Arc<str>, out: &mut Vec<Def>) {
+fn process_top_stmt(stmt: &Statement<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, ctx: &LensCtx, out: &mut Vec<Def>) {
     match stmt {
         Statement::FunctionDeclaration(f) => {
-            if let Some(def) = function_def(f, source, lines, file) {
+            if let Some(def) = function_def(f, source, lines, file, imports, ctx) {
                 out.push(def);
+                emit_function_lens(f, source, lines, file, ctx, out);
             }
         }
         Statement::ClassDeclaration(c) => {
-            if let Some(def) = class_def(c, source, lines, file) {
+            if let Some(def) = class_def(c, source, lines, file, imports, ctx) {
                 out.push(def);
+                emit_class_lens(c, source, lines, file, ctx, out);
             }
-            class_method_defs(c, source, lines, file, "", out);
+            class_method_defs(c, source, lines, file, imports, ctx, "", out);
         }
         Statement::TSTypeAliasDeclaration(t) => {
-            if let Some(def) = type_alias_def(t, source, lines, file) {
+            if let Some(def) = type_alias_def(t, source, lines, file, imports, ctx) {
                 out.push(def);
             }
         }
         Statement::TSInterfaceDeclaration(i) => {
-            if let Some(def) = interface_def(i, source, lines, file) {
+            if let Some(def) = interface_def(i, source, lines, file, imports, ctx) {
                 out.push(def);
+                emit_interface_lens(i, source, lines, file, ctx, out);
             }
         }
-        Statement::VariableDeclaration(v) => variable_decls(v, source, lines, file, out),
+        Statement::VariableDeclaration(v) => variable_decls(v, source, lines, file, imports, ctx, out),
         Statement::ExportNamedDeclaration(e) => {
             if let Some(decl) = &e.declaration {
-                process_declaration(decl, source, lines, file, out);
+                process_declaration(decl, source, lines, file, imports, ctx, out);
             }
         }
         Statement::ExportDefaultDeclaration(e) => match &e.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
-                if let Some(def) = function_def(f, source, lines, file) {
+                if let Some(def) = function_def(f, source, lines, file, imports, ctx) {
                     out.push(def);
                 }
             }
             ExportDefaultDeclarationKind::ClassDeclaration(c) => {
-                if let Some(def) = class_def(c, source, lines, file) {
+                if let Some(def) = class_def(c, source, lines, file, imports, ctx) {
                     out.push(def);
                 }
-                class_method_defs(c, source, lines, file, "", out);
+                class_method_defs(c, source, lines, file, imports, ctx, "", out);
             }
             _ => {}
         },
@@ -356,30 +537,40 @@ fn process_top_stmt(stmt: &Statement<'_>, source: &str, lines: &LineMap, file: &
 }
 
 /// Inner-declaration walker — same cases as [`process_top_stmt`] minus the export wrappers.
-fn process_declaration(decl: &Declaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, out: &mut Vec<Def>) {
+fn process_declaration(
+    decl: &Declaration<'_>,
+    source: &str,
+    lines: &LineMap,
+    file: &Arc<str>,
+    imports: &HashMap<String, Arc<str>>, ctx: &LensCtx,
+    out: &mut Vec<Def>,
+) {
     match decl {
         Declaration::FunctionDeclaration(f) => {
-            if let Some(def) = function_def(f, source, lines, file) {
+            if let Some(def) = function_def(f, source, lines, file, imports, ctx) {
                 out.push(def);
+                emit_function_lens(f, source, lines, file, ctx, out);
             }
         }
         Declaration::ClassDeclaration(c) => {
-            if let Some(def) = class_def(c, source, lines, file) {
+            if let Some(def) = class_def(c, source, lines, file, imports, ctx) {
                 out.push(def);
+                emit_class_lens(c, source, lines, file, ctx, out);
             }
-            class_method_defs(c, source, lines, file, "", out);
+            class_method_defs(c, source, lines, file, imports, ctx, "", out);
         }
         Declaration::TSTypeAliasDeclaration(t) => {
-            if let Some(def) = type_alias_def(t, source, lines, file) {
+            if let Some(def) = type_alias_def(t, source, lines, file, imports, ctx) {
                 out.push(def);
             }
         }
         Declaration::TSInterfaceDeclaration(i) => {
-            if let Some(def) = interface_def(i, source, lines, file) {
+            if let Some(def) = interface_def(i, source, lines, file, imports, ctx) {
                 out.push(def);
+                emit_interface_lens(i, source, lines, file, ctx, out);
             }
         }
-        Declaration::VariableDeclaration(v) => variable_decls(v, source, lines, file, out),
+        Declaration::VariableDeclaration(v) => variable_decls(v, source, lines, file, imports, ctx, out),
         _ => {}
     }
 }
@@ -389,7 +580,7 @@ fn process_declaration(decl: &Declaration<'_>, source: &str, lines: &LineMap, fi
 /// Scan one TypeScript source string → its definitions as [`Def`]s with canon precomputed. The
 /// `file` path drives the parse mode (`.tsx` enables JSX) and is the shared `Arc` stamped onto
 /// every def.
-pub(crate) fn scan_source(source: &str, file: &Arc<str>) -> Vec<Def> {
+pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec<Def> {
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(Path::new(&**file)).unwrap_or_else(|_| SourceType::ts());
     let ret = Parser::new(&allocator, source, source_type).parse();
@@ -398,8 +589,16 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>) -> Vec<Def> {
     }
     let lines = LineMap::new(source);
     let mut defs: Vec<Def> = Vec::new();
+    // The module's import table, resolved once: what each bound name stands for.
+    let imports: HashMap<String, Arc<str>> =
+        crate::canon::module_imports(&ret.program, file).into_iter().collect();
+    let lenses = dup_defs_core::lens::enabled_lenses(opts);
+    // Every lens reads the module's own bound names, so they are collected once per file.
+    let module_names =
+        if lenses.is_empty() { HashSet::new() } else { crate::lenses::module_bound_names(&ret.program) };
+    let ctx = LensCtx { lenses, module_names };
     for stmt in &ret.program.body {
-        process_top_stmt(stmt, source, &lines, file, &mut defs);
+        process_top_stmt(stmt, source, &lines, file, &imports, &ctx, &mut defs);
     }
     defs
 }
@@ -407,11 +606,142 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>) -> Vec<Def> {
 #[cfg(test)]
 mod tests {
     use super::scan_source;
+    use dup_defs_core::ScanOpts;
     use std::sync::Arc;
 
     fn triples(src: &str, file: &str) -> Vec<(String, String, String)> {
         let f: Arc<str> = Arc::from(file);
-        scan_source(src, &f).into_iter().map(|d| (d.kind.id.to_owned(), d.name, d.text_orig)).collect()
+        scan_source(src, &f, &ScanOpts::default()).into_iter().map(|d| (d.kind.id.to_owned(), d.name, d.text_orig)).collect()
+    }
+
+    fn lens_record(src: &str, name: &str) -> Vec<String> {
+        let f: Arc<str> = Arc::from("t.ts");
+        let kinds = vec!["lenses".to_owned()];
+        let opts = ScanOpts { kinds: Some(&kinds) };
+        scan_source(src, &f, &opts)
+            .into_iter()
+            .find(|d| d.kind.id == "lenses" && d.name == name)
+            .map(|d| d.analysis.expect("lens analysis").type3_lines)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn lenses_are_absent_unless_the_run_asks_for_them() {
+        let src = "function f(n: number) {\n  if (n > 0) { g(n); }\n  return n;\n}\n";
+        let f: Arc<str> = Arc::from("t.ts");
+        assert!(
+            scan_source(src, &f, &ScanOpts::default()).iter().all(|d| d.kind.id != "lenses"),
+            "the default run stays byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_typescript_callable_projects_through_every_lens_it_can_answer() {
+        let src = "async function f(n: number): Promise<number> {\n  try {\n    for (const x of xs) { emit(x); }\n  } catch (e: HttpError) {\n    throw new WrappedError(e);\n  }\n  return await load(n);\n}\n";
+        let facts = lens_record(src, "f");
+        assert!(facts.contains(&"outgoing:emit".to_owned()), "{facts:?}");
+        assert!(facts.contains(&"control:try".to_owned()), "{facts:?}");
+        assert!(facts.contains(&"control:+forof".to_owned()), "nesting rides on the tag: {facts:?}");
+        assert!(facts.contains(&"failures:HttpError".to_owned()), "the caught type: {facts:?}");
+        assert!(facts.contains(&"failures:WrappedError".to_owned()), "the thrown type: {facts:?}");
+        assert!(facts.contains(&"signature:async".to_owned()), "{facts:?}");
+        assert!(facts.contains(&"signature:ret:Promise".to_owned()), "{facts:?}");
+        assert!(facts.iter().any(|f| f.starts_with("scope:")), "{facts:?}");
+    }
+
+    #[test]
+    fn using_is_what_typescript_holds_open_and_finally_is_not() {
+        let held = "function f() {\n  using h = open();\n  return 1;\n}\n";
+        let cleanup = "function f() {\n  try { g(); } finally { close(); }\n  return 1;\n}\n";
+        assert!(lens_record(held, "f").contains(&"resources:open".to_owned()), "{:?}", lens_record(held, "f"));
+        // A `finally` is a cleanup *path* — control flow, not a held resource. Reading it as one
+        // would fill the lens with the language's commonest idiom and say nothing.
+        let cleanup_facts = lens_record(cleanup, "f");
+        assert!(cleanup_facts.iter().all(|f| !f.starts_with("resources:")), "{cleanup_facts:?}");
+        assert!(cleanup_facts.contains(&"control:finally".to_owned()), "{cleanup_facts:?}");
+    }
+
+    #[test]
+    fn an_interface_declares_a_shape_as_a_set() {
+        let a = "interface I { a: string; b: number[]; c?: Foo; }\n";
+        let b = "interface I { c?: Foo; b: number[]; a: string; }\n";
+        // A declaration is a set: the same interface with its members reordered is the same shape.
+        assert_eq!(lens_record(a, "I"), lens_record(b, "I"));
+        assert!(!lens_record(a, "I").is_empty());
+        // Two members would fall under the thinness floor and carry no record at all — a projection
+        // with fewer facts than that matches trivially.
+        assert!(lens_record("interface J { a: string; b: number; }\n", "J").is_empty());
+    }
+
+    #[test]
+    fn a_callable_reports_its_statement_stream_with_nesting() {
+        let src = "function f(xs: number[]): number {\n  for (const x of xs) {\n    g(x);\n  }\n  return 0;\n}\n";
+        let f: Arc<str> = Arc::from("t.ts");
+        let defs = scan_source(src, &f, &ScanOpts::default());
+        let d = defs.iter().find(|d| d.name == "f").expect("f");
+        let depths: Vec<u16> = d.facets.statements.iter().map(|s| s.depth).collect();
+        // Header at 0, body at 1, the call inside the loop at 2 — the same shape the Python and Rust
+        // frontends produce, which is what makes the three streams comparable rather than merely all
+        // present.
+        assert_eq!(depths, vec![0, 1, 2, 1], "statements: {:?}", d.facets.statements);
+        assert!(d.facets.statements[1].line.starts_with("ForOf("), "the loop contributes a header");
+    }
+
+    #[test]
+    fn a_braceless_body_nests_like_a_braced_one() {
+        let braced = "function f(n: number) {\n  if (n > 0) { g(n); }\n}\n";
+        let bare = "function f(n: number) {\n  if (n > 0) g(n);\n}\n";
+        let file: Arc<str> = Arc::from("t.ts");
+        let shape = |src: &str| -> Vec<u16> {
+            scan_source(src, &file, &ScanOpts::default())
+                .iter()
+                .find(|d| d.name == "f")
+                .expect("f")
+                .facets
+                .statements
+                .iter()
+                .map(|s| s.depth)
+                .collect()
+        };
+        // Braces are punctuation, not structure: two sources that mean the same thing must not read
+        // as different shapes.
+        assert_eq!(shape(braced), shape(bare));
+    }
+
+    #[test]
+    fn a_relative_import_names_where_it_points_not_that_it_is_relative() {
+        // Left as written, `./x` and `../x` begin with a bare `.` or `..`, and every relative import
+        // in a tree shares those as a prefix — so "both import something relative" would read as
+        // "both are about the same thing". Resolved, two directories' `./models` are two nodes.
+        let src = "import { c } from \"./sibling\";\nimport { d } from \"../uncle\";\n\nexport function f(): number {\n  return c() + d();\n}\n";
+        let here: Arc<str> = Arc::from("pages/one/thing.ts");
+        let there: Arc<str> = Arc::from("pages/two/thing.ts");
+        let reaches = |file: &Arc<str>| -> Vec<String> {
+            scan_source(src, file, &ScanOpts::default())
+                .iter()
+                .find(|d| d.name == "f")
+                .expect("f")
+                .facets
+                .reaches
+                .iter()
+                .map(|r| (**r).to_owned())
+                .collect()
+        };
+        assert_eq!(reaches(&here), vec!["pages.one.sibling.c".to_owned(), "pages.uncle.d".to_owned()]);
+        // Same source, another directory: the sibling is a different module and says so.
+        assert_ne!(reaches(&here)[0], reaches(&there)[0]);
+        assert!(reaches(&here).iter().all(|r| !r.starts_with('.')), "no bare relative marker: {:?}", reaches(&here));
+    }
+
+    #[test]
+    fn a_callable_reports_the_import_paths_it_reaches() {
+        let src = "import { c } from \"a/b\";\nimport z from \"d/e\";\n\nexport function f(): number {\n  return c();\n}\n";
+        let f: Arc<str> = Arc::from("t.ts");
+        let defs = scan_source(src, &f, &ScanOpts::default());
+        let d = defs.iter().find(|d| d.name == "f").expect("f");
+        let reaches: Vec<&str> = d.facets.reaches.iter().map(|r| &**r).collect();
+        // `c` is used, so its whole path is reported; `z` is imported and never touched.
+        assert_eq!(reaches, vec!["a.b.c"]);
     }
 
     #[test]
@@ -456,7 +786,7 @@ const fetch = async (x: number): Promise<number> => {
 };
 "#;
         let f: Arc<str> = Arc::from("test.ts");
-        let got = scan_source(src, &f);
+        let got = scan_source(src, &f, &ScanOpts::default());
         let fetch = got.iter().find(|d| d.name == "fetch").expect("fetch arrow");
         assert_eq!(fetch.kind.id, "functions");
         assert_eq!(fetch.args, 1);
@@ -532,7 +862,7 @@ class Service {
 }
 "#;
         let f: Arc<str> = Arc::from("test.ts");
-        let got = scan_source(src, &f);
+        let got = scan_source(src, &f, &ScanOpts::default());
         let svc = got.iter().find(|d| d.name == "Service").expect("Service class");
         assert!(svc.text_orig.trim_start().starts_with("class "), "got: {:?}", svc.text_orig);
     }
@@ -559,7 +889,7 @@ function factory() {
         // (methods analyze to None — their slice isn't a standalone function — which is fine).
         let src = "export function f(x: number) { const y = x + 1; return y * 2; }\nexport const MAX_N = 7;\nexport interface I { a(): number; }\n";
         let f: Arc<str> = Arc::from("t.ts");
-        let defs = scan_source(src, &f);
+        let defs = scan_source(src, &f, &ScanOpts::default());
         let func = defs.iter().find(|d| d.name == "f").expect("fn");
         assert!(func.cluster_canonical.is_some() && func.analysis.is_some());
         let iface = defs.iter().find(|d| d.name == "I").expect("iface");

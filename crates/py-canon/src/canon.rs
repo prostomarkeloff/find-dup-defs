@@ -16,7 +16,8 @@ use std::fmt::Write as _;
 /// `(cluster_canonical, xname_canonical, type3_lines, node_count)` — the analysis tuple the scan
 /// reads to build a `Def`'s cluster canonical + `Analysis`. `py-canon`'s own type (was shared via
 /// `dup-defs-core`, now local since the engine consumes `Def`, not this tuple).
-pub use find_dup_defs_canon::AnalyzedFn;
+pub use dup_defs_core::AnalyzedFn;
+use dup_defs_core::Statement;
 use rayon::prelude::*;
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{
@@ -337,7 +338,7 @@ impl<'a> Dump<'a> {
 
     /// In cross-name mode, rewrite a bound local to its positional `_v{n}` placeholder.
     fn rename_id(&mut self, id: &str) -> String {
-        find_dup_defs_canon::alpha_rename(&mut self.map, self.locals, id)
+        dup_defs_core::alpha_rename(&mut self.map, self.locals, id)
     }
 
     /// An attribute whose name the *module* declares (a field of one of its classes) is a slot too:
@@ -345,7 +346,7 @@ impl<'a> Dump<'a> {
     /// Attributes of things the module did not define (`session.get`) are left alone — they are the
     /// grammar the shape is written in.
     fn rename_attr(&mut self, attr: &str) -> String {
-        find_dup_defs_canon::alpha_rename(&mut self.map, self.scope, attr)
+        dup_defs_core::alpha_rename(&mut self.map, self.scope, attr)
     }
 
     /// Emit one AST node `name(field, …)` applying the `show_empty=False` + keyword-switch rule.
@@ -1332,17 +1333,24 @@ struct Unparse<'a> {
     locals: Option<&'a HashSet<String>>,
     map: HashMap<String, u32>,
     blanked: bool,
+    /// Block nesting of the statement being written. Emitted as leading spaces, which every
+    /// existing caller trims away; [`unparse_depths`] is the one that reads it back.
+    indent: usize,
 }
 
 impl Unparse<'_> {
     fn rename_id(&mut self, id: &str) -> String {
-        find_dup_defs_canon::alpha_rename(&mut self.map, self.locals, id)
+        dup_defs_core::alpha_rename(&mut self.map, self.locals, id)
     }
 
-    /// Start a new logical line (CPython `fill`): a newline unless we're at the start.
+    /// Start a new logical line (CPython `fill`): a newline unless we're at the start, then the
+    /// current block nesting as leading spaces.
     fn fill(&mut self, text: &str) {
         if !self.out.is_empty() {
             self.out.push('\n');
+        }
+        for _ in 0..self.indent {
+            self.out.push_str("    ");
         }
         self.out.push_str(text);
     }
@@ -1365,13 +1373,15 @@ impl Unparse<'_> {
     /// A def/class body: skip a leading docstring (→ `pass` if that empties it), then each stmt.
     fn body(&mut self, stmts: &[Stmt], strip: bool) {
         let slice = if strip && stmts.first().is_some_and(is_docstring) { &stmts[1..] } else { stmts };
+        self.indent += 1;
         if slice.is_empty() {
             self.fill("pass");
-            return;
+        } else {
+            for stmt in slice {
+                self.stmt(stmt);
+            }
         }
-        for stmt in slice {
-            self.stmt(stmt);
-        }
+        self.indent -= 1;
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2290,9 +2300,28 @@ impl Unparse<'_> {
 
 /// Unparse the alpha-renamed function and split into stripped, non-empty lines (the Type-3 units).
 fn unparse_lines(stmt: &Stmt, src: &str, locals: &HashSet<String>, map: HashMap<String, u32>) -> Vec<String> {
-    let mut up = Unparse { out: String::new(), src, locals: Some(locals), map, blanked: false };
+    unparse_depths(stmt, src, locals, map).into_iter().map(|(_, line)| line).collect()
+}
+
+/// [`unparse_lines`] keeping each line's **block nesting**.
+///
+/// Order alone cannot tell `for _v0 in _v1: / foo() / bar()` from the same three statements where
+/// `bar()` runs *after* the loop instead of inside it — flattened, both are one sequence. Depth is
+/// what says which block a statement belongs to, and therefore whether a line following a run
+/// continues the path that run described or is what happens when that path was not taken.
+fn unparse_depths(
+    stmt: &Stmt,
+    src: &str,
+    locals: &HashSet<String>,
+    map: HashMap<String, u32>,
+) -> Vec<(usize, String)> {
+    let mut up = Unparse { out: String::new(), src, locals: Some(locals), map, blanked: false, indent: 0 };
     up.stmt(stmt);
-    up.out.lines().map(str::trim).filter(|l| !l.is_empty()).map(ToOwned::to_owned).collect()
+    up.out
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| ((l.len() - l.trim_start().len()) / 4, l.trim().to_owned()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2378,8 +2407,22 @@ pub(crate) fn analyze_stmt(stmt: &Stmt, src: &str) -> Option<AnalyzedFn> {
     let mut dump = Dump::new(src, Some(&locals));
     let xname_canonical = dump.stmt(stmt);
     let size = dump.count;
-    let lines = unparse_lines(stmt, src, &locals, dump.map);
-    Some((cluster_canonical, xname_canonical, lines, size))
+    let statements = statement_stream(unparse_depths(stmt, src, &locals, dump.map));
+    let type3_lines = statements.iter().map(|s| s.line.clone()).collect();
+    Some(AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, statements, size })
+}
+
+/// The unparser's `(depth, line)` pairs as the engine's statement stream.
+///
+/// Python's Type-3 shingles and its statement stream are the same unit — the unparser already walks
+/// into nested blocks and one line comes out per statement — so the two are built from one traversal
+/// here. That coincidence is Python's, not the contract's: the other frontends shingle differently
+/// and produce the stream separately.
+fn statement_stream(pairs: Vec<(usize, String)>) -> Vec<Statement> {
+    pairs
+        .into_iter()
+        .map(|(depth, line)| Statement { line, depth: u16::try_from(depth).unwrap_or(u16::MAX) })
+        .collect()
 }
 
 /// Names-preserved cluster canonical of any def node (functions AND classes), decorators of the top
@@ -2434,8 +2477,35 @@ pub(crate) fn analyze_in_scope(stmt: &Stmt, src: &str, scope: &HashSet<String>) 
     let mut dump = Dump::with_scope(src, &locals, scope);
     let xname_canonical = dump.stmt(stmt);
     let size = dump.count;
-    let lines = unparse_lines(stmt, src, &locals, dump.map);
-    (cluster_canonical, xname_canonical, lines, size)
+    let statements = statement_stream(unparse_depths(stmt, src, &locals, dump.map));
+    let type3_lines = statements.iter().map(|s| s.line.clone()).collect();
+    AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, statements, size }
+}
+
+/// Every name this definition mentions — the raw material for [`Facets::reaches`].
+///
+/// Deliberately *not* filtered by boundness: a name that shadows an import inside one function is
+/// rare, and treating the shadow as evidence the definition does not reach the module would be a
+/// silent false negative, which is the expensive direction here. The frontend intersects this with
+/// what its file imported; a name nothing imported simply matches nothing.
+///
+/// [`Facets::reaches`]: dup_defs_core::Facets::reaches
+pub(crate) fn used_names(stmt: &Stmt) -> HashSet<String> {
+    #[derive(Default)]
+    struct Names {
+        seen: HashSet<String>,
+    }
+    impl<'a> Visitor<'a> for Names {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if let Expr::Name(name) = expr {
+                self.seen.insert(name.id.as_str().to_owned());
+            }
+            visitor::walk_expr(self, expr);
+        }
+    }
+    let mut names = Names::default();
+    names.visit_stmt(stmt);
+    names.seen
 }
 
 /// Every name the module binds at top level: imports, `def`/`class` names, module-level assignment
@@ -2478,4 +2548,158 @@ fn analyze_one(text: &str) -> Option<AnalyzedFn> {
 #[must_use]
 pub fn analyze_functions(texts: &[String]) -> Vec<Option<AnalyzedFn>> {
     texts.par_iter().map(|text| analyze_one(text)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Imports: what a module declares it reaches into
+// ---------------------------------------------------------------------------
+
+/// One name a file binds by importing, and the dotted path that name stands for.
+///
+/// The path is what was **written**, joined whole: `from a.b import c` binds `c` to `a.b.c`, and
+/// `from a.b import c as d` binds `d` to that same `a.b.c`. Recording the whole path rather than
+/// the module is what lets two files that reach one thing through different doors — one importing
+/// the module, the other importing a member of it — meet on a **prefix** of the path instead of on
+/// a name. That prefix is the referent they share, and the corpus states it itself; nothing here
+/// decides which paths are worth caring about.
+///
+/// Relative imports keep their leading dots, so a `.` path is not silently unified with an absolute
+/// one that happens to end the same way.
+#[derive(Debug, Clone)]
+pub(crate) struct Import {
+    /// The name the file can use afterwards.
+    pub local: String,
+    /// Dotted path, as written.
+    pub path: String,
+}
+
+/// Every import in `src`, including those written inside a function body.
+///
+/// Function-local imports are kept because they are a definition reaching for something just as
+/// much as a file-level one is — often more pointedly, since a local import is usually there to
+/// break a cycle around one specific call.
+#[must_use]
+pub(crate) fn module_imports(src: &str) -> Vec<Import> {
+    let Ok(parsed) = parse_module(src) else { return Vec::new() };
+    let mut out = Vec::new();
+    walk_imports(&parsed.into_syntax().body, &mut out);
+    out
+}
+
+fn walk_imports(body: &[Stmt], out: &mut Vec<Import>) {
+    for stmt in body {
+        match stmt {
+            Stmt::Import(node) => {
+                for alias in &node.names {
+                    let path = alias.name.id.as_str().to_owned();
+                    let local = match &alias.asname {
+                        Some(asname) => asname.id.as_str().to_owned(),
+                        // Plain `import a.b.c` binds only `a`, and a use reads `a.b.c.f` — so the
+                        // name bound stands for the head of the path, not the whole of it.
+                        None => path.split('.').next().unwrap_or("").to_owned(),
+                    };
+                    let path = if alias.asname.is_some() { path } else { local.clone() };
+                    out.push(Import { local, path });
+                }
+            }
+            Stmt::ImportFrom(node) => {
+                let mut prefix = ".".repeat(node.level as usize);
+                if let Some(module) = &node.module {
+                    prefix.push_str(module.id.as_str());
+                }
+                for alias in &node.names {
+                    let member = alias.name.id.as_str();
+                    if member == "*" {
+                        continue; // binds no name this can attribute a use to
+                    }
+                    let local = alias.asname.as_ref().unwrap_or(&alias.name).id.as_str().to_owned();
+                    let path =
+                        if prefix.ends_with('.') { format!("{prefix}{member}") } else { format!("{prefix}.{member}") };
+                    out.push(Import { local, path });
+                }
+            }
+            _ => walk_imports(stmt_body(stmt), out),
+        }
+    }
+}
+
+/// Statements nested directly inside `stmt`, so the walk reaches imports written in a function or
+/// under a `try`.
+fn stmt_body(stmt: &Stmt) -> &[Stmt] {
+    match stmt {
+        Stmt::FunctionDef(node) => &node.body,
+        Stmt::ClassDef(node) => &node.body,
+        Stmt::If(node) => &node.body,
+        Stmt::With(node) => &node.body,
+        Stmt::While(node) => &node.body,
+        Stmt::For(node) => &node.body,
+        Stmt::Try(node) => &node.body,
+        _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::module_imports;
+
+    fn pairs(src: &str) -> Vec<(String, String)> {
+        module_imports(src).into_iter().map(|i| (i.local, i.path)).collect()
+    }
+
+    #[test]
+    fn from_import_binds_the_whole_dotted_path() {
+        // The path is what makes two files meet: importing the module and importing a member of it
+        // are different strings that share a prefix, and the prefix is the thing both are about.
+        assert_eq!(
+            pairs("from a.b import c\n"),
+            vec![("c".to_owned(), "a.b.c".to_owned())]
+        );
+        assert_eq!(
+            pairs("from a.b.c import d\n"),
+            vec![("d".to_owned(), "a.b.c.d".to_owned())]
+        );
+    }
+
+    #[test]
+    fn an_alias_renames_the_binding_but_not_the_path() {
+        assert_eq!(
+            pairs("from a.b import c as z\n"),
+            vec![("z".to_owned(), "a.b.c".to_owned())]
+        );
+    }
+
+    #[test]
+    fn plain_import_binds_only_the_head() {
+        // `import a.b.c` makes `a` the name in scope; a use reads `a.b.c.f`, so the bound name
+        // stands for the head and nothing deeper can be attributed to it here.
+        assert_eq!(pairs("import a.b.c\n"), vec![("a".to_owned(), "a".to_owned())]);
+        assert_eq!(pairs("import a.b.c as d\n"), vec![("d".to_owned(), "a.b.c".to_owned())]);
+    }
+
+    #[test]
+    fn relative_imports_keep_their_dots() {
+        // Otherwise `.models` from two different packages would unify into one referent.
+        assert_eq!(pairs("from . import x\n"), vec![("x".to_owned(), ".x".to_owned())]);
+        assert_eq!(pairs("from ..pkg import y\n"), vec![("y".to_owned(), "..pkg.y".to_owned())]);
+    }
+
+    #[test]
+    fn star_binds_no_name_to_attribute_a_use_to() {
+        assert!(pairs("from a.b import *\n").is_empty());
+    }
+
+    #[test]
+    fn imports_inside_a_body_are_reached() {
+        // A local import is a definition reaching for something just as much as a file-level one —
+        // often more pointedly, since it is usually there to break a cycle around one call.
+        let src = "def f():\n    from a.b import c\n    return c\n";
+        assert_eq!(pairs(src), vec![("c".to_owned(), "a.b.c".to_owned())]);
+        let guarded = "if TYPE_CHECKING:\n    from a.b import c\n";
+        assert_eq!(pairs(guarded), vec![("c".to_owned(), "a.b.c".to_owned())]);
+    }
+
+    #[test]
+    fn unparsable_source_yields_nothing_rather_than_panicking() {
+        assert!(pairs("def (:\n").is_empty());
+    }
 }
