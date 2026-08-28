@@ -79,7 +79,7 @@ struct Cli {
     /// Restrict to these kinds (comma-separated:
     /// functions,methods,classes,interfaces,constants,type-aliases).
     ///
-    /// Naming `lenses` additionally enables the lens kind (Python only), which is never in the
+    /// Naming `lenses` additionally enables the lens kind, which is never in the
     /// default set: it clusters a definition by *perspectives other than its body* — what it calls,
     /// how it branches, how it fails, what it declares, how it is used elsewhere — each fact tagged
     /// with the lens it came from, so a finding reports which perspectives agreed. It costs a
@@ -1656,6 +1656,15 @@ struct JsonGroup {
     kind: String,
     name: String,
     severity: String,
+    /// Проход, давший находку: `name` / `cross-name` / `type-3` / `pattern` / `converge` /
+    /// `converge-family`.
+    ///
+    /// 🔴 Без него `--json` не отличим по проходам вовсе. Человеческий отчёт разделяет их
+    /// заголовками секций, а машинный сваливал в один список, где у совещательного converge тот
+    /// же `dup-function`, что у гейтящего прохода. Потребителю оставалось угадывать по косвенным
+    /// признакам — скажем, по пустому `min_sim` вместе с наличием `facets`, — то есть строить
+    /// свою модель того, чего инструмент про себя не сказал.
+    pass: String,
     min_sim: Option<f64>,
     cross_name: bool,
     /// Composite [0,1] "fat function" score — see [`thickness`].
@@ -1694,6 +1703,7 @@ fn render_json(findings: &[Finding], repo_root: &Path) -> String {
                 kind: f.kind.label.to_owned(),
                 name: f.name.clone(),
                 severity: f.severity.label().to_owned(),
+                pass: f.pass.to_owned(),
                 min_sim: f.min_sim,
                 cross_name: cross,
                 thickness: f.thickness,
