@@ -45,7 +45,9 @@
 //! thing to gate a build on — the pass exists to be read, and a gate that fires on the tail of a
 //! ranking teaches people to ignore it.
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+
+use rayon::prelude::*;
 
 use dup_defs_core::{CanonDialect, Def, KindSpec};
 use dup_defs_core::reach::prefixes;
@@ -225,7 +227,7 @@ fn tokens(line: &str, vocab: Vocab) -> Vec<Tok<'_>> {
 /// [`Renaming`] rejects what it over-matches.
 fn slot_normalize(line: &str, vocab: Vocab) -> String {
     let mut out = String::with_capacity(line.len());
-    let mut map: HashMap<&str, usize> = HashMap::new();
+    let mut map: HashMap<&str, usize> = HashMap::default();
     for token in tokens(line, vocab) {
         match token {
             Tok::Slot(slot) if is_slot(slot) => {
@@ -349,7 +351,7 @@ struct View {
 }
 
 fn views(defs: &[Def]) -> (Vec<View>, Vec<String>) {
-    let mut node_ids: HashMap<String, u32> = HashMap::new();
+    let mut node_ids: HashMap<String, u32> = HashMap::default();
     let mut node_names: Vec<String> = Vec::new();
     let mut out = Vec::new();
     for (at, def) in defs.iter().enumerate() {
@@ -360,7 +362,7 @@ fn views(defs: &[Def]) -> (Vec<View>, Vec<String>) {
         if body.len() < 2 || body.len() > MAX_STATEMENTS {
             continue;
         }
-        let mut subjects: HashSet<u32> = HashSet::new();
+        let mut subjects: HashSet<u32> = HashSet::default();
         for path in &def.facets.reaches {
             for node in prefixes(path) {
                 let next = u32::try_from(node_names.len()).unwrap_or(u32::MAX);
@@ -382,8 +384,8 @@ fn views(defs: &[Def]) -> (Vec<View>, Vec<String>) {
 }
 
 fn corpus_of(views: &[View]) -> Corpus {
-    let (mut names, mut lines, mut shapes) = (HashMap::new(), HashMap::new(), HashMap::new());
-    let mut subjects: HashMap<u32, usize> = HashMap::new();
+    let (mut names, mut lines, mut shapes) = (HashMap::default(), HashMap::default(), HashMap::default());
+    let mut subjects: HashMap<u32, usize> = HashMap::default();
     let (mut name_total, mut line_total) = (0usize, 0usize);
     for view in views {
         for (key, shape) in view.keys.iter().zip(&view.shape) {
@@ -683,11 +685,11 @@ fn evidence<'a>(a: &'a View, b: &'a View, corpus: &Corpus, run: Option<&Run>) ->
             .sum()
     });
 
-    let mut count_a: HashMap<&str, usize> = HashMap::new();
+    let mut count_a: HashMap<&str, usize> = HashMap::default();
     for key in &a.keys {
         *count_a.entry(key.as_str()).or_default() += 1;
     }
-    let mut shared_text: HashMap<&str, usize> = HashMap::new();
+    let mut shared_text: HashMap<&str, usize> = HashMap::default();
     for key in &b.keys {
         if let Some(left) = count_a.get(key.as_str()) {
             let entry = shared_text.entry(key.as_str()).or_default();
@@ -701,7 +703,7 @@ fn evidence<'a>(a: &'a View, b: &'a View, corpus: &Corpus, run: Option<&Run>) ->
     // rank near-clones — which that anchor reports with their exact divergence point — above the only
     // pairs this anchor can reach. Subtracted, not penalized by a factor.
     let bag = |view: &'a View| -> HashMap<&'a str, usize> {
-        let mut out: HashMap<&str, usize> = HashMap::new();
+        let mut out: HashMap<&str, usize> = HashMap::default();
         for (key, shape) in view.keys.iter().zip(&view.shape) {
             if !shared_text.contains_key(key.as_str()) {
                 *out.entry(shape.as_str()).or_default() += 1;
@@ -772,26 +774,21 @@ pub fn pass_converge(defs: &[Def], top: usize) -> Vec<Finding> {
         return Vec::new();
     }
     let corpus = corpus_of(&views);
-    let mut pairs: HashMap<(usize, usize), Pair> = HashMap::new();
+    let mut pairs: HashMap<(usize, usize), Pair> = HashMap::default();
     seed_by_statement(&views, &corpus, &mut pairs);
     seed_by_subject(&views, &corpus, &mut pairs);
-    let mut found = weigh(defs, &views, &corpus, &node_names, pairs);
-    if top > 0 {
-        // Each kind keeps its own head: a family is not competing with a pair for the same slot, and
-        // a shared cap would let whichever scores higher on this tree silence the other entirely.
-        let mut kept = 0;
-        let mut kept_family = 0;
-        found.retain(|f| {
-            let seen = if f.pass == "converge-family" { &mut kept_family } else { &mut kept };
-            *seen += 1;
-            *seen <= top
-        });
-    }
-    found
+    weigh(defs, &views, &corpus, &node_names, pairs, top)
+}
+
+/// Кандидат посева, у которого посчитан только БЛОК согласия — до дорогого разбора развилки.
+struct Seed {
+    a: usize,
+    b: usize,
+    run: Run,
 }
 
 fn seed_by_statement(views: &[View], corpus: &Corpus, pairs: &mut HashMap<(usize, usize), Pair>) {
-    let mut occurrences: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
+    let mut occurrences: HashMap<&str, Vec<(usize, usize)>> = HashMap::default();
     for (idx, view) in views.iter().enumerate() {
         for (pos, key) in view.keys.iter().enumerate() {
             occurrences.entry(key.as_str()).or_default().push((idx, pos));
@@ -802,80 +799,101 @@ fn seed_by_statement(views: &[View], corpus: &Corpus, pairs: &mut HashMap<(usize
     // against changed between runs of the same tool over the same tree.
     let mut keys: Vec<&&str> = occurrences.keys().collect();
     keys.sort_unstable();
-    let mut seen: HashSet<(usize, usize, usize, usize)> = HashSet::new();
-    for key in keys {
-        let sites = &occurrences[*key];
-        if sites.len() < 2 || sites.len() > SEED_CAP {
+
+    // 🔴 Три фазы вместо одного цикла, и делятся они ровно по тому, что можно считать независимо.
+    // Растяжение блока и разбор развилки — работа на пару, общего состояния у них нет; отсев же
+    // («этот прогон уже посеян другим утверждением», «у пары остаётся ДЛИННЕЙШИЙ прогон») читает и
+    // пишет одну таблицу, и порядок в нём несущий. Поэтому считаем параллельно, а решаем
+    // последовательно — по заранее отсортированному списку ключей, а не по обходу хеш-таблицы.
+    let seeds: Vec<Seed> = keys
+        .par_iter()
+        .flat_map_iter(|key| {
+            let sites: &[(usize, usize)] = &occurrences[**key];
+            let usable = sites.len() >= 2 && sites.len() <= SEED_CAP;
+            let sites: &[(usize, usize)] = if usable { sites } else { &[] };
+            sites.iter().enumerate().flat_map(move |(i, &(a, a_pos))| {
+                sites[i + 1..].iter().filter_map(move |&(b, b_pos)| {
+                    // One file does not disqualify a pair — a module that gathers one concern is
+                    // exactly where its near-copies collect. Being the same definition does: one
+                    // line repeated inside one body diverges from nothing.
+                    if a == b {
+                        return None;
+                    }
+                    extend_block(&views[a], &views[b], a_pos, b_pos).map(|run| Seed { a, b, run })
+                })
+            })
+        })
+        .collect();
+
+    // Отсев прогонов, уже посеянных раньше тем же блоком: последовательный и в том же порядке, что
+    // был у однопоточного цикла, — иначе «раньше» перестаёт быть определённым.
+    let mut seen: HashSet<(usize, usize, usize, usize)> = HashSet::default();
+    let fresh: Vec<Seed> = seeds
+        .into_iter()
+        .filter(|s| {
+            seen.insert((s.a.min(s.b), s.a.max(s.b), s.run.a_at.min(s.run.b_at), s.run.a_at.max(s.run.b_at)))
+        })
+        .collect();
+    let scored: Vec<(usize, usize, Run, RunFork)> = fresh
+        .into_par_iter()
+        .filter_map(|Seed { a, b, run }| {
+            let (va, vb) = (&views[a], &views[b]);
+            let (pa, pb) = (
+                slice(&va.lines, run.a_at + run.len, run.gap_a).join("; "),
+                slice(&vb.lines, run.b_at + run.len, run.gap_b).join("; "),
+            );
+            if pa.is_empty() && pb.is_empty() {
+                return None;
+            }
+            let fork = anti_unify(&pa, &pb, va.vocab);
+            let holes: Vec<String> = fork.holes_a.iter().chain(&fork.holes_b).cloned().collect();
+            if peak(corpus, &holes) <= 0.0 {
+                return None; // they part on nothing named
+            }
+            let agreed: usize =
+                slice(&va.lines, run.a_at, run.len).iter().map(|l| tokens(l, va.vocab).len()).sum::<usize>()
+                    + slice(&vb.lines, run.b_at, run.len).iter().map(|l| tokens(l, vb.vocab).len()).sum::<usize>();
+            let gap = tokens(&pa, va.vocab).len() + tokens(&pb, vb.vocab).len();
+            #[allow(clippy::cast_precision_loss)]
+            let sharpness =
+                if agreed + gap == 0 { 0.0 } else { (agreed as f64 + fork.aligned as f64) / (agreed + gap) as f64 };
+            let anchor = slice(&va.keys, run.a_at, run.len)
+                .iter()
+                .flat_map(|line| tokens(line, va.vocab))
+                .filter_map(|t| if let Tok::Name(n) = t { Some(n.to_owned()) } else { None })
+                .max_by(|x, y| corpus.name(x).partial_cmp(&corpus.name(y)).unwrap_or(std::cmp::Ordering::Equal));
+            let flip = a > b;
+            let held = RunFork {
+                run: Run {
+                    a_at: if flip { run.b_at } else { run.a_at },
+                    b_at: if flip { run.a_at } else { run.b_at },
+                    len: run.len,
+                    gap_a: if flip { run.gap_b } else { run.gap_a },
+                    gap_b: if flip { run.gap_a } else { run.gap_b },
+                    run2: run.run2,
+                },
+                holes_a: if flip { fork.holes_b.clone() } else { fork.holes_a.clone() },
+                holes_b: if flip { fork.holes_a } else { fork.holes_b },
+                sharpness,
+                anchor,
+            };
+            Some((a, b, run, held))
+        })
+        .collect();
+    for (a, b, run, held) in scored {
+        let entry = pairs.entry((a.min(b), a.max(b))).or_default();
+        // The longest agreement is the strongest evidence, so a pair keeps its longest run
+        // rather than its last-seen one — and "longest" is a property of the code, where
+        // "last seen" was a property of the hasher.
+        if entry.run.as_ref().is_some_and(|kept| kept.run.len >= run.len) {
             continue;
         }
-        for (i, &(a, a_pos)) in sites.iter().enumerate() {
-            for &(b, b_pos) in &sites[i + 1..] {
-                // One file does not disqualify a pair — a module that gathers one concern is exactly
-                // where its near-copies collect. Being the same definition does: one line repeated
-                // inside one body diverges from nothing.
-                if a == b {
-                    continue;
-                }
-                let Some(run) = extend_block(&views[a], &views[b], a_pos, b_pos) else { continue };
-                if !seen.insert((a.min(b), a.max(b), run.a_at.min(run.b_at), run.a_at.max(run.b_at))) {
-                    continue; // another seed inside the same run already reported it
-                }
-                let (va, vb) = (&views[a], &views[b]);
-                let (pa, pb) = (
-                    slice(&va.lines, run.a_at + run.len, run.gap_a).join("; "),
-                    slice(&vb.lines, run.b_at + run.len, run.gap_b).join("; "),
-                );
-                if pa.is_empty() && pb.is_empty() {
-                    continue;
-                }
-                let fork = anti_unify(&pa, &pb, va.vocab);
-                let holes: Vec<String> = fork.holes_a.iter().chain(&fork.holes_b).cloned().collect();
-                if peak(corpus, &holes) <= 0.0 {
-                    continue; // they part on nothing named
-                }
-                let agreed: usize = slice(&va.lines, run.a_at, run.len)
-                    .iter()
-                    .map(|l| tokens(l, va.vocab).len())
-                    .sum::<usize>()
-                    + slice(&vb.lines, run.b_at, run.len).iter().map(|l| tokens(l, vb.vocab).len()).sum::<usize>();
-                let gap = tokens(&pa, va.vocab).len() + tokens(&pb, vb.vocab).len();
-                #[allow(clippy::cast_precision_loss)]
-                let sharpness =
-                    if agreed + gap == 0 { 0.0 } else { (agreed as f64 + fork.aligned as f64) / (agreed + gap) as f64 };
-                let anchor = slice(&va.keys, run.a_at, run.len)
-                    .iter()
-                    .flat_map(|line| tokens(line, va.vocab))
-                    .filter_map(|t| if let Tok::Name(n) = t { Some(n.to_owned()) } else { None })
-                    .max_by(|x, y| corpus.name(x).partial_cmp(&corpus.name(y)).unwrap_or(std::cmp::Ordering::Equal));
-                let flip = a > b;
-                let entry = pairs.entry((a.min(b), a.max(b))).or_default();
-                // The longest agreement is the strongest evidence, so a pair keeps its longest run
-                // rather than its last-seen one — and "longest" is a property of the code, where
-                // "last seen" was a property of the hasher.
-                if entry.run.as_ref().is_some_and(|held| held.run.len >= run.len) {
-                    continue;
-                }
-                entry.run = Some(RunFork {
-                    run: Run {
-                        a_at: if flip { run.b_at } else { run.a_at },
-                        b_at: if flip { run.a_at } else { run.b_at },
-                        len: run.len,
-                        gap_a: if flip { run.gap_b } else { run.gap_a },
-                        gap_b: if flip { run.gap_a } else { run.gap_b },
-                        run2: run.run2,
-                    },
-                    holes_a: if flip { fork.holes_b.clone() } else { fork.holes_a.clone() },
-                    holes_b: if flip { fork.holes_a } else { fork.holes_b },
-                    sharpness,
-                    anchor,
-                });
-            }
-        }
+        entry.run = Some(held);
     }
 }
 
 fn seed_by_subject(views: &[View], corpus: &Corpus, pairs: &mut HashMap<(usize, usize), Pair>) {
-    let mut index: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut index: HashMap<u32, Vec<usize>> = HashMap::default();
     for (idx, view) in views.iter().enumerate() {
         for node in &view.subjects {
             index.entry(*node).or_default().push(idx);
@@ -897,7 +915,12 @@ fn seed_by_subject(views: &[View], corpus: &Corpus, pairs: &mut HashMap<(usize, 
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(x.cmp(y))
     });
-    let mut claimed: HashSet<(usize, usize)> = HashSet::new();
+    // Захват пары за узлом — решение ПОРЯДКА («кто первый, за тем и субъект»), и потому идёт
+    // последовательно; разбор развилки захваченной пары ни от кого не зависит и уходит в параллель.
+    // Разделение сохраняет и то, и другое: список захватов строится в том же порядке узлов, что и
+    // раньше, а считается по нему уже безразлично кем.
+    let mut claimed: HashSet<(usize, usize)> = HashSet::default();
+    let mut taken: Vec<(u32, usize, (usize, usize))> = Vec::new();
     for node in nodes {
         let sites = &index[&node];
         if sites.len() < 2 || sites.len() > SEED_CAP {
@@ -906,34 +929,43 @@ fn seed_by_subject(views: &[View], corpus: &Corpus, pairs: &mut HashMap<(usize, 
         for (i, &a) in sites.iter().enumerate() {
             for &b in &sites[i + 1..] {
                 let key = (a.min(b), a.max(b));
-                if !claimed.insert(key) {
-                    continue;
+                if claimed.insert(key) {
+                    taken.push((node, sites.len(), key));
                 }
-                // The fork of this seed: steps the two take alike and word differently. Comparing the
-                // bodies line for line where their shapes agree is enough to find them — the ordering
-                // of the two streams is what the statement anchor is for.
-                let (va, vb) = (&views[key.0], &views[key.1]);
-                let mut holes: Vec<String> = Vec::new();
-                let mut by_shape: HashMap<&str, &str> = HashMap::new();
-                for (shape, line) in vb.shape.iter().zip(&vb.lines) {
-                    by_shape.entry(shape.as_str()).or_insert(line.as_str());
-                }
-                for (shape, line) in va.shape.iter().zip(&va.lines) {
-                    if let Some(other) = by_shape.get(shape.as_str()) {
-                        if *other != line.as_str() {
-                            let fork = anti_unify(line, other, va.vocab);
-                            holes.extend(fork.holes_a);
-                            holes.extend(fork.holes_b);
-                        }
-                    }
-                }
-                if peak(corpus, &holes) <= 0.0 {
-                    continue;
-                }
-                pairs.entry(key).or_default().subject =
-                    Some(SubjectFork { node, sites: sites.len(), holes });
             }
         }
+    }
+
+    let forks: Vec<((usize, usize), SubjectFork)> = taken
+        .into_par_iter()
+        .filter_map(|(node, sites, key)| {
+            // The fork of this seed: steps the two take alike and word differently. Comparing the
+            // bodies line for line where their shapes agree is enough to find them — the ordering
+            // of the two streams is what the statement anchor is for.
+            let (va, vb) = (&views[key.0], &views[key.1]);
+            let mut holes: Vec<String> = Vec::new();
+            let mut by_shape: HashMap<&str, &str> = HashMap::default();
+            for (shape, line) in vb.shape.iter().zip(&vb.lines) {
+                by_shape.entry(shape.as_str()).or_insert(line.as_str());
+            }
+            for (shape, line) in va.shape.iter().zip(&va.lines) {
+                if let Some(other) = by_shape.get(shape.as_str()) {
+                    if *other != line.as_str() {
+                        let fork = anti_unify(line, other, va.vocab);
+                        holes.extend(fork.holes_a);
+                        holes.extend(fork.holes_b);
+                    }
+                }
+            }
+            if peak(corpus, &holes) <= 0.0 {
+                return None;
+            }
+            Some((key, SubjectFork { node, sites, holes }))
+        })
+        .collect();
+
+    for (key, fork) in forks {
+        pairs.entry(key).or_default().subject = Some(fork);
     }
 }
 
@@ -952,6 +984,18 @@ fn cluster_key(pair: &Pair, key: (usize, usize)) -> String {
         _ => format!("pair:{}:{}", key.0, key.1),
     }
 }
+
+/// Находка вместе с тем, что понадобится, только если она переживёт потолок.
+///
+/// Сортировка от отложенного разбора не страдает: ни `notes`, ни `snippet` в её ключи не входят.
+struct Pending {
+    finding: Finding,
+    render: Option<(Pair, usize, usize)>,
+    snippet_def: usize,
+}
+
+/// Поджатая клика: её состав, общая масса формы и рендер этих форм для читателя.
+type TightFamily = (Vec<usize>, f64, Vec<String>);
 
 /// A set of definitions that all reach one subject and all take the same shape.
 ///
@@ -1019,13 +1063,13 @@ fn clique_cover(vertices: &[usize], edges: &HashMap<usize, HashSet<usize>>) -> V
 /// the first families this produced were made of nothing else. Cover is what says whether the shared
 /// shape is most of what these definitions are, or the residue of any three procedures.
 fn common_shapes(members: &[usize], views: &[View], corpus: &Corpus) -> (f64, Vec<String>) {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut counts: HashMap<&str, usize> = HashMap::default();
     let Some((&first, rest)) = members.split_first() else { return (0.0, Vec::new()) };
     for shape in &views[first].shape {
         *counts.entry(shape.as_str()).or_default() += 1;
     }
     for &member in rest {
-        let mut here: HashMap<&str, usize> = HashMap::new();
+        let mut here: HashMap<&str, usize> = HashMap::default();
         for shape in &views[member].shape {
             *here.entry(shape.as_str()).or_default() += 1;
         }
@@ -1045,7 +1089,7 @@ fn common_shapes(members: &[usize], views: &[View], corpus: &Corpus) -> (f64, Ve
     });
     let mut whole: f64 = 0.0;
     for &member in members {
-        let mut here: HashMap<&str, usize> = HashMap::new();
+        let mut here: HashMap<&str, usize> = HashMap::default();
         for shape in &views[member].shape {
             *here.entry(shape.as_str()).or_default() += 1;
         }
@@ -1074,7 +1118,7 @@ fn tighten(
     mut members: Vec<usize>,
     views: &[View],
     corpus: &Corpus,
-) -> Option<(Vec<usize>, f64, Vec<String>)> {
+) -> Option<TightFamily> {
     members.sort_unstable();
     let mut best = common_shapes(&members, views, corpus);
     while members.len() > MIN_FAMILY {
@@ -1109,7 +1153,7 @@ fn families(
     // is the most specific thing the two are both about — and wrong for finding a family, which needs
     // the node the whole group meets on. Built on claims, a group of six sibling functions fragmented
     // into pairs scattered over six different nodes and no family formed at all.
-    let mut by_node: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
+    let mut by_node: HashMap<u32, Vec<(usize, usize)>> = HashMap::default();
     for &(a, b) in pairs {
         let (small, large) = if views[a].subjects.len() <= views[b].subjects.len() {
             (&views[a].subjects, &views[b].subjects)
@@ -1127,34 +1171,45 @@ fn families(
     nodes.sort_by(|x, y| {
         corpus.subject(*y).partial_cmp(&corpus.subject(*x)).unwrap_or(std::cmp::Ordering::Equal).then(x.cmp(y))
     });
-    let mut out = Vec::new();
-    let mut absorbed: HashSet<(usize, usize)> = HashSet::new();
-    let mut seen_members: HashSet<Vec<usize>> = HashSet::new();
-    for node in nodes {
-        // 🔴 The same cap the pair seeding uses, applied here too. A node reached by more definitions
-        // than this is infrastructure — the framework, the store, the directory every file lives in —
-        // not a thing a handful of definitions are *about*. Without it the family index re-admitted
-        // exactly what the pair index excludes, and families formed around "these files are in the
-        // same tree".
-        if corpus.subjects.get(&node).copied().unwrap_or(0) > SEED_CAP {
-            continue;
-        }
-        let edges_list = &by_node[&node];
-        let mut edges: HashMap<usize, HashSet<usize>> = HashMap::new();
-        let mut vertices: Vec<usize> = Vec::new();
-        for &(a, b) in edges_list {
-            edges.entry(a).or_default().insert(b);
-            edges.entry(b).or_default().insert(a);
-            vertices.push(a);
-            vertices.push(b);
-        }
-        vertices.sort_unstable();
-        vertices.dedup();
-        for clique in clique_cover(&vertices, &edges) {
-            if clique.len() < MIN_FAMILY {
-                continue;
+    // 🔴 Клики считаются параллельно, а отбираются последовательно. Поиск клик и их поджатие —
+    // работа внутри ОДНОГО узла, соседи ей не нужны; а вот «эту же семью уже напечатали на более
+    // точном субъекте» — решение о порядке, и оно обязано приниматься по списку узлов, отсортированному
+    // от редкого к частому. Смешай их — и семья выходила бы то под одним субъектом, то под другим.
+    let per_node: Vec<Vec<TightFamily>> = nodes
+        .par_iter()
+        .map(|node| {
+            // 🔴 The same cap the pair seeding uses, applied here too. A node reached by more
+            // definitions than this is infrastructure — the framework, the store, the directory every
+            // file lives in — not a thing a handful of definitions are *about*. Without it the family
+            // index re-admitted exactly what the pair index excludes, and families formed around
+            // "these files are in the same tree".
+            if corpus.subjects.get(node).copied().unwrap_or(0) > SEED_CAP {
+                return Vec::new();
             }
-            let Some((clique, shared, shapes)) = tighten(clique, views, corpus) else { continue };
+            let edges_list = &by_node[node];
+            let mut edges: HashMap<usize, HashSet<usize>> = HashMap::default();
+            let mut vertices: Vec<usize> = Vec::new();
+            for &(a, b) in edges_list {
+                edges.entry(a).or_default().insert(b);
+                edges.entry(b).or_default().insert(a);
+                vertices.push(a);
+                vertices.push(b);
+            }
+            vertices.sort_unstable();
+            vertices.dedup();
+            clique_cover(&vertices, &edges)
+                .into_iter()
+                .filter(|clique| clique.len() >= MIN_FAMILY)
+                .filter_map(|clique| tighten(clique, views, corpus))
+                .collect()
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    let mut absorbed: HashSet<(usize, usize)> = HashSet::default();
+    let mut seen_members: HashSet<Vec<usize>> = HashSet::default();
+    for (node, cliques) in nodes.iter().zip(per_node) {
+        for (clique, shared, shapes) in cliques {
             if !seen_members.insert(clique.clone()) {
                 continue; // the same family, already reported at a more specific subject
             }
@@ -1167,8 +1222,8 @@ fn families(
             // share — no hub penalty, because being many places is the finding, not a discount on
             // it. That penalty belongs to a pair, where a third carrier means the primitive exists.
             #[allow(clippy::cast_precision_loss)]
-            let score = corpus.subject(node) * shared * (clique.len() as f64).ln();
-            out.push(Family { node, members: clique, shared, shapes, score });
+            let score = corpus.subject(*node) * shared * (clique.len() as f64).ln();
+            out.push(Family { node: *node, members: clique, shared, shapes, score });
         }
     }
     out.sort_by(|x, y| {
@@ -1177,27 +1232,34 @@ fn families(
     (out, absorbed)
 }
 
-fn weigh(
-    defs: &[Def],
-    views: &[View],
-    corpus: &Corpus,
-    node_names: &[String],
-    pairs: HashMap<(usize, usize), Pair>,
-) -> Vec<Finding> {
-    struct Scored {
-        key: (usize, usize),
-        pair: Pair,
-        ev: Evidence,
-        divergence: f64,
-        score: f64,
-    }
-    let mut scored: Vec<Scored> = Vec::new();
-    for (key, pair) in pairs {
+/// Взвешенная пара — до того, как из неё сделали находку.
+struct Scored {
+    key: (usize, usize),
+    pair: Pair,
+    ev: Evidence,
+    divergence: f64,
+    score: f64,
+    /// Ключ кластера считается в ПАРАЛЛЕЛЬНОЙ фазе, а не в последовательной группировке: он строит
+    /// строку на каждую пару, и таких пар сотни тысяч.
+    cluster: String,
+}
+
+fn score_pairs(views: &[View], corpus: &Corpus, pairs: HashMap<(usize, usize), Pair>) -> Vec<Scored> {
+    // 🔴 Взвешивание идёт ПАРАЛЛЕЛЬНО, но по заранее упорядоченному списку, а не по обходу
+    // `HashMap`. Порядок тут не косметика: `collect` индексированного параллельного итератора
+    // сохраняет позиции, и потому результат не зависит ни от числа ядер, ни от того, какой воркер
+    // успел первым. Обход хеш-таблицы дал бы каждому прогону свой порядок групп — а группы решают,
+    // какая пара станет представителем кластера, то есть какое расхождение будет напечатано.
+    let mut entries: Vec<((usize, usize), Pair)> = pairs.into_iter().collect();
+    entries.sort_unstable_by_key(|(key, _)| *key);
+    let out: Vec<Scored> = entries
+        .into_par_iter()
+        .filter_map(|(key, pair)| {
         let (a, b) = (&views[key.0], &views[key.1]);
         let ev = evidence(a, b, corpus, pair.run.as_ref().map(|r| &r.run));
         let total = ev.text + ev.shape + ev.subject;
         if total <= 0.0 {
-            continue;
+            return None;
         }
         let mut holes: Vec<String> = Vec::new();
         if let Some(run) = &pair.run {
@@ -1209,7 +1271,7 @@ fn weigh(
         }
         let divergence = peak(corpus, &holes);
         if divergence <= 0.0 {
-            continue;
+            return None;
         }
         // Sharpness applies only where it was measured — inside a run, where "how much of the block
         // still aligns" is defined. A subject-seeded pair has no block, and its counterpart is the
@@ -1221,8 +1283,22 @@ fn weigh(
         let rejoined = pair.run.as_ref().is_some_and(|r| r.run.run2 > 0);
         let novelty = if rejoined { 1.0 } else { 1.0 - ev.jaccard };
         let score = total * divergence * sharpness * novelty;
-        scored.push(Scored { key, pair, ev, divergence, score });
-    }
+        let cluster = cluster_key(&pair, key);
+        Some(Scored { key, pair, ev, divergence, score, cluster })
+        })
+        .collect();
+    out
+}
+
+fn weigh(
+    defs: &[Def],
+    views: &[View],
+    corpus: &Corpus,
+    node_names: &[String],
+    pairs: HashMap<(usize, usize), Pair>,
+    top: usize,
+) -> Vec<Finding> {
+    let scored = score_pairs(views, corpus, pairs);
 
     // 🔴 Families are built from **scored** pairs, not from the raw claims. An edge has to mean "these
     // two are genuinely alike" — the seed only established that they meet on a subject and part on
@@ -1238,17 +1314,22 @@ fn weigh(
         .map(|s| s.key)
         .collect();
     let (families, absorbed) = families(&subject_pairs, views, corpus);
-    let mut out: Vec<Finding> =
-        families.iter().map(|family| family_finding(defs, views, node_names, family)).collect();
-
-    let mut by_cluster: HashMap<String, Vec<Scored>> = HashMap::new();
-    for entry in scored {
+    let mut out: Vec<Pending> = families
+        .iter()
+        .map(|family| Pending {
+            snippet_def: views[family.members[0]].at,
+            render: None,
+            finding: family_finding(defs, views, node_names, family),
+        })
+        .collect();
+    let mut by_cluster: HashMap<String, Vec<Scored>> = HashMap::default();
+    for mut entry in scored {
         // A pair a family already accounts for is that family, said once per partner. A pair that
         // also grew a run stays: the run is a fact about those two that the family does not carry.
         if absorbed.contains(&entry.key) && entry.pair.run.is_none() {
             continue;
         }
-        by_cluster.entry(cluster_key(&entry.pair, entry.key)).or_default().push(entry);
+        by_cluster.entry(std::mem::take(&mut entry.cluster)).or_default().push(entry);
     }
 
     for (_, mut group) in by_cluster {
@@ -1264,7 +1345,6 @@ fn weigh(
         let Some(best) = group.first() else { continue };
         let (a, b) = (&views[best.key.0], &views[best.key.1]);
         let (da, db) = (&defs[a.at], &defs[b.at]);
-        let notes = render(&best.pair, a, b, node_names);
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let facets = vec![
             ("text".to_owned(), best.ev.text.max(0.0) as usize),
@@ -1273,7 +1353,12 @@ fn weigh(
             ("fork".to_owned(), best.divergence.max(0.0) as usize),
         ];
         let score = best.score / hub;
-        out.push(Finding {
+        let (key_a, key_b) = (best.key.0, best.key.1);
+        let pair_for_render = group.into_iter().next().map(|s| s.pair);
+        out.push(Pending {
+            snippet_def: a.at,
+            render: pair_for_render.map(|pair| (pair, key_a, key_b)),
+            finding: Finding {
             pass: "converge",
             kind: kind_of(da, db),
             name: format!("{} / {}", da.name, db.name),
@@ -1286,11 +1371,12 @@ fn weigh(
             // Squashed to [0, 1] so it sorts alongside every other pass's thickness without pretending
             // to be the same quantity; the raw nats ride in `facets`.
             thickness: 1.0 - (-score / 400.0).exp(),
-            snippet: da.text_orig.clone(),
-            notes,
+            snippet: String::new(),
+            notes: Vec::new(),
             members: vec![member(defs, a.at), member(defs, b.at)],
             facets,
             pattern: None,
+            },
         });
     }
     // Same reasoning as the node order: clusters come out of a `HashMap`, and equal scores tie often
@@ -1301,13 +1387,49 @@ fn weigh(
     // which came out of a `HashMap`. The same tool over the same tree printed a different report each
     // run, in a section whose whole value is its order.
     out.sort_by(|x, y| {
-        y.thickness
-            .partial_cmp(&x.thickness)
+        y.finding
+            .thickness
+            .partial_cmp(&x.finding.thickness)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| x.name.cmp(&y.name))
-            .then_with(|| x.members.cmp(&y.members))
+            .then_with(|| x.finding.name.cmp(&y.finding.name))
+            .then_with(|| x.finding.members.cmp(&y.finding.members))
     });
-    out
+    cap_and_explain(out, top, defs, views, node_names)
+}
+
+/// Обрезать отчёт по потолку и разобрать ТОЛЬКО то, что его пережило.
+///
+/// 🔴 Порядок обязателен именно такой. Разбор находки и её сниппет — самая дорогая часть прохода, и
+/// до потолка они не нужны ни одной находке: на среднем дереве пар набирается сто с лишним тысяч, а
+/// печатается несколько сотен. Считая всё сразу, проход рендерил и копировал исходники ста тысяч
+/// определений, чтобы тут же их выбросить.
+fn cap_and_explain(
+    mut out: Vec<Pending>,
+    top: usize,
+    defs: &[Def],
+    views: &[View],
+    node_names: &[String],
+) -> Vec<Finding> {
+    if top > 0 {
+        // Каждый вид держит свою голову: семейство не соревнуется с парой за один слот, и общий
+        // потолок дал бы тому, кто на этом дереве набрал больше, заглушить второго целиком.
+        let mut kept = 0;
+        let mut kept_family = 0;
+        out.retain(|p| {
+            let seen = if p.finding.pass == "converge-family" { &mut kept_family } else { &mut kept };
+            *seen += 1;
+            *seen <= top
+        });
+    }
+    out.into_iter()
+        .map(|mut p| {
+            if let Some((pair, a, b)) = &p.render {
+                p.finding.notes = render(pair, &views[*a], &views[*b], node_names);
+            }
+            p.finding.snippet.clone_from(&defs[p.snippet_def].text_orig);
+            p.finding
+        })
+        .collect()
 }
 
 /// What the reader sees: the run the two agreed on, the step where they parted and the names they
@@ -1393,7 +1515,7 @@ fn kind_of(a: &Def, _b: &Def) -> &'static KindSpec {
 #[cfg(test)]
 mod tests {
     use super::{clique_cover, pass_converge, tokens, Tok, Vocab};
-    use std::collections::{HashMap, HashSet};
+    use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
     use dup_defs_core::{Analysis, CanonDialect, Def, Facets, KindSpec, Statement};
     use std::sync::Arc;
 
@@ -1505,7 +1627,7 @@ mod tests {
     }
 
     fn graph(edges: &[(usize, usize)]) -> HashMap<usize, HashSet<usize>> {
-        let mut out: HashMap<usize, HashSet<usize>> = HashMap::new();
+        let mut out: HashMap<usize, HashSet<usize>> = HashMap::default();
         for &(a, b) in edges {
             out.entry(a).or_default().insert(b);
             out.entry(b).or_default().insert(a);
