@@ -69,6 +69,62 @@ pub struct Analysis {
     pub canon_dialect: CanonDialect,
 }
 
+/// One statement of a definition, in source order, with the block it sits in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Statement {
+    /// The statement rendered in the frontend's canonical form — alpha-renamed, one line.
+    pub line: String,
+    /// How deep inside the definition's blocks it sits; the outermost statements are `0`.
+    pub depth: u16,
+}
+
+/// What a definition is, *besides* a body of text.
+///
+/// The body passes read [`Def::cluster_canonical`] and [`Analysis`]; the perspective passes need two
+/// more facts, and they live here together rather than as loose fields for one reason: a frontend
+/// author needs a single place that says what it is expected to answer. Split across two structs,
+/// a language ends up supporting one perspective pass and silently not the other — which is exactly
+/// how Python came to be the only language with lenses.
+///
+/// Both fields are **empty when the frontend does not report them**, and every pass that reads them
+/// is self-gating on that: a language lights up the moment its frontend starts filling them in, with
+/// no engine edit and no list of supported languages anywhere.
+#[derive(Clone, Debug, Default)]
+pub struct Facets {
+    /// Every statement of the definition, at every nesting level, in source order.
+    ///
+    /// 🔴 Deliberately **not** [`Analysis::type3_lines`] with depths bolted on, though on one
+    /// frontend the two happen to coincide. Type-3 shingles are whatever unit that pass counts best
+    /// — Rust emits one line per *top-level* block statement, with a nested `if` inlined whole — and
+    /// tying the statement stream to them would either force a change in an established pass's
+    /// behaviour or leave the other languages with a stream that has no nesting to report.
+    /// Two consumers, two units, no coupling.
+    ///
+    /// Order and depth together are the point. Flattened, `for x in xs: / f() / g()` reads the same
+    /// as the three statements where `g()` runs *after* the loop rather than inside it, and no
+    /// consumer can recover the difference from the strings — only the walk that produced them knows.
+    ///
+    /// **The definition's own header is the first entry, at depth 0, and its body starts at depth 1.**
+    /// Every frontend must agree on that, because a consumer comparing two languages' streams cannot
+    /// tell a missing header from a definition that opens with a statement. A consumer that wants
+    /// steps rather than declarations drops the head itself — two definitions sharing a signature
+    /// shape have not agreed on *doing* anything.
+    pub statements: Vec<Statement>,
+    /// Dotted paths this definition **reaches**: for every name it uses that its file imported, the
+    /// whole path that name stands for, with the language's own separator normalized to `.`
+    /// (`crate::a::b` and `./a/b` both become `a.b`).
+    ///
+    /// This is the corpus's own declaration of what a definition is *about*, and it is the one thing
+    /// a body-keyed index cannot supply: two functions written independently about one entity share
+    /// no line, and often not one name. Recording the path whole rather than the module lets
+    /// "imported the module" and "imported a member of it" meet on a **prefix** of the module tree
+    /// instead of failing to meet as strings.
+    ///
+    /// Normalizing the separator is the frontend's job because only it knows what a path is; the
+    /// prefix lattice over the result is the engine's, and is language-blind.
+    pub reaches: Vec<Arc<str>>,
+}
+
 /// One definition lowered to the engine's feature record. Produced by [`Frontend::scan`] with
 /// the canonical strings already computed (single parse per file). `line`/`col` are 0-indexed;
 /// `loc`/`args` mirror [`ModuleDef`]'s semantics.
@@ -101,7 +157,12 @@ pub struct Def {
     /// it here; the engine takes the cluster's minimum, so a cluster is never thicker than its
     /// thinnest member.
     pub thickness: Option<f64>,
+    /// The perspective passes' inputs — see [`Facets`]. Default (both empty) for a frontend that
+    /// does not report them, which those passes read as "nothing to say here", not as "no facts".
+    pub facets: Facets,
 }
+
+
 
 /// What the caller asked this run to produce. Some kinds cost real work — a second walk of every
 /// file, an extra canonicalization per definition — and emitting them unasked would both slow the

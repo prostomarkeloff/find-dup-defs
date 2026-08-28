@@ -13,12 +13,20 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_find-dup-defs");
 const FIX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mixed");
+/// A second tree for the converge goldens. Separate on purpose: the pass needs definitions that
+/// reach imports and word one shape differently, and adding those to `mixed` would move every
+/// existing golden for a pass they have nothing to do with.
+const FIX_CONVERGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/converge");
 
 fn run(extra: &[&str]) -> String {
+    run_in(FIX, extra)
+}
+
+fn run_in(fixture: &str, extra: &[&str]) -> String {
     let out = Command::new(BIN)
-        .arg(FIX)
+        .arg(fixture)
         .arg("--repo-root")
-        .arg(FIX)
+        .arg(fixture)
         .args(extra)
         .output()
         .expect("spawn find-dup-defs");
@@ -69,4 +77,23 @@ fn report_only_py_matches_golden() {
 #[test]
 fn report_only_ts_matches_golden() {
     assert_golden(&run(&["--only", "ts", "--show-info"]), include_str!("golden/report.ts.txt"), "report.ts.txt");
+}
+
+#[test]
+fn lenses_matches_golden() {
+    // Locks the lens record across two frontends at once — the fixture holds Python and TypeScript,
+    // and the ten questions are answered by each language's own walk.
+    assert_golden(&run(&["--kinds", "lenses", "--show-info"]), include_str!("golden/lenses.txt"), "lenses.txt");
+}
+
+#[test]
+fn converge_matches_golden() {
+    // Locks both anchors, the family rubric and the per-dialect vocabulary: the fixture holds a
+    // Python pair that meets only on a subject, a Python family worded three ways, and a Rust and a
+    // TypeScript pair whose canonicals are s-expr dumps rather than source-like.
+    assert_golden(
+        &run_in(FIX_CONVERGE, &["--converge", "--show-info"]),
+        include_str!("golden/converge.txt"),
+        "converge.txt",
+    );
 }

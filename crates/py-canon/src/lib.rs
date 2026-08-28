@@ -15,6 +15,8 @@ mod frontend;
 mod lenses;
 mod uses;
 
-pub use canon::{analyze_functions, ast_canonical, ast_canonical_many, normalize_functions, AnalyzedFn};
+pub use canon::{
+    analyze_functions, ast_canonical, ast_canonical_many, normalize_functions, AnalyzedFn,
+};
 pub use dup_defs_core::LineMap;
 pub use frontend::{Python, CLASSES, CONSTANTS, FUNCTIONS, LENSES, METHODS, TYPE_ALIASES};

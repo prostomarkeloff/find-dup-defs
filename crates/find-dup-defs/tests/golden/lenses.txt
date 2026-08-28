@@ -1,0 +1,63 @@
+--- duplicate constants (cross-file, by name) ---
+
+--- duplicate functions (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate functions (cross-name, exact AST-normalized) ---
+
+--- duplicate functions (cross-name Type-3, IDF-weighted cosine) ---
+
+--- duplicate methods (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate methods (cross-name, exact AST-normalized) ---
+
+--- duplicate methods (cross-name Type-3, IDF-weighted cosine) ---
+
+--- duplicate classes (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate interfaces (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate type aliases (cross-file, by name) ---
+
+--- duplicate lens consensus (cross-file, AST sim warn=0.5 error=0.85) ---
+DUPLICATE LENSES [ERROR]: Repo  [ast sim 1.00, T=0.39, n=2, loc=5, args=3]  votes[1]: schema×3
+  ts/core_a.ts:6
+  ts/core_b.ts:6
+
+DUPLICATE LENSES [ERROR]: Repository  [ast sim 1.00, T=0.78, n=2, loc=10, args=15]  votes[4]: effects×5 outgoing×5 control×3 failures×1
+  py/core_a.py:20
+  py/core_b.py:20
+
+DUPLICATE LENSES [ERROR]: Repository.fetchItem  [ast sim 1.00, T=0.84, n=2, loc=7, args=12]  votes[6]: control×3 signature×3 effects×2 outgoing×2 failures×1 scope×1
+  ts/core_a.ts:26
+  ts/core_b.ts:26
+
+DUPLICATE LENSES [ERROR]: computeScore  [ast sim 1.00, T=0.56, n=2, loc=7, args=8]  votes[3]: signature×4 control×2 scope×1
+  ts/core_a.ts:12
+  ts/core_b.ts:12
+
+DUPLICATE LENSES [ERROR]: compute_score  [ast sim 1.00, T=0.57, n=2, loc=5, args=6]  votes[5]: control×2 effects×1 outgoing×1 scope×1 signature×1
+  py/core_a.py:8
+  py/core_b.py:8
+
+DUPLICATE LENSES [ERROR]: renderBadge  [ast sim 1.00, T=0.54, n=2, loc=5, args=6]  votes[3]: signature×3 control×2 scope×1
+  ts/widget_a.tsx:1
+  ts/widget_b.tsx:1
+
+
+--- duplicate lens consensus (cross-name, exact AST-normalized) ---
+DUPLICATE LENSES [WARNING]: addNumbers/plusNumbers  [normalized-exact, T=0.42, n=2, loc=4, args=6]  votes[3]: signature×3 control×1 scope×1
+  ts/core_a.ts:20
+  ts/core_b.ts:20
+
+DUPLICATE LENSES [WARNING]: add_numbers/plus_numbers  [normalized-exact, T=0.35, n=2, loc=3, args=3]  votes[3]: control×1 scope×1 signature×1
+  py/core_a.py:15
+  py/core_b.py:15
+
+
+--- duplicate lens consensus (cross-name Type-3, IDF-weighted cosine) ---
+DUPLICATE LENSES [WARNING]: Cache/Repository  [ast sim 0.70, T=0.50, n=3, loc=10, args=15]  votes[4]: control×3 effects×2 outgoing×2 failures×1
+  py/core_a.py:20
+  py/core_a.py:33
+  py/core_b.py:20
+
+# summary: 6 ERROR, 3 WARNING groups

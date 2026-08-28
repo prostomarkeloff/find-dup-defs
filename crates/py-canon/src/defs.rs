@@ -22,12 +22,12 @@
 
 use std::sync::Arc;
 
-use find_dup_defs_canon::{count_loc, is_upper_snake};
-use dup_defs_core::{Analysis, CanonDialect, Def, KindSpec, LineMap, ScanOpts};
+use dup_defs_core::{count_loc, is_upper_snake, reach::reach_path, AnalyzedFn};
+use dup_defs_core::{Analysis, CanonDialect, Def, Facets, KindSpec, LineMap, ScanOpts, Statement};
 use ruff_python_ast::{Expr, Parameters, Stmt};
 use ruff_python_parser::parse_module;
 
-use crate::canon::{analyze_functions, analyze_stmt, ast_canonical, cluster_canonical_node};
+use crate::canon::{analyze_functions, analyze_stmt, ast_canonical, cluster_canonical_node, used_names};
 use crate::frontend::{enabled_lenses, kind_spec, METHODS};
 
 /// Total parameter count: posonly + args + kwonly + (`*args` if present) + (`**kwargs` if
@@ -59,7 +59,7 @@ fn const_name(stmt: &Stmt) -> Option<String> {
 /// The byte offset of the `def`/`async`/`class` keyword — i.e. the def text *excluding* decorators.
 /// With no decorators the statement range already starts at the keyword; with decorators we skip
 /// past the last decorator and any intervening whitespace / comment lines to the keyword token.
-fn keyword_start(source: &str, range_start: usize, last_decorator_end: Option<usize>) -> usize {
+pub(crate) fn keyword_start(source: &str, range_start: usize, last_decorator_end: Option<usize>) -> usize {
     let Some(mut i) = last_decorator_end else { return range_start };
     let bytes = source.as_bytes();
     loop {
@@ -241,23 +241,41 @@ pub(crate) fn classify(source: &str, stmt: &Stmt) -> Option<(&'static str, Strin
     }
 }
 
-/// Tuple → [`Analysis`], shared by the function and method canon paths.
-fn analysis_from(xname: String, lines: Vec<String>, size: usize) -> Analysis {
-    Analysis { xname_canonical: xname, type3_lines: lines, size, canon_dialect: CanonDialect::CPythonAst }
+/// [`AnalyzedFn`] → the engine's three pieces: the cluster canonical, the [`Analysis`], and the
+/// statement stream that rides alongside it as [`Facets::statements`].
+///
+/// Returned together rather than reassembled at each call site: one analysis produced all three, and
+/// handing them back separately invites a caller to pair a def's canon with another's stream.
+fn split_analysis(analyzed: AnalyzedFn) -> (Option<String>, Option<Analysis>, Vec<Statement>) {
+    let AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, statements, size } = analyzed;
+    (
+        Some(cluster_canonical),
+        Some(Analysis {
+            xname_canonical,
+            type3_lines,
+            size,
+            canon_dialect: CanonDialect::CPythonAst,
+        }),
+        statements,
+    )
 }
 
 /// Canonicalize a **top-level** function/class node (no re-parse). Returns
 /// `(cluster_canonical, analysis)`: functions get both off one node walk, classes get the
 /// cluster canonical only (not callable), and raw-text kinds get neither.
-fn top_def_canon(kind: &'static KindSpec, stmt: &Stmt, src: &str) -> (Option<String>, Option<Analysis>) {
+fn top_def_canon(
+    kind: &'static KindSpec,
+    stmt: &Stmt,
+    src: &str,
+) -> (Option<String>, Option<Analysis>, Vec<Statement>) {
     match kind.id {
         "functions" => match analyze_stmt(stmt, src) {
-            Some((cc, xname, lines, size)) => (Some(cc), Some(analysis_from(xname, lines, size))),
+            Some(analyzed) => split_analysis(analyzed),
             // A FunctionDef always analyzes; this branch only guards future kinds.
-            None => (Some(cluster_canonical_node(stmt, src)), None),
+            None => (Some(cluster_canonical_node(stmt, src)), None, Vec::new()),
         },
-        "classes" => (Some(cluster_canonical_node(stmt, src)), None),
-        _ => (None, None),
+        "classes" => (Some(cluster_canonical_node(stmt, src)), None, Vec::new()),
+        _ => (None, None, Vec::new()),
     }
 }
 
@@ -265,16 +283,24 @@ fn top_def_canon(kind: &'static KindSpec, stmt: &Stmt, src: &str) -> (Option<Str
 /// yields the cluster canonical (tuple `.0`, identical to `ast_canonical`) plus the analysis;
 /// on the rare unparseable-strip edge (`self, /`) it falls back to `ast_canonical`'s raw-text
 /// path with no analysis — byte-identical to the previous behavior.
-fn method_canon(canon_text: &str) -> (Option<String>, Option<Analysis>) {
+fn method_canon(canon_text: &str) -> (Option<String>, Option<Analysis>, Vec<Statement>) {
     match analyze_functions(&[canon_text.to_owned()]).into_iter().next().flatten() {
-        Some((cc, xname, lines, size)) => (Some(cc), Some(analysis_from(xname, lines, size))),
-        None => (Some(ast_canonical(canon_text)), None),
+        Some(analyzed) => split_analysis(analyzed),
+        None => (Some(ast_canonical(canon_text)), None, Vec::new()),
     }
 }
 
 /// Methods of one class as `Def`s (`kind = methods`, class-qualified names). Recurses into
 /// nested classes (`Outer.Inner.foo`); classes hidden inside a *function* are never reached.
-fn method_defs(source: &str, stmt: &Stmt, lines: &LineMap, file: &Arc<str>, parent_chain: &str, out: &mut Vec<Def>) {
+fn method_defs(
+    source: &str,
+    stmt: &Stmt,
+    lines: &LineMap,
+    file: &Arc<str>,
+    parent_chain: &str,
+    imports: &std::collections::HashMap<String, Arc<str>>,
+    out: &mut Vec<Def>,
+) {
     let Stmt::ClassDef(class) = stmt else { return };
     let class_name = class.name.id.as_str();
     let parent = if parent_chain.is_empty() { class_name.to_owned() } else { format!("{parent_chain}.{class_name}") };
@@ -297,7 +323,8 @@ fn method_defs(source: &str, stmt: &Stmt, lines: &LineMap, file: &Arc<str>, pare
                 let loc = count_loc(&text_orig);
                 let args = count_args(&node.parameters);
                 let canon_text = apply_receiver_strip(source, start, end, &node.parameters);
-                let (cluster_canonical, analysis) = method_canon(&canon_text);
+                let (cluster_canonical, analysis, statements) = method_canon(&canon_text);
+                let reaches = reached_paths(inner, imports);
                 out.push(Def {
                     lang: "py",
                     kind: &METHODS,
@@ -311,9 +338,10 @@ fn method_defs(source: &str, stmt: &Stmt, lines: &LineMap, file: &Arc<str>, pare
                     cluster_canonical,
                     analysis,
                     thickness: None,
+                    facets: Facets { statements, reaches },
                 });
             }
-            Stmt::ClassDef(_) => method_defs(source, inner, lines, file, &parent, out),
+            Stmt::ClassDef(_) => method_defs(source, inner, lines, file, &parent, imports, out),
             _ => {}
         }
     }
@@ -324,6 +352,13 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
     let Ok(parsed) = parse_module(source) else { return Vec::new() };
     let module = parsed.into_syntax();
     let lines = LineMap::new(source);
+    // The file's import table, resolved once: what each bound name stands for. Python already writes
+    // its paths with dots, so `reach_path` here is about agreeing with the other frontends on the
+    // form rather than translating a separator.
+    let imports: std::collections::HashMap<String, Arc<str>> = crate::canon::module_imports(source)
+        .into_iter()
+        .map(|i| (i.local, reach_path(&i.path.split('.').collect::<Vec<_>>())))
+        .collect();
     let mut defs: Vec<Def> = Vec::new();
     // Module scope is a property of the file, so it is collected once before any definition is
     // canonicalized against it.
@@ -332,14 +367,15 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
     let scope = (!lenses.is_empty()).then(|| crate::canon::module_bound_names(&module.body));
     for stmt in &module.body {
         if matches!(stmt, Stmt::ClassDef(_)) {
-            method_defs(source, stmt, &lines, file, "", &mut defs);
+            method_defs(source, stmt, &lines, file, "", &imports, &mut defs);
         }
         let Some((kind_id, name, start, end, args)) = classify(source, stmt) else { continue };
         let (line, col) = lines.loc0(start);
         let text_orig = source[start..end].to_owned();
         let loc = count_loc(&text_orig);
         let kind = kind_spec(kind_id);
-        let (cluster_canonical, analysis) = top_def_canon(kind, stmt, source);
+        let (cluster_canonical, analysis, statements) = top_def_canon(kind, stmt, source);
+        let reaches = reached_paths(stmt, &imports);
         if let Some(scope) = &scope {
             // The `scope` lens contributes a single fact: the whole body canonicalized with every
             // name the module introduced erased. One fact rather than one per statement, because
@@ -350,7 +386,7 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
             // single string that is unique per class — pure denominator, no shared numerator, and
             // it pushed genuinely-matching declarations below the cosine floor.
             let scope_lines = if kind.id == "functions" {
-                vec![crate::canon::analyze_in_scope(stmt, source, scope).1]
+                vec![crate::canon::analyze_in_scope(stmt, source, scope).xname_canonical]
             } else {
                 Vec::new()
             };
@@ -371,9 +407,27 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
             cluster_canonical,
             analysis,
             thickness: None,
+            facets: Facets { statements, reaches },
         });
     }
     defs
+}
+
+/// The dotted paths one definition reaches: for every name it mentions that the file imported, the
+/// whole path that name stands for.
+///
+/// Resolving it here rather than in the engine is not an optimization — only the frontend knows what
+/// its language calls a name and what an import binds. What the engine gets is the answer, in the one
+/// dotted form every language normalizes to.
+fn reached_paths(stmt: &Stmt, imports: &std::collections::HashMap<String, Arc<str>>) -> Vec<Arc<str>> {
+    if imports.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Arc<str>> =
+        used_names(stmt).iter().filter_map(|name| imports.get(name).map(Arc::clone)).collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[cfg(test)]
@@ -592,6 +646,44 @@ mod tests {
     }
 
     #[test]
+    fn a_definition_reports_its_statement_stream_with_nesting() {
+        let src = "def f(xs):\n    for x in xs:\n        g(x)\n    return 1\n";
+        let file: Arc<str> = Arc::from("<test>");
+        let defs = scan_source(src, &file, &ScanOpts::default());
+        let f = defs.iter().find(|d| d.name == "f").expect("f");
+        let depths: Vec<u16> = f.facets.statements.iter().map(|s| s.depth).collect();
+        // The def header opens the stream at depth 0 and the body starts one deeper — the contract
+        // every frontend agrees on. Within the body, the `for` header and the `return` are siblings
+        // while the call inside the loop is not: flattened, that difference is unrecoverable, which
+        // is the whole reason the stream carries depth.
+        assert_eq!(depths, vec![0, 1, 2, 1], "statements: {:?}", f.facets.statements);
+        assert!(f.facets.statements[0].line.starts_with("def "), "the head is the definition itself");
+    }
+
+    #[test]
+    fn a_definition_reports_the_paths_it_reaches_and_only_those() {
+        let src = "from a.b import c\nimport d.e as f\n\n\ndef g(x):\n    return c(x)\n";
+        let file: Arc<str> = Arc::from("<test>");
+        let defs = scan_source(src, &file, &ScanOpts::default());
+        let g = defs.iter().find(|d| d.name == "g").expect("g");
+        let reaches: Vec<&str> = g.facets.reaches.iter().map(|r| &**r).collect();
+        // `c` is used, so its whole path is reported; `f` is imported and never used, and an import
+        // the definition does not touch says nothing about what it is *about*.
+        assert_eq!(reaches, vec!["a.b.c"]);
+    }
+
+    #[test]
+    fn a_definition_that_imports_nothing_reaches_nothing() {
+        let src = "def h(x):\n    y = x + 1\n    return y\n";
+        let file: Arc<str> = Arc::from("<test>");
+        let defs = scan_source(src, &file, &ScanOpts::default());
+        let h = defs.iter().find(|d| d.name == "h").expect("h");
+        assert!(h.facets.reaches.is_empty());
+        // Empty reach is not empty facets: the stream is still there.
+        assert!(!h.facets.statements.is_empty());
+    }
+
+    #[test]
     fn node_canon_matches_slice_reparse_for_functions_and_classes() {
         use crate::canon::{analyze_functions, ast_canonical};
         let file: Arc<str> = Arc::from("<test>");
@@ -609,7 +701,7 @@ mod tests {
                     let a = d.analysis.as_ref().expect("fn_like has analysis");
                     assert_eq!(
                         (a.xname_canonical.as_str(), a.type3_lines.as_slice(), a.size),
-                        (slice.1.as_str(), slice.2.as_slice(), slice.3),
+                        (slice.xname_canonical.as_str(), slice.type3_lines.as_slice(), slice.size),
                         "analysis mismatch for {:?}",
                         d.name
                     );

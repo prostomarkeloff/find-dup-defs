@@ -40,11 +40,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::sync::Arc;
+
+use dup_defs_core::Statement as CoreStatement;
+use dup_defs_core::reach::reach_path;
 
 /// `(cluster_canonical, xname_canonical, type3_lines, node_count)` — the analysis tuple the scan
 /// reads to build a `Def`'s cluster canonical + `Analysis`. `ts-canon`'s own type (was shared via
 /// `dup-defs-core`, now local since the engine consumes `Def`, not this tuple).
-pub use find_dup_defs_canon::AnalyzedFn;
+pub use dup_defs_core::AnalyzedFn;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     self, ArrayExpressionElement, Argument, AssignmentTarget, AssignmentTargetMaybeDefault,
@@ -379,7 +383,7 @@ impl<'a> Dump<'a> {
     }
 
     fn rename(&mut self, name: &str) -> String {
-        find_dup_defs_canon::alpha_rename(&mut self.map, self.locals, name)
+        dup_defs_core::alpha_rename(&mut self.map, self.locals, name)
     }
 
     /// Emit one node as `Tag(field1, field2, …)`. Empty trailing fields are NOT trimmed (so
@@ -1343,11 +1347,11 @@ fn analyze_one(text: &str) -> Option<AnalyzedFn> {
     // Two paths: a real Function node, or an arrow/function-expression init in a var decl.
     // Either way, we collect locals from params+body and emit the cluster + xname canonicals
     // off the same parse.
-    let (params, body_stmts, cluster_canonical) = if let Some(f) = func {
+    let (params, body_stmts, cluster_canonical, is_async) = if let Some(f) = func {
         let body = f.body.as_deref()?;
         let mut cd = Dump::new(None);
         let cc = cluster_stmt(&mut cd, stmt);
-        (Some(&*f.params), Some(&body.statements[..]), cc)
+        (Some(&*f.params), Some(&body.statements[..]), cc, f.r#async)
     } else if let Statement::VariableDeclaration(v) = stmt {
         let decl = v.declarations.first()?;
         let init = decl.init.as_ref()?;
@@ -1355,13 +1359,13 @@ fn analyze_one(text: &str) -> Option<AnalyzedFn> {
             Expression::ArrowFunctionExpression(a) => {
                 let mut cd = Dump::new(None);
                 let cc = cluster_stmt(&mut cd, stmt);
-                (Some(&*a.params), Some(&a.body.statements[..]), cc)
+                (Some(&*a.params), Some(&a.body.statements[..]), cc, a.r#async)
             }
             Expression::FunctionExpression(f) => {
                 let body = f.body.as_deref()?;
                 let mut cd = Dump::new(None);
                 let cc = cluster_stmt(&mut cd, stmt);
-                (Some(&*f.params), Some(&body.statements[..]), cc)
+                (Some(&*f.params), Some(&body.statements[..]), cc, f.r#async)
             }
             _ => return None,
         }
@@ -1402,12 +1406,301 @@ fn analyze_one(text: &str) -> Option<AnalyzedFn> {
     let mut line_d = Dump::new(Some(&locals));
     let lines: Vec<String> = body_stmts.iter().map(|s| line_d.stmt(s)).collect();
 
-    Some((cluster_canonical, xname, lines, size))
+    let statements = statement_stream(params, body_stmts, &locals, is_async);
+    Some(AnalyzedFn { cluster_canonical, xname_canonical: xname, type3_lines: lines, statements, size })
 }
 
 #[must_use]
 pub fn analyze_functions(texts: &[String]) -> Vec<Option<AnalyzedFn>> {
     texts.par_iter().map(|t| analyze_one(t)).collect()
+}
+
+/// The body canonicalized with every name the **module** introduced erased — the widest rung of the
+/// erasure ladder, which the `scope` lens projects as a single fact.
+///
+/// One string rather than one per statement: what it asserts is all-or-nothing — two bodies either
+/// reduce to the same shape or they do not — and as one rare string it carries the IDF weight that
+/// claim deserves.
+#[must_use]
+pub fn scope_canonical(
+    params: &FormalParameters<'_>,
+    body: &[Statement<'_>],
+    module_names: &HashSet<String>,
+) -> String {
+    let mut collect = Collect::default();
+    collect.add_params(params);
+    for stmt in body {
+        collect.collect_stmt(stmt);
+    }
+    let mut locals = collect.bound;
+    locals.extend(module_names.iter().cloned());
+    let mut dump = Dump::new(Some(&locals));
+    let rendered = dump.formal_params(params);
+    let rendered_body = dump.block_body(body);
+    dump.node("Func", &[Dump::lit_str("_fn"), rendered, rendered_body])
+}
+
+// ───────────────────────────── statement stream ─────────────────────────────
+
+/// One line per statement at **every** nesting level, in source order — the engine's
+/// [`Facets::statements`](dup_defs_core::Facets::statements).
+///
+/// A second traversal rather than a re-use of the Type-3 lines: those are one line per *top-level*
+/// body statement, with a nested `if` inlined whole into its parent's line — right for an
+/// order-invariant cosine, useless for a pass that asks where two definitions stopped agreeing,
+/// because everything interesting is buried inside one string.
+///
+/// A compound statement contributes a **header** naming what it tests (`If(test)`,
+/// `Switch(discriminant)`, `ForOf(left, right)`) with its body elided, and the body follows one level
+/// deeper — the same shape the Python and Rust frontends produce, so the three streams are
+/// comparable rather than merely all present.
+///
+/// One `Dump` for the whole definition, so a local carries the same `_v{n}` across every line it
+/// appears on. The Type-3 lines use a fresh `Dump` per line on purpose (order-invariance); here the
+/// order *is* the signal.
+fn statement_stream(
+    params: &FormalParameters<'_>,
+    body: &[Statement<'_>],
+    locals: &HashSet<String>,
+    is_async: bool,
+) -> Vec<CoreStatement> {
+    let mut dump = Dump::new(Some(locals));
+    let rendered = dump.formal_params(params);
+    let flags = format!("async={is_async}");
+    // The definition's own header opens the stream at depth 0, its body at depth 1 — the contract
+    // every frontend agrees on. The name is `_fn` for the same reason the xname canonical blanks it.
+    let head = dump.node("Func", &[Dump::lit_str("_fn"), rendered, Dump::lit_str(&flags)]);
+    let mut walk = StreamWalk { dump: &mut dump, out: vec![CoreStatement { line: head, depth: 0 }] };
+    walk.stmts(body, 1);
+    walk.out
+}
+
+struct StreamWalk<'a, 'b> {
+    dump: &'b mut Dump<'a>,
+    out: Vec<CoreStatement>,
+}
+
+impl StreamWalk<'_, '_> {
+    fn push(&mut self, depth: u16, line: String) {
+        self.out.push(CoreStatement { line, depth });
+    }
+
+    fn stmts(&mut self, stmts: &[Statement<'_>], depth: u16) {
+        for stmt in stmts {
+            self.stmt(stmt, depth);
+        }
+    }
+
+    /// A statement's body, whether it is a block or a single statement — `if (c) f();` nests just as
+    /// `if (c) { f(); }` does, and a stream that treated the braces as the structure would read two
+    /// equivalent sources as different shapes.
+    fn body(&mut self, stmt: &Statement<'_>, depth: u16) {
+        match stmt {
+            Statement::BlockStatement(block) => self.stmts(&block.body, depth),
+            other => self.stmt(other, depth),
+        }
+    }
+
+    fn stmt(&mut self, stmt: &Statement<'_>, depth: u16) {
+        match stmt {
+            Statement::BlockStatement(block) => {
+                let head = self.dump.node("Block", &[]);
+                self.push(depth, head);
+                self.stmts(&block.body, depth + 1);
+            }
+            Statement::IfStatement(node) => {
+                let test = self.dump.expr(&node.test);
+                let head = self.dump.node("If", &[test]);
+                self.push(depth, head);
+                self.body(&node.consequent, depth + 1);
+                if let Some(alt) = &node.alternate {
+                    let head = self.dump.node("Else", &[]);
+                    self.push(depth, head);
+                    match alt {
+                        // `else if` is a sibling of its `else`, not a level deeper — what the source
+                        // means, and what Python's `elif` and Rust's `else if` render as.
+                        Statement::IfStatement(_) => self.stmt(alt, depth),
+                        other => self.body(other, depth + 1),
+                    }
+                }
+            }
+            Statement::ForStatement(node) => {
+                let init = node.init.as_ref().map_or_else(String::new, |i| self.dump.for_init(i));
+                let test = node.test.as_ref().map_or_else(String::new, |t| self.dump.expr(t));
+                let update = node.update.as_ref().map_or_else(String::new, |u| self.dump.expr(u));
+                let head = self.dump.node("For", &[init, test, update]);
+                self.push(depth, head);
+                self.body(&node.body, depth + 1);
+            }
+            Statement::ForInStatement(node) => {
+                let left = self.dump.for_left(&node.left);
+                let right = self.dump.expr(&node.right);
+                let head = self.dump.node("ForIn", &[left, right]);
+                self.push(depth, head);
+                self.body(&node.body, depth + 1);
+            }
+            Statement::ForOfStatement(node) => {
+                let tag = if node.r#await { "ForAwaitOf" } else { "ForOf" };
+                let left = self.dump.for_left(&node.left);
+                let right = self.dump.expr(&node.right);
+                let head = self.dump.node(tag, &[left, right]);
+                self.push(depth, head);
+                self.body(&node.body, depth + 1);
+            }
+            Statement::WhileStatement(node) => {
+                let test = self.dump.expr(&node.test);
+                let head = self.dump.node("While", &[test]);
+                self.push(depth, head);
+                self.body(&node.body, depth + 1);
+            }
+            Statement::DoWhileStatement(node) => {
+                let test = self.dump.expr(&node.test);
+                let head = self.dump.node("DoWhile", &[test]);
+                self.push(depth, head);
+                self.body(&node.body, depth + 1);
+            }
+            Statement::SwitchStatement(node) => {
+                let disc = self.dump.expr(&node.discriminant);
+                let head = self.dump.node("Switch", &[disc]);
+                self.push(depth, head);
+                for case in &node.cases {
+                    let test = case.test.as_ref().map_or_else(String::new, |t| self.dump.expr(t));
+                    let head = self.dump.node("Case", &[test]);
+                    self.push(depth + 1, head);
+                    self.stmts(&case.consequent, depth + 2);
+                }
+            }
+            Statement::TryStatement(node) => {
+                let head = self.dump.node("Try", &[]);
+                self.push(depth, head);
+                self.stmts(&node.block.body, depth + 1);
+                if let Some(handler) = &node.handler {
+                    let param =
+                        handler.param.as_ref().map_or_else(String::new, |p| self.dump.binding(&p.pattern));
+                    let head = self.dump.node("Catch", &[param]);
+                    self.push(depth, head);
+                    self.stmts(&handler.body.body, depth + 1);
+                }
+                if let Some(finalizer) = &node.finalizer {
+                    let head = self.dump.node("Finally", &[]);
+                    self.push(depth, head);
+                    self.stmts(&finalizer.body, depth + 1);
+                }
+            }
+            // A label names a statement; it is not a block of its own, so it adds no depth.
+            Statement::LabeledStatement(node) => self.stmt(&node.body, depth),
+            other => {
+                let line = self.dump.stmt(other);
+                self.push(depth, line);
+            }
+        }
+    }
+}
+
+// ───────────────────────────── reach ─────────────────────────────
+
+/// What each name a module's imports bind stands for, as the engine's dotted path.
+///
+/// `import { c } from "a/b"` binds `c` to `a.b.c`; `import { c as z }` binds `z` to the same; a
+/// default or namespace import binds its name to the module path itself, since that is the whole of
+/// what it names. A bare `import "a/b"` binds nothing and is skipped rather than guessed at.
+///
+/// 🔴 A **relative** specifier is resolved against the importing file's own directory. Left as
+/// written, `./a/b` and `../a/b` become paths beginning with a bare `.` or `..`, and every relative
+/// import in the tree then shares those as a prefix node — so "both of these import something
+/// relative" reads as "both of these are about the same thing". Found by running the pass on a real
+/// frontend, where eighteen families formed on exactly that and on nothing else. Resolved, two
+/// packages' `./models` are two distinct nodes, which is what the path was recording in the first
+/// place.
+#[must_use]
+pub fn module_imports(prog: &ast::Program<'_>, file: &str) -> Vec<(String, Arc<str>)> {
+    let mut out = Vec::new();
+    for stmt in &prog.body {
+        let Statement::ImportDeclaration(decl) = stmt else { continue };
+        let source = resolve_specifier(decl.source.value.as_str(), file);
+        let Some(specifiers) = &decl.specifiers else { continue };
+        for specifier in specifiers {
+            match specifier {
+                ast::ImportDeclarationSpecifier::ImportSpecifier(s) => {
+                    let mut path = source.clone();
+                    path.push(s.imported.name().to_string());
+                    out.push((s.local.name.to_string(), reach_path(&path)));
+                }
+                ast::ImportDeclarationSpecifier::ImportDefaultSpecifier(s) => {
+                    out.push((s.local.name.to_string(), reach_path(&source)));
+                }
+                ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(s) => {
+                    out.push((s.local.name.to_string(), reach_path(&source)));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A specifier as path segments: absolute ones as written, relative ones walked from the importing
+/// file's directory so they name where they actually point.
+fn resolve_specifier(specifier: &str, file: &str) -> Vec<String> {
+    if !specifier.starts_with('.') {
+        return specifier.split('/').map(str::to_owned).collect();
+    }
+    // The file's directory — everything but the file name itself.
+    let mut segments: Vec<String> = file.split('/').map(str::to_owned).collect();
+    segments.pop();
+    for part in specifier.split('/') {
+        match part {
+            "." | "" => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other.to_owned()),
+        }
+    }
+    segments
+}
+
+/// The dotted paths a definition reaches, read off its own statement stream.
+///
+/// The stream is already rendered, and the canonical renames *locals* to `_v{n}` while leaving free
+/// names verbatim — so an imported name appears in it as itself. Reading identifiers back off those
+/// strings costs one pass over text the frontend has already produced, where a second AST visitor
+/// would have to keep up with an expression grammar of some eighty variants; anything the unparser
+/// learns to render, this sees.
+///
+/// Not filtered by boundness, for the same reason as the other frontends: a local shadowing an
+/// import inside one function is rare, and reading the shadow as "this definition does not reach
+/// that module" is a silent false negative, the expensive direction here.
+#[must_use]
+pub fn reached_paths(
+    statements: &[CoreStatement],
+    imports: &HashMap<String, Arc<str>>,
+) -> Vec<Arc<str>> {
+    if imports.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Arc<str>> = Vec::new();
+    let mut token = String::new();
+    let take = |token: &mut String, out: &mut Vec<Arc<str>>| {
+        if let Some(path) = imports.get(token.as_str()) {
+            out.push(Arc::clone(path));
+        }
+        token.clear();
+    };
+    for statement in statements {
+        for ch in statement.line.chars() {
+            if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+                token.push(ch);
+            } else if !token.is_empty() {
+                take(&mut token, &mut out);
+            }
+        }
+        if !token.is_empty() {
+            take(&mut token, &mut out);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[cfg(test)]
@@ -1429,7 +1722,7 @@ mod tests {
         let b = "function plus(a: number, b: number) { return a + b; }";
         let aa = analyze_one(a).expect("a parses");
         let bb = analyze_one(b).expect("b parses");
-        assert_eq!(aa.1, bb.1, "xname canonicals should match across alpha-renaming\n  a: {}\n  b: {}", aa.1, bb.1);
+        assert_eq!(aa.xname_canonical, bb.xname_canonical, "xname canonicals should match across alpha-renaming\n  a: {}\n  b: {}", aa.xname_canonical, bb.xname_canonical);
     }
 
     #[test]
@@ -1438,7 +1731,7 @@ mod tests {
         let b = "function add(x: number, y: number) { return x - y; }";
         let aa = analyze_one(a).expect("a parses");
         let bb = analyze_one(b).expect("b parses");
-        assert_ne!(aa.1, bb.1, "different operators must produce different xname canonicals");
+        assert_ne!(aa.xname_canonical, bb.xname_canonical, "different operators must produce different xname canonicals");
     }
 
     #[test]
@@ -1452,7 +1745,8 @@ mod tests {
     #[test]
     fn analyze_lines_are_per_statement() {
         let src = "function f(x: number, y: number) {\n  const z = x + y;\n  return z * 2;\n}";
-        let (_, _, lines, size) = analyze_one(src).expect("parses");
+        let a = analyze_one(src).expect("parses");
+        let (lines, size) = (a.type3_lines, a.size);
         assert_eq!(lines.len(), 2, "got lines: {lines:?}");
         assert!(size > 0);
     }
@@ -1474,8 +1768,8 @@ mod tests {
         let b = "const fetchOrder = (key: string) => { return db.find(key); };";
         let aa = analyze_one(a).expect("a parses");
         let bb = analyze_one(b).expect("b parses");
-        assert!(aa.1.contains("Bind('_fn')"), "top name should blank to _fn, got: {}", aa.1);
-        assert_eq!(aa.1, bb.1, "renamed arrow-consts should alpha-equate\n  a: {}\n  b: {}", aa.1, bb.1);
+        assert!(aa.xname_canonical.contains("Bind('_fn')"), "top name should blank to _fn, got: {}", aa.xname_canonical);
+        assert_eq!(aa.xname_canonical, bb.xname_canonical, "renamed arrow-consts should alpha-equate\n  a: {}\n  b: {}", aa.xname_canonical, bb.xname_canonical);
     }
 
     #[test]
@@ -1483,8 +1777,8 @@ mod tests {
         let src = "const fetch = async (x: number): Promise<number> => { return x + 1; };";
         let analysis = analyze_one(src);
         assert!(analysis.is_some(), "arrow-const should analyze");
-        let (_, xname, lines, _) = analysis.unwrap();
-        assert!(xname.contains("Arrow"));
-        assert_eq!(lines.len(), 1, "single-stmt body, one line");
+        let analyzed = analysis.unwrap();
+        assert!(analyzed.xname_canonical.contains("Arrow"));
+        assert_eq!(analyzed.type3_lines.len(), 1, "single-stmt body, one line");
     }
 }

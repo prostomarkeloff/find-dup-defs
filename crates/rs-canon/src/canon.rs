@@ -24,6 +24,9 @@
 )]
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use dup_defs_core::Statement;
 
 use syn::{
     BinOp, Block, Expr, FnArg, Generics, ImplItemFn, ItemEnum, ItemFn, ItemStruct, ItemTrait,
@@ -32,7 +35,7 @@ use syn::{
 
 /// `(cluster_canonical, xname_canonical, type3_lines, node_count)` — the analysis tuple the scan
 /// reads to build a callable `Def`'s cluster canonical + `Analysis`.
-pub use find_dup_defs_canon::AnalyzedFn;
+pub use dup_defs_core::AnalyzedFn;
 
 // ───────────────────────────── bound-locals collector ─────────────────────────────
 
@@ -200,7 +203,7 @@ impl<'a> Dump<'a> {
     }
 
     fn rename(&mut self, name: &str) -> String {
-        find_dup_defs_canon::alpha_rename(&mut self.map, self.locals, name)
+        dup_defs_core::alpha_rename(&mut self.map, self.locals, name)
     }
 
     fn node(&mut self, tag: &str, fields: &[String]) -> String {
@@ -840,7 +843,25 @@ fn analyze(name: &str, sig: &Signature, body: &Block) -> AnalyzedFn {
     let size = xd.count;
 
     let lines = type3_lines(body, &locals);
-    (cluster, xname, lines, size)
+    let statements = statement_stream(name, sig, body, &locals);
+    AnalyzedFn { cluster_canonical: cluster, xname_canonical: xname, type3_lines: lines, statements, size }
+}
+
+/// The body canonicalized with every name the **file** introduced erased — the widest rung of the
+/// erasure ladder, which the `scope` lens projects as a single fact.
+///
+/// One string rather than one per statement: what it asserts is all-or-nothing — two bodies either
+/// reduce to the same shape or they do not — and as one rare string it carries the IDF weight that
+/// claim deserves.
+#[must_use]
+pub fn scope_canonical(sig: &Signature, body: &Block, file_names: &HashSet<String>) -> String {
+    let mut collect = Collect::default();
+    collect.add_inputs(sig);
+    collect.visit_block(body);
+    let mut locals = collect.bound;
+    locals.extend(file_names.iter().cloned());
+    let mut dump = Dump::new(Some(&locals));
+    dump.func("_fn", sig, Some(body), true)
 }
 
 /// Analyze a free `fn` item.
@@ -859,4 +880,238 @@ pub fn analyze_impl_fn(f: &ImplItemFn) -> AnalyzedFn {
 #[must_use]
 pub fn analyze_trait_fn(f: &TraitItemFn) -> Option<AnalyzedFn> {
     f.default.as_ref().map(|body| analyze(&f.sig.ident.to_string(), &f.sig, body))
+}
+
+// ───────────────────────────── statement stream ─────────────────────────────
+
+/// One line per statement at **every** nesting level, in source order — the engine's
+/// [`Facets::statements`](dup_defs_core::Facets::statements).
+///
+/// Deliberately a second traversal rather than a re-use of [`type3_lines`]. Those are one line per
+/// *top-level* block statement, with a nested `if` inlined whole into its parent's line: right for
+/// an order-invariant cosine, useless for a pass that asks where two definitions stopped agreeing,
+/// since everything interesting is buried inside one string. This walks in.
+///
+/// Rust has no statement-level `if`: control flow is expressions, so the walk descends into the
+/// expression forms that carry a block. A compound construct contributes a **header** line naming
+/// what it tests (`If(cond)`, `Match(scrutinee)`, `For(pat, iter)`) with its body elided, and the
+/// body follows one level deeper — the same shape Python's unparser produces, so the two languages'
+/// streams are comparable rather than merely both present.
+///
+/// One `Dump` for the whole definition, so a local carries the same `_v{n}` across every line it
+/// appears on. `type3_lines` uses a fresh `Dump` per line on purpose (order-invariance); here the
+/// order *is* the signal, and a slot that means something different on each line would destroy it.
+#[must_use]
+pub fn statement_stream(name: &str, sig: &Signature, body: &Block, locals: &HashSet<String>) -> Vec<Statement> {
+    let mut dump = Dump::new(Some(locals));
+    // The definition's own header opens the stream at depth 0 and the body starts at depth 1 — the
+    // contract every frontend agrees on, so a consumer cannot mistake a missing header for a
+    // definition that opens with a statement.
+    let head = dump.func(name, sig, None, true);
+    let mut walk = StreamWalk { dump: &mut dump, out: vec![Statement { line: head, depth: 0 }] };
+    walk.block(body, 1);
+    walk.out
+}
+
+struct StreamWalk<'a, 'b> {
+    dump: &'b mut Dump<'a>,
+    out: Vec<Statement>,
+}
+
+impl StreamWalk<'_, '_> {
+    fn push(&mut self, depth: u16, line: String) {
+        self.out.push(Statement { line, depth });
+    }
+
+    fn block(&mut self, block: &Block, depth: u16) {
+        for stmt in &block.stmts {
+            self.stmt(stmt, depth);
+        }
+    }
+
+    fn stmt(&mut self, stmt: &Stmt, depth: u16) {
+        match stmt {
+            // A block-carrying expression *as a statement* is a construct, not a value: walk it.
+            // The same expression in value position (`let x = if c { a } else { b };`) stays one
+            // line, because there the block is how the value is written, not a step of the body.
+            Stmt::Expr(expr, _) if opens_a_block(expr) => self.control(expr, depth),
+            _ => {
+                let line = self.dump.stmt(stmt);
+                self.push(depth, line);
+            }
+        }
+    }
+
+    /// A block-carrying expression: its header, then its body one level deeper.
+    fn control(&mut self, expr: &Expr, depth: u16) {
+        match expr {
+            Expr::If(node) => {
+                let cond = self.dump.expr(&node.cond);
+                let head = self.dump.node("If", &[cond]);
+                self.push(depth, head);
+                self.block(&node.then_branch, depth + 1);
+                if let Some((_, alt)) = &node.else_branch {
+                    let head = self.dump.node("Else", &[]);
+                    self.push(depth, head);
+                    match alt.as_ref() {
+                        // `else if` chains as a sibling of the `else`, not nested under it — which
+                        // is what the source means and what Python's `elif` renders as.
+                        Expr::If(_) => self.control(alt, depth),
+                        Expr::Block(b) => self.block(&b.block, depth + 1),
+                        other => self.control_or_line(other, depth + 1),
+                    }
+                }
+            }
+            Expr::Match(node) => {
+                let scrutinee = self.dump.expr(&node.expr);
+                let head = self.dump.node("Match", &[scrutinee]);
+                self.push(depth, head);
+                for arm in &node.arms {
+                    let pat = self.dump.pat(&arm.pat);
+                    let guard = arm.guard.as_ref().map_or_else(String::new, |(_, g)| self.dump.expr(g));
+                    let head = self.dump.node("Arm", &[pat, guard]);
+                    self.push(depth + 1, head);
+                    self.control_or_line(&arm.body, depth + 2);
+                }
+            }
+            Expr::While(node) => {
+                let cond = self.dump.expr(&node.cond);
+                let head = self.dump.node("While", &[cond]);
+                self.push(depth, head);
+                self.block(&node.body, depth + 1);
+            }
+            Expr::ForLoop(node) => {
+                let pat = self.dump.pat(&node.pat);
+                let iter = self.dump.expr(&node.expr);
+                let head = self.dump.node("For", &[pat, iter]);
+                self.push(depth, head);
+                self.block(&node.body, depth + 1);
+            }
+            Expr::Loop(node) => {
+                let head = self.dump.node("Loop", &[]);
+                self.push(depth, head);
+                self.block(&node.body, depth + 1);
+            }
+            Expr::Block(node) => {
+                let head = self.dump.node("Block", &[]);
+                self.push(depth, head);
+                self.block(&node.block, depth + 1);
+            }
+            Expr::Unsafe(node) => {
+                let head = self.dump.node("Unsafe", &[]);
+                self.push(depth, head);
+                self.block(&node.block, depth + 1);
+            }
+            Expr::TryBlock(node) => {
+                let head = self.dump.node("TryBlock", &[]);
+                self.push(depth, head);
+                self.block(&node.block, depth + 1);
+            }
+            Expr::Async(node) => {
+                let head = self.dump.node("Async", &[]);
+                self.push(depth, head);
+                self.block(&node.block, depth + 1);
+            }
+            other => self.control_or_line(other, depth),
+        }
+    }
+
+    /// Walk `expr` if it opens a block, otherwise emit it as one line.
+    fn control_or_line(&mut self, expr: &Expr, depth: u16) {
+        if opens_a_block(expr) {
+            self.control(expr, depth);
+        } else {
+            let line = self.dump.expr(expr);
+            self.push(depth, line);
+        }
+    }
+}
+
+/// Does this expression carry a block the stream should walk into?
+fn opens_a_block(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::If(_)
+            | Expr::Match(_)
+            | Expr::While(_)
+            | Expr::ForLoop(_)
+            | Expr::Loop(_)
+            | Expr::Block(_)
+            | Expr::Unsafe(_)
+            | Expr::TryBlock(_)
+            | Expr::Async(_)
+    )
+}
+
+// ───────────────────────────── reach ─────────────────────────────
+
+/// What each name a file's `use` items bind stands for, as the engine's dotted path.
+///
+/// `use a::b::c;` binds `c` to `a.b.c`; `use a::b as z;` binds `z` to `a.b`; `use a::{b, c::d};`
+/// binds both leaves. A glob binds no name this can attribute a use to, so it is skipped rather than
+/// guessed at.
+#[must_use]
+pub fn file_imports(file: &syn::File) -> Vec<(String, Arc<str>)> {
+    let mut out = Vec::new();
+    for item in &file.items {
+        if let syn::Item::Use(item) = item {
+            walk_use(&item.tree, &mut Vec::new(), &mut out);
+        }
+    }
+    out
+}
+
+fn walk_use(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut Vec<(String, Arc<str>)>) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            walk_use(&path.tree, prefix, out);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            let leaf = name.ident.to_string();
+            prefix.push(leaf.clone());
+            out.push((leaf, dup_defs_core::reach::reach_path(prefix)));
+            prefix.pop();
+        }
+        syn::UseTree::Rename(rename) => {
+            prefix.push(rename.ident.to_string());
+            out.push((rename.rename.to_string(), dup_defs_core::reach::reach_path(prefix)));
+            prefix.pop();
+        }
+        syn::UseTree::Group(group) => {
+            for tree in &group.items {
+                walk_use(tree, prefix, out);
+            }
+        }
+        // `use a::*` binds names this cannot enumerate; guessing would invent reach that is not there.
+        syn::UseTree::Glob(_) => {}
+    }
+}
+
+/// Every path head this callable mentions — the raw material the frontend intersects with what its
+/// file imported.
+///
+/// Deliberately not filtered by boundness: a local shadowing an import inside one function is rare,
+/// and reading the shadow as "this definition does not reach that module" is a silent false
+/// negative, the expensive direction here.
+#[must_use]
+pub fn used_names(block: &Block) -> HashSet<String> {
+    #[derive(Default)]
+    struct Names {
+        seen: HashSet<String>,
+    }
+    impl<'ast> syn::visit::Visit<'ast> for Names {
+        fn visit_path(&mut self, path: &'ast syn::Path) {
+            if let Some(first) = path.segments.first() {
+                self.seen.insert(first.ident.to_string());
+            }
+            // A path's own segments are not expressions; keep walking for generic arguments, which
+            // can name types this definition genuinely reaches.
+            syn::visit::visit_path(self, path);
+        }
+    }
+    let mut names = Names::default();
+    syn::visit::Visit::visit_block(&mut names, block);
+    names.seen
 }

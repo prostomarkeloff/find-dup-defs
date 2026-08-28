@@ -1,0 +1,49 @@
+--- duplicate constants (cross-file, by name) ---
+
+--- duplicate functions (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate functions (cross-name, exact AST-normalized) ---
+
+--- duplicate functions (cross-name Type-3, IDF-weighted cosine) ---
+
+--- duplicate methods (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate methods (cross-name, exact AST-normalized) ---
+
+--- duplicate methods (cross-name Type-3, IDF-weighted cosine) ---
+
+--- duplicate classes (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate interfaces (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate type aliases (cross-file, by name) ---
+
+--- divergences in functions (converge — one thing done twice, and where they part) ---
+DUPLICATE FUNCTION [INFO]: exportContacts / exportTimeline  [T=0.09, n=2, loc=5, args=3]  votes[4]: text×0 shape×19 subject×1 fork×3  # subject: @.shared.export.buildStreamingResponse (reached by 2 definitions)
+  ts/exports.ts:5
+  ts/exports.ts:11
+
+DUPLICATE FUNCTION [INFO]: enforce_submit_budget / apply_source_limit  [T=0.06, n=2, loc=9, args=2]  votes[4]: text×3 shape×14 subject×1 fork×3  # agreed on 1 statement(s):;   = with write_session() as _v3:; parted:;   attempts_prune(_v3, scope=SUBMIT, older_than=_v2);   by: SUBMIT;   attempts_prune(_v4, scope=APPLY, older_than=_v3);   by: APPLY; subject: infra.quota.repo.attempt_record (reached by 2 definitions)
+  py/limits.py:7
+  py/limits.py:17
+
+DUPLICATE FUNCTION [INFO]: revoke_admins / expel_members  [T=0.03, n=2, loc=7, args=2]  votes[4]: text×0 shape×6 subject×1 fork×3  # agreed on 3 statement(s):;   = Let(Bind('_v2'), Call(Path('open_session'), Path('_v0')));   = Let(Bind('_v3'), Call(Path('resolve_chat'), Ref('', Path('_v2')), Path('_v0')));   = Let(Bind('_v4'), Method(Path('_v3'), 'identifier', )); parted:;   Let(Bind('_v5'), Method(Method(Method(Path('_v1'), 'iter', ), 'map', Closure(Bind('admin'), Call(Path('demote_one'), Ref('', Path('_v2')), Path('_v4'), Unary('*', Path('admin'))))), 'collect', ));   by: admin, demote_one;   Let(Bind('_v5'), Method(Method(Method(Path('_v1'), 'iter', ), 'map', Closure(Bind('person'), Call(Path('kick_one'), Ref('', Path('_v2')), Path('_v4'), Unary('*', Path('person'))))), 'collect', ));   by: kick_one, person; and agreed again; subject: crate.session.open_session (reached by 2 definitions)
+  rs/batch.rs:7
+  rs/batch.rs:15
+
+DUPLICATE FUNCTION [INFO]: channel_admits / import_permits  [T=0.01, n=2, loc=7, args=2]  votes[4]: text×2 shape×5 subject×1 fork×3  # agreed on 5 statement(s):;   = _v2 = plan_for(_v0);   = if _v2 is None:;   = return True;   = if _v1 is None:;   = return True; parted:;   return _v1 <= seat_ceiling(_v2);   by: seat_ceiling;   return _v1 <= row_ceiling(_v2);   by: row_ceiling; subject: domain.access.plans.plan_for (reached by 3 definitions)
+  py/guards.py:10
+  py/guards.py:19
+
+
+--- divergences in methods (converge — one thing done twice, and where they part) ---
+
+--- families of functions (converge — many places, one subject, one shape) ---
+DUPLICATE FUNCTION [INFO]: channel_admits / import_permits / upload_allows  [T=0.04, n=3, loc=7, args=2]  votes[2]: shape×11 members×3  # 3 definitions around domain.access.plans.plan_for, all taking one shape:;   ~ _ = _(_);   ~ _ _ <= _(_);   ~ _ _ _ _:;   ~ _ _
+  py/guards.py:10
+  py/guards.py:19
+  py/guards.py:28
+
+
+--- families of methods (converge — many places, one subject, one shape) ---
+# summary: 0 ERROR, 5 WARNING groups

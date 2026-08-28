@@ -93,7 +93,9 @@ Nothing is filtered until a directive says so. Calibration suggests; the committ
 
 ## What it finds, and why not just CPD
 
-Three passes, all from the same single parse per file.
+Three passes, all from the same single parse per file. Three more are opt-in and advisory —
+[patternology](#patternology), [lenses](#lenses) and [converge](#converge) — and none of them ever
+raises an ERROR.
 
 | Pass | Catches | How |
 |---|---|---|
@@ -367,9 +369,119 @@ only what a signature *has*. Worth checking for any lens you add.
 
 A finding carried by a single lens is weak by construction — the vote count is there to be read.
 
-Opt in with `--kinds lenses` (Python only). The kind exists exactly when asked for, so the section
-list, the default report and the default JSON are byte-identical without it. Directives address it
-like any other kind — `-D 'suppress:<lenses>*@*/legacy/*=deliberate parallel port'`.
+Opt in with `--kinds lenses` — Python, Rust and TypeScript. The ten questions were never
+Python-specific; what was, until the machinery moved into `dup-defs-core`, is that a frontend had to
+carry the vocabulary, the stitching and the corpus scoring itself. Now it contributes an AST walk
+and nothing else.
+
+Three answers were worth thinking about rather than transliterating. Rust has no `with`, and its
+answer to *what does it hold open* is a **guard** — a binding whose value is never read again and
+whose only job is to live until the scope ends; that is structurally detectable, so the lens finds
+it without a list of blessed names. TypeScript's is `using` / `await using`, **not** `try`/`finally`
+— a `finally` is a cleanup path, projected as control flow, and reading every one as a held resource
+would fill the lens with the language's commonest idiom. And Rust's failures keep the whole path:
+`Err(MyError::Empty)`, because the enum is the failure family and the variant the specific failure.
+
+The kind exists exactly when asked for, so the section list, the default report and the default JSON
+are byte-identical without it. Directives address it like any other kind —
+`-D 'suppress:<lenses>*@*/legacy/*=deliberate parallel port'`.
+
+## Converge
+
+Every pass above answers *are these two the same*. This one answers *these two are about the same
+thing — **where do they stop agreeing***, and reports the step rather than the cluster.
+
+```console
+$ find-dup-defs ./src --converge
+--- divergences in functions (converge — one thing done twice, and where they part) ---
+DUPLICATE FUNCTION [INFO]: _apply_source_rate_limit / _enforce_submit_budget
+  votes[4]: text×0 shape×62 subject×6 fork×12
+  A only: _v2 = utcnow()
+  B only: _v1 = now(UTC)
+  ~ _ = _ - _(_=_)
+    A: _v3 = _v2 - timedelta(hours=1)
+    B: _v2 = _v1 - timedelta(seconds=HOUR_SECONDS)
+  ~ if _ > _:
+    A: if _v6 > _v1.source_limit_per_hour
+    B: if _v4 > landing.lead_submit_limit_per_hour
+  subject: domain.rate_limit.repo (reached by 11 definitions)
+```
+
+`text×0` — those two share **no line**. One rate limiter written four times across a codebase, and
+the four disagree about where "now" comes from.
+
+### Two anchors, because one is structurally blind
+
+A pass keyed on a **shared statement** can only see divergence that grew out of textual agreement: a
+copy that drifted, or two paths that converged. It cannot reach the opposite case — two places
+written independently about one thing, with no line in common. Measured, that blind spot is real: a
+pair of functions answering one question ("does this channel fit the plan") shared exactly one name
+between them, and that name was `int`.
+
+What such a pair does share is a **subject**: both reach the same module. Imports are the corpus's
+own declaration of what a definition is about, so the frontend resolves the dotted path each name it
+uses stands for, and the engine takes prefixes of it — which is how *imported the module* and
+*imported a member of it* are made to meet, instead of failing to meet as strings.
+
+| anchor | agreement | divergence | reads as |
+|---|---|---|---|
+| **statement** | same words | different names | one decision made in two ways |
+| **subject** | same entity, same shape | different words | one procedure written twice |
+
+### One currency
+
+The seed decides only what the report points at, never how a pair is weighed:
+
+```text
+score = (E_text + E_shape + E_subject) · D · sharpness · novelty / members
+```
+
+**E** is how surprising the coincidence is, in nats, over the three ways two definitions can
+evidently be one thing done twice — the run they share line for line, the shapes they share among
+the lines they word differently, and the rarity of the deepest module both reach. **D** is the
+rarity of the rarest name they *part* on: evidence says they are the same, this says how sharp the
+difference is. **novelty** is `1` when the two found each other again after the gap and `1 − jaccard`
+when they parted for good — for a drifted copy alikeness is the premise, for a permanent fork it
+means a similarity pass already has the pair.
+
+**members** divides by how many places share the run, and it is the one factor measured rather than
+assumed: read against real code, a divergence between exactly two places was worth acting on 74% of
+the time and one among three or more 16%. Two places is the primitive that does not exist, written
+out twice; many places is the primitive that does exist, with users who legitimately go on to differ.
+
+### Families
+
+Many places around one subject, all one shape, said **once**:
+
+```console
+--- families of functions (converge — many places, one subject, one shape) ---
+DUPLICATE FUNCTION [INFO]: chart_week_plusminus / chart_week_plusminus_wave / chart_daily_unsubscribers
+  votes[2]: shape×73 members×3   # 3 definitions around domain.report._chart_helpers…
+  src/domain/report/tg_charts.py:173
+  src/domain/report/tg_charts.py:233
+  src/domain/report/tg_charts.py:298
+```
+
+A group of N definitions produces N(N−1)/2 pairs, and reporting those says one fact once per pair
+while burying it. In a read of fifty findings on a real tree, four slots went to pairs among one
+family of six sibling functions and three more to a set of chart builders — the finding was never
+"these two are alike", it was "this family exists".
+
+Grouped by **greedy maximal clique**, not by connected component: under single-linkage `1-2-3-4` is
+one group whose ends share no edge. The clique proposes and the evidence disposes — members are
+dropped while dropping raises the score, so a clique that grew past the real family shrinks back to
+it, with no threshold and no notion of which member is the odd one.
+
+### Reading it
+
+Opt in with `--converge`; findings are **INFO** and never gate. `--converge-top` keeps the strongest
+50 of each kind by default, which is the one place this differs from every other pass: they report a
+*set*, where cutting off would drop findings as true as the ones kept, and this reports a *ranking*
+with no threshold in it, where the tail is what the ordering exists to push away. `--converge-top 0`
+prints all of them (198k lines on a mid-sized tree — the reason for the default).
+
+Works for Python, Rust and TypeScript, and names none of them: the inputs are the statement stream
+and the reach set on `Facets`, so a language lights the pass up by filling them.
 
 ## Performance
 
@@ -457,26 +569,44 @@ find-dup-defs ./repo \
 
 ## Architecture
 
-Six crates, layered so the engine never depends on a frontend and the contract crate stays pure:
+Five crates, layered so the engine never depends on a language:
 
 ```
-              dup-defs-core            ← the contract: Def / KindSpec / Analysis / CanonDialect /
-                  ▲                       the Frontend trait / LineMap.  No deps.
-        ┌─────────┴─────────┐
-   find-dup-defs-canon         find-dup-defs   ← find-dup-defs-canon: shared frontend helpers (alpha-rename, the
-        ▲                  (engine+CLI)   KindSpec vocabulary, count_loc, AnalyzedFn).
-   ┌────┼────┐               │           find-dup-defs: the 3 passes + patternology + severity +
- py-   rs-   ts-canon ───────┘           directives + calibration + reports.
- canon canon            (engine depends on the contract + each frontend, NOT on find-dup-defs-canon)
+              dup-defs-core       ← the shared ground: the Def / KindSpec / Facets / Frontend
+                  ▲                 contract, the kind vocabulary, the alpha-rename, the lens
+        ┌────┬────┼────┬────┐       machinery and the dotted-path form.  No deps.
+      py-   rs-   ts-  find-dup-defs
+     canon canon canon  (engine + CLI: the 3 passes + patternology + converge +
+        └────┴────┴───────▲          severity + directives + calibration + reports)
+                          │
+                    the engine depends on the contract and on each frontend,
+                    and on no frontend's internals
 ```
 
 [`find-dup-defs`](crates/find-dup-defs) is the engine and CLI; it clusters a `Vec<Def>` and never
-names a language. [`dup-defs-core`](crates/dup-defs-core) is the engine↔frontend contract — `Def`,
-`KindSpec`, `Analysis`, the `Frontend` trait. [`find-dup-defs-canon`](crates/find-dup-defs-canon)
-holds the helpers the frontends share (the alpha-rename, the kind vocabulary, `count_loc`).
+names a language. [`dup-defs-core`](crates/dup-defs-core) is everything both sides share: the
+contract (`Def`, `Facets`, `KindSpec`, `Analysis`, the `Frontend` trait), and the pieces the
+frontends would otherwise each keep a copy of — the kind vocabulary, `alpha_rename`, `count_loc`,
+the lens vocabulary and stitching, the dotted-path form and its prefix walk.
 [`py-canon`](crates/py-canon), [`ts-canon`](crates/ts-canon) and [`rs-canon`](crates/rs-canon) are
 the frontends (Ruff, oxc, syn). Adding a language is one more `<lang>-canon` crate implementing
 `Frontend` — plus a `Dialect` impl if it wants patternology — and no engine changes.
+
+The contract used to be its own crate with a `find-dup-defs-canon` between it and the frontends, so
+the engine would not pull in frontend implementation. The perspective passes ended that: the engine
+reads `reach::prefixes` to walk the module tree the frontends' `Facets::reaches` names, and the lens
+machinery needs `Def` itself. A boundary with holes on both sides is a version to bump and a publish
+order to get right for nothing, so the two were folded into one.
+
+**What a frontend must answer.** Beyond the body canonical, `Facets` asks for two things, and both
+are empty when a frontend does not report them — every pass reading them is self-gating, so a
+language lights up the moment its frontend fills them in, with no engine edit and no list of
+supported languages anywhere:
+
+| facet | what | why it cannot be derived later |
+|---|---|---|
+| `statements` | every statement at every nesting level, header first at depth 0 | flattened, `for x in xs: / f() / g()` is indistinguishable from the three statements where `g()` runs *after* the loop — only the walk that produced them knows |
+| `reaches` | the dotted path each imported name it uses stands for, separator normalized to `.` | the corpus's own declaration of what a definition is *about*; two functions written independently about one entity share no line and often not one name |
 
 The similarity engine underneath is [`difflib-fast`](https://github.com/prostomarkeloff/difflib-fast),
 an exact Ratcliff–Obershelp + L2AP cosine-join port. And the tool eats its own cooking: this
@@ -492,7 +622,7 @@ USAGE:  find-dup-defs [OPTIONS] <PATHS>...
 LANGUAGES
   --only <CODES>            Restrict to frontends (py,ts,rs). Default: all found in PATHS.
   --kinds <K,…>             functions,methods,classes,interfaces,constants,type-aliases
-                            + `lenses` (opt-in, py only) — see Lenses
+                            + `lenses` (opt-in; py, rs, ts) — see Lenses
 
 SEVERITY (thickness ladder)
   --error-thickness <F>     Demote ERROR → WARNING if T < F   (default 0.0 = off)
@@ -505,7 +635,7 @@ SIMILARITY
   --type3-theta <F>         Type-3 cosine floor        (default 0.7)
   --max-name-group <N>      Skip name-gated clustering for (kind,name) groups > N
 
-LENSES (opt-in · py only)
+LENSES (opt-in · py, rs, ts)
   --kinds lenses            Cluster by perspectives other than the body; each finding reports
                             which lenses agreed (`votes[n]: control×3 outgoing×2 …`)
 
@@ -513,6 +643,11 @@ PATTERNOLOGY (opt-in · advisory, never ERROR)
   --patternology            Surface collapsible-duplication helper candidates
   --pattern-theta <F>       Whole-fn structural cosine floor (default 0.85)
   --pattern-support <N>     Sub-block idiom support floor     (default 3)
+
+CONVERGE (opt-in · advisory, never ERROR · py, rs, ts)
+  --converge                Where two definitions about the same thing stop agreeing, and the
+                            families of many that do the same thing around one subject
+  --converge-top <N>        Keep the strongest N of each kind (default 50; 0 = every one)
 
 FILTERS / MODES
   -D, --directive <S>       ACTION:[<KIND>]NAME[@PATH][=NOTE], repeatable. ACTION ∈
