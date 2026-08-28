@@ -26,6 +26,6 @@ pub mod lens;
 pub mod reach;
 
 pub use canon::{alpha_rename, count_loc, is_upper_snake, AnalyzedFn};
-pub use kinds::kind_spec;
+pub use kinds::{kind_spec, KIND_IDS};
 pub use loc::LineMap;
 pub use types::{Analysis, CanonDialect, Def, Facets, Frontend, KindSpec, ScanOpts, Statement};

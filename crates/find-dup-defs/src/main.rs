@@ -84,6 +84,9 @@ struct Cli {
     /// how it branches, how it fails, what it declares, how it is used elsewhere — each fact tagged
     /// with the lens it came from, so a finding reports which perspectives agreed. It costs a
     /// second walk of every file, hence opt-in.
+    ///
+    /// The vocabulary is closed and an unknown name exits non-zero — there is no `all`. A typo
+    /// would otherwise select no kind at all and report zero findings from an empty scan.
     #[arg(long, value_delimiter = ',')]
     kinds: Option<Vec<String>>,
     /// Restrict the scan to specific language frontends (comma-separated). Default: every
@@ -167,6 +170,9 @@ struct Cli {
     ///   `-D de-escalate:<methods>*.test_*@*/test/*=parametrize candidate`
     ///   `-D escalate:<methods>Lock.*@*/storage/*=Lock dups block this release`
     ///   `-D note:<methods>For*.begin_body=v2 refactor target`
+    ///
+    /// `--json` reports what each directive matched (`directives[]`, with its `origin` and a
+    /// `matched` count) — `matched: 0` is a directive that no longer suppresses anything.
     #[arg(long = "directive", short = 'D', value_name = "DIRECTIVE")]
     directives: Vec<String>,
 }
@@ -387,9 +393,28 @@ fn main() {
             registry.iter().copied().filter(|f| codes.iter().any(|c| c == f.lang())).collect()
         }
     };
+    // `--kinds` names kind ids, and an unknown one is an error (exit 2) for exactly the reason
+    // `--only` gives above — only worse. An unrecognized id matches no kind, so the scan collected
+    // NOTHING and the run reported zero findings: a gate that went green having looked at nothing.
+    // `--kinds all` reads like a wildcard and is not one, which is how it was found.
+    if let Some(kinds) = &cli.kinds {
+        for id in kinds {
+            if dup_defs_core::kind_spec(id).is_none() {
+                eprintln!(
+                    "find-dup-defs: unknown kind {id:?} for --kinds (known: {})",
+                    dup_defs_core::KIND_IDS.join(", ")
+                );
+                std::process::exit(2);
+            }
+        }
+    }
     // User-authored directives, parsed once (exit-2 on a typo so CI fails loud). `settings:`
     // entries configure the pipeline before the scan; the rest filter findings afterwards.
-    let directives: Vec<directiva::Directive<LintAction>> = cli
+    //
+    // The origin (`<file>:<line>` or `<inline>`) is kept alongside: `--json` reports what each
+    // directive actually matched, and a consumer auditing a directive FILE needs to be told which
+    // line it is looking at, not just what the line says.
+    let sourced: Vec<directiva::source::Sourced<LintAction>> = cli
         .directives
         .iter()
         .flat_map(|s| {
@@ -399,8 +424,10 @@ fn main() {
                 std::process::exit(2);
             })
         })
-        .map(|sourced| sourced.directive)
         .collect();
+    let origins: Vec<String> = sourced.iter().map(|s| s.origin.to_string()).collect();
+    let directives: Vec<directiva::Directive<LintAction>> =
+        sourced.into_iter().map(|sourced| sourced.directive).collect();
 
     // `--max-name-group` is the base; `settings:max-name-group=…` directives override it (the
     // portable, inferrer-suggested way to configure the same knob).
@@ -492,6 +519,11 @@ fn main() {
     }
     let large_groups = timed("large-groups", || large_name_groups(&defs, SUGGEST_CAP));
     let mut findings = cluster(defs, &opts);
+    // What each directive actually matched, indexed alongside `directives`. Recorded during the
+    // pass that already asks `d.matches(f)` for every pair, so it costs nothing — and it is the
+    // only place the answer exists at all: after `retain` the suppressed findings are gone, and a
+    // consumer re-deriving the matching outside would be building a second implementation of it.
+    let mut hits: Vec<Vec<JsonDirectiveHit>> = vec![Vec::new(); directives.len()];
     if !directives.is_empty() {
         // Order of effects (unchanged): notes accumulate from every matching directive (even a
         // `suppress`, so a suppress with a `=note` still leaves its reason if another directive
@@ -500,10 +532,11 @@ fn main() {
         // never finding filters, so they're skipped here.
         for f in &mut findings {
             let mut step = 0i32;
-            for d in directives.iter().filter(|d| d.action != LintAction::Set) {
-                if !d.matches(f) {
+            for (i, d) in directives.iter().enumerate() {
+                if d.action == LintAction::Set || !d.matches(f) {
                     continue;
                 }
+                hits[i].push(JsonDirectiveHit { key: allowlist_key(f), files: member_files(f, &cli.repo_root) });
                 if let Some(n) = &d.note {
                     f.notes.push(n.clone());
                 }
@@ -523,6 +556,21 @@ fn main() {
                 .any(|d| d.action == LintAction::Suppress && d.matches(f))
         });
     }
+    let directive_report: Vec<JsonDirective> = directives
+        .iter()
+        .zip(origins.iter())
+        .zip(hits)
+        .map(|((d, origin), findings)| JsonDirective {
+            directive: directive_text(d),
+            origin: origin.clone(),
+            action: action_token(d.action).to_owned(),
+            // `null`, not `0`, for `set:` — it is pipeline config and never a finding filter, so
+            // "matched nothing" is not a fact about it. `0` would read as dead to a consumer
+            // auditing a directive file for lines that no longer suppress anything.
+            matched: (d.action != LintAction::Set).then_some(findings.len()),
+            findings,
+        })
+        .collect();
     if cli.errors_only {
         findings.retain(|f| f.severity == Severity::Error);
     }
@@ -576,7 +624,7 @@ fn main() {
     let report = timed("render", || {
         if cli.json {
             // JSON consumers get every severity unconditionally — it's their job to filter.
-            render_json(&findings, &cli.repo_root)
+            render_json(&findings, &cli.repo_root, directive_report)
         } else {
             // Human report hides INFO by default — that's the whole point of the tier. JSON path
             // unchanged so downstream tooling never loses data.
@@ -1686,19 +1734,99 @@ struct JsonGroup {
     pattern: Option<PatternInfo>,
 }
 
+/// One finding a directive matched, identified stably enough to fingerprint across runs: the
+/// allowlist key plus the files involved. **Lines are deliberately absent** — they move on any edit
+/// above the definition, so including them would report a directive as touching something new every
+/// time an unrelated import was added.
+#[derive(Serialize, Clone)]
+struct JsonDirectiveHit {
+    key: String,
+    files: Vec<String>,
+}
+
+/// What one `-D` directive did on this run.
+///
+/// 🔴 The binary matches every directive against every finding and used to say nothing about it, so
+/// "is this suppression still suppressing anything?" could only be answered by re-running the tool
+/// once per directive — or by re-implementing the matcher outside, which is a second source of truth
+/// for a mini-language with globs, kind gating and path scoping. Both were measured on a real
+/// directive file (126 lines): the first costs a full run each, the second disagreed with this
+/// binary on the `a/b` cross-name form.
+#[derive(Serialize)]
+struct JsonDirective {
+    /// Canonical round-trip of the directive as parsed — stable under whitespace, so it keys a
+    /// stored judgement better than the raw line does.
+    directive: String,
+    /// `<file>:<line>` for a directive read from `@file`, `<inline>` for one given on the CLI.
+    origin: String,
+    action: String,
+    /// How many findings it matched — `0` means the directive is dead. `null` for `set:`, which is
+    /// pipeline config rather than a finding filter and therefore cannot be dead.
+    matched: Option<usize>,
+    findings: Vec<JsonDirectiveHit>,
+}
+
 #[derive(Serialize)]
 struct JsonReport {
     groups: Vec<JsonGroup>,
     summary: serde_json::Map<String, serde_json::Value>,
+    /// Per-directive effect, in the order the directives were given. Omitted entirely when no `-D`
+    /// was passed, so the default document is byte-identical to previous releases.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    directives: Vec<JsonDirective>,
+}
+
+/// Stable identity of a finding for allowlists and directive reports.
+fn allowlist_key(f: &Finding) -> String {
+    let rule = if is_cross_name(f.pass) {
+        "dup-xname".to_owned()
+    } else {
+        format!("dup-{}", f.kind.label.to_ascii_lowercase())
+    };
+    format!("{rule} {}", f.name)
+}
+
+/// Distinct repo-relative files a finding's members live in, sorted — the other half of its
+/// fingerprint. Sorted and de-duplicated so two members in one file don't make the identity depend
+/// on member order.
+fn member_files(f: &Finding, repo_root: &Path) -> Vec<String> {
+    f.members.iter().map(|(file, _, _)| short_path(file, repo_root)).collect::<BTreeSet<_>>().into_iter().collect()
+}
+
+/// The directive's action as its canonical token — `LintAction` is a foreign enum, so it cannot
+/// carry a `Display` of ours.
+fn action_token(a: LintAction) -> &'static str {
+    match a {
+        LintAction::Suppress => "suppress",
+        LintAction::Deescalate => "de-escalate",
+        LintAction::Escalate => "escalate",
+        LintAction::Note => "note",
+        LintAction::Set => "set",
+    }
+}
+
+/// Canonical `ACTION:[<KIND>]NAME[@PATH][=NOTE]` text of a parsed directive.
+fn directive_text(d: &directiva::Directive<LintAction>) -> String {
+    let mut out = format!("{}:", action_token(d.action));
+    if let Some(k) = &d.kind {
+        let _ = write!(out, "<{k}>");
+    }
+    let _ = write!(out, "{}", d.name);
+    if let Some(p) = &d.path {
+        let _ = write!(out, "@{p}");
+    }
+    if let Some(n) = &d.note {
+        let _ = write!(out, "={n}");
+    }
+    out
 }
 
 /// Machine-readable groups + summary — byte-for-byte the Python `render_json` (indent=2).
-fn render_json(findings: &[Finding], repo_root: &Path) -> String {
+fn render_json(findings: &[Finding], repo_root: &Path, directives: Vec<JsonDirective>) -> String {
     let groups: Vec<JsonGroup> = findings
         .iter()
         .map(|f| {
             let cross = is_cross_name(f.pass);
-            let rule = if cross { "dup-xname".to_owned() } else { format!("dup-{}", f.kind.label.to_ascii_lowercase()) };
             JsonGroup {
                 kind: f.kind.label.to_owned(),
                 name: f.name.clone(),
@@ -1710,7 +1838,7 @@ fn render_json(findings: &[Finding], repo_root: &Path) -> String {
                 loc: f.loc,
                 args: f.args,
                 members: f.members.iter().map(|(file, line, _)| JsonMember { file: short_path(file, repo_root), line: *line }).collect(),
-                allowlist_key: format!("{rule} {}", f.name),
+                allowlist_key: allowlist_key(f),
                 notes: f.notes.clone(),
                 facets: f.facets.clone(),
                 pattern: f.pattern.clone(),
@@ -1727,6 +1855,6 @@ fn render_json(findings: &[Finding], repo_root: &Path) -> String {
     }
     summary.insert("total".to_owned(), serde_json::Value::from(findings.len()));
 
-    let report = JsonReport { groups, summary };
+    let report = JsonReport { groups, summary, directives };
     serde_json::to_string_pretty(&report).unwrap_or_default() + "\n"
 }
