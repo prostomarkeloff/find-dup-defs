@@ -48,6 +48,12 @@ pub static LENSES: KindSpec = KindSpec {
 pub static TYPE_ALIASES: KindSpec =
     KindSpec { id: "type-aliases", label: "TYPE_ALIAS", noun_plural: "type aliases", section: 9, body: false, fn_like: false };
 
+/// Every kind id [`kind_spec`] resolves — the vocabulary a caller may name (`--kinds`). Kept
+/// adjacent to the match below so the two are edited together; `kind_ids_all_resolve` fails if an
+/// id here stops resolving.
+pub const KIND_IDS: &[&str] =
+    &["functions", "methods", "classes", "interfaces", "constants", "type-aliases", "lenses"];
+
 /// Map a kind `id` to its shared [`KindSpec`]. A frontend that doesn't support a kind simply never
 /// passes its id here.
 #[must_use]
@@ -62,4 +68,25 @@ pub fn kind_spec(id: &str) -> Option<&'static KindSpec> {
         "lenses" => &LENSES,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{kind_spec, KIND_IDS};
+
+    #[test]
+    fn kind_ids_all_resolve() {
+        for id in KIND_IDS {
+            assert!(kind_spec(id).is_some(), "KIND_IDS lists {id:?} but kind_spec does not resolve it");
+        }
+    }
+
+    #[test]
+    fn unknown_kind_does_not_resolve() {
+        // The vocabulary is closed: `all` reads like a wildcard but is not one, and resolving it
+        // to nothing is exactly how a caller ends up scanning an empty kind set.
+        for id in ["all", "*", "function", "Functions", ""] {
+            assert!(kind_spec(id).is_none(), "{id:?} must not resolve to a kind");
+        }
+    }
 }
