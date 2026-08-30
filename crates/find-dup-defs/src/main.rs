@@ -194,6 +194,15 @@ const SUGGEST_CAP: usize = 256;
 /// directive file written for a newer build degrades gracefully on an older one.
 fn apply_setting(opts: &mut PipelineOpts, key: &str, value: &str) {
     match key {
+        // The converge seeding cap — how many places a shared statement may occur in before the pass
+        // calls it an idiom. Also the pass's cost knob: the work is quadratic in it.
+        "converge-cap" => {
+            let Ok(n) = value.parse::<usize>() else {
+                eprintln!("find-dup-defs: settings:converge-cap expects an integer, got {value:?}");
+                std::process::exit(2);
+            };
+            opts.converge_cap = n.max(2);
+        }
         "max-name-group" => {
             let Ok(n) = value.parse::<usize>() else {
                 eprintln!("find-dup-defs: settings:max-name-group expects an integer, got {value:?}");
@@ -439,6 +448,8 @@ fn main() {
         patternology: cli.patternology,
         converge: cli.converge,
         converge_top: cli.converge_top,
+        // Directive-only (`-D settings:converge-cap=N`).
+        converge_cap: find_dup_defs::converge::SEED_CAP,
         pattern_theta: cli.pattern_theta,
         pattern_support: cli.pattern_support,
         // No CLI flag — directive-only (`-D settings:pattern-min-thickness=…`), applied below via
@@ -1668,29 +1679,40 @@ fn format_report(
     let pathmap: HashMap<&str, String> =
         files.par_iter().map(|&file| (file, short_path_root(file, &canon_root))).collect();
 
-    let mut lines: Vec<String> = Vec::new();
+    // Written into ONE buffer rather than a `Vec<String>` joined at the end: a report of this size is
+    // a million-odd lines, and every one of them was an allocation whose only purpose was to be
+    // copied into the join and dropped. The text is identical — `join("\n") + "\n"` and a `\n` after
+    // each line are the same string, and the buffer is never empty at either return below.
+    let mut out = String::new();
+    let line = |out: &mut String, args: std::fmt::Arguments<'_>| {
+        let _ = out.write_fmt(args);
+        out.push('\n');
+    };
     for (index, (sect, header)) in sections.iter().enumerate() {
         if index > 0 {
-            lines.push(String::new());
+            out.push('\n');
         }
-        lines.push(format!("--- {header} ---"));
+        line(&mut out, format_args!("--- {header} ---"));
         for f in findings.iter().copied().filter(|f| section_index(f) == *sect) {
-            lines.push(format!("DUPLICATE {} [{}]: {}{}", f.kind.label, f.severity.label(), f.name, group_suffix(f)));
-            for (file, line, _col) in &f.members {
-                lines.push(format!("  {}:{}", pathmap[file.as_str()], line));
+            line(
+                &mut out,
+                format_args!("DUPLICATE {} [{}]: {}{}", f.kind.label, f.severity.label(), f.name, group_suffix(f)),
+            );
+            for (file, line_no, _col) in &f.members {
+                line(&mut out, format_args!("  {}:{}", pathmap[file.as_str()], line_no));
             }
-            lines.push(String::new());
+            out.push('\n');
         }
     }
 
     if findings.is_empty() {
-        lines.push("No cross-file duplicates.".to_owned());
-        return lines.join("\n") + "\n";
+        out.push_str("No cross-file duplicates.\n");
+        return out;
     }
     let errs = findings.iter().filter(|f| f.severity == Severity::Error).count();
     let warns = findings.len() - errs;
-    lines.push(format!("# summary: {errs} ERROR, {warns} WARNING groups"));
-    lines.join("\n") + "\n"
+    line(&mut out, format_args!("# summary: {errs} ERROR, {warns} WARNING groups"));
+    out
 }
 
 #[derive(Serialize)]
