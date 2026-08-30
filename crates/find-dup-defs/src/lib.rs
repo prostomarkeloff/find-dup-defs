@@ -32,7 +32,6 @@ use std::time::Instant;
 use dup_defs_core::{CanonDialect, Def, Frontend, KindSpec, ScanOpts};
 use rayon::prelude::*;
 use serde::Serialize;
-use walkdir::WalkDir;
 
 /// Wall-time a pipeline phase to stderr when `FDD_TIMING` is set; a transparent pass-through
 /// otherwise. Output-neutral (stderr only, behind the env flag) so it never affects findings.
@@ -87,6 +86,38 @@ const SKIP_DIRS: &[&str] = &[
 
 fn is_excluded_dir(name: &str) -> bool {
     SKIP_DIRS.contains(&name) || name.ends_with(".egg-info")
+}
+
+/// Every entry under `dir`, walked in parallel, with excluded directories pruned whole.
+///
+/// 🔴 Stat'ing the tree was 10% of the run's CPU and all of it on one thread — a sequential walker
+/// over fifty thousand files while eleven cores waited. The result is collected into a set, so the
+/// ORDER the tree comes back in is not observable and the walk has nothing to serialize on.
+///
+/// Directories are yielded as entries too, and an unreadable one is skipped rather than fatal —
+/// both matching the sequential walker this replaces, whose `filter_entry` likewise pruned an
+/// excluded directory without descending into it or reporting it.
+fn walk_entries(dir: &Path) -> Vec<PathBuf> {
+    let Ok(reader) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let entries: Vec<std::fs::DirEntry> = reader.filter_map(Result::ok).collect();
+    entries
+        .par_iter()
+        .flat_map(|entry| {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                if is_excluded_dir(&entry.file_name().to_string_lossy()) {
+                    return Vec::new();
+                }
+                let mut under = walk_entries(&path);
+                under.push(path);
+                under
+            } else {
+                vec![path]
+            }
+        })
+        .collect()
 }
 
 // ── Severity ───────────────────────────────────────────────────────────────
@@ -313,33 +344,86 @@ fn frontend_for(frontends: &[&dyn Frontend], path: &Path) -> Option<usize> {
 /// of how many frontends are active. Per-frontend file lists are gathered into a `BTreeSet` so
 /// they are deduplicated and sorted before scanning (the engine re-sorts defs afterwards, so
 /// this is defense-in-depth for determinism).
+/// `(the file already parsed, the file that repeats its bytes)`, per copy.
+type Twins = Vec<(Arc<str>, Arc<str>)>;
+
+/// Split the discovered files into the ones worth parsing and the ones that are a copy of another.
+///
+/// 🔴 85% of the files in a real monorepo are byte-identical to another one — vendored trees,
+/// generated clients, a package present in several lockfile-pinned copies. Parsing is the single
+/// most expensive thing this tool does per file, and it was doing it seven times over for the same
+/// bytes. Content is compared in full, not by digest: a hash collision here would silently attach
+/// one file's definitions to another file's path.
+///
+/// Returns `(files to parse, (source, twin) pairs)`. The file kept for each content is the first in
+/// the discovered order, which is sorted, so which one is parsed does not vary between runs. A file
+/// that cannot be read is kept as its own group and left to the frontend to fail on as before.
+fn one_per_content(files: &[Arc<str>]) -> (Vec<Arc<str>>, Twins) {
+    // Read and digested in parallel; the sequential pass below then compares CONTENT only against
+    // files that already agree on their digest — one comparison, where keying an ordered map by the
+    // bytes themselves meant a dozen full-file compares per lookup.
+    let read: Vec<Option<(u64, Vec<u8>)>> = files
+        .par_iter()
+        .map(|f| {
+            std::fs::read(f.as_ref()).ok().map(|bytes| {
+                use std::hash::{BuildHasher, Hasher};
+                let mut h = rustc_hash::FxBuildHasher.build_hasher();
+                h.write(&bytes);
+                (h.finish(), bytes)
+            })
+        })
+        .collect();
+
+    let mut by_digest: rustc_hash::FxHashMap<u64, Vec<usize>> = rustc_hash::FxHashMap::default();
+    let (mut to_parse, mut twins) = (Vec::new(), Vec::new());
+    for (i, file) in files.iter().enumerate() {
+        let Some((digest, content)) = read[i].as_ref() else {
+            to_parse.push(Arc::clone(file));
+            continue;
+        };
+        // The digest narrows it; the bytes decide it. A collision must not attach one file's
+        // definitions to another file's path, so the comparison stays exact.
+        let seen = by_digest.entry(*digest).or_default();
+        if let Some(&source) = seen.iter().find(|&&r| read[r].as_ref().is_some_and(|(_, c)| c == content)) {
+            twins.push((Arc::clone(&files[source]), Arc::clone(file)));
+        } else {
+            seen.push(i);
+            to_parse.push(Arc::clone(file));
+        }
+    }
+    (to_parse, twins)
+}
+
 #[must_use]
 pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf], opts: &ScanOpts) -> Vec<Def> {
-    let per_frontend: Vec<BTreeSet<Arc<str>>> = timed("discovery", || {
-        let mut per_frontend: Vec<BTreeSet<Arc<str>>> = vec![BTreeSet::new(); frontends.len()];
-        let mut route = |path: &Path| {
-            if let Some(fi) = frontend_for(frontends, path) {
-                per_frontend[fi].insert(Arc::from(path.to_string_lossy().as_ref()));
-            }
-        };
+    // 🔴 Sorted vectors, not `BTreeSet`s. The set was only ever used to order and deduplicate, and
+    // then handed on as a slice — but building it meant inserting fifty thousand paths one at a
+    // time, on one thread, each insert a walk down a tree of string compares. Routing and sorting
+    // are both per path and both parallel; a sorted, deduplicated vector iterates in exactly the
+    // order the set did.
+    let per_frontend: Vec<Vec<Arc<str>>> = timed("discovery", || {
+        let mut candidates: Vec<PathBuf> = Vec::new();
         for p in paths {
+            candidates.push(p.clone());
             if p.is_dir() {
-                let walker = WalkDir::new(p).into_iter().filter_entry(|e| {
-                    if e.depth() == 0 {
-                        return true;
-                    }
-                    if e.file_type().is_dir() {
-                        return !is_excluded_dir(&e.file_name().to_string_lossy());
-                    }
-                    true
-                });
-                for entry in walker.filter_map(Result::ok) {
-                    route(entry.path());
-                }
-            } else {
-                route(p);
+                // The root itself is an entry, as it was for the sequential walker.
+                candidates.extend(walk_entries(p));
             }
         }
+        let routed: Vec<(usize, Arc<str>)> = candidates
+            .par_iter()
+            .filter_map(|path| {
+                frontend_for(frontends, path).map(|fi| (fi, Arc::from(path.to_string_lossy().as_ref())))
+            })
+            .collect();
+        let mut per_frontend: Vec<Vec<Arc<str>>> = vec![Vec::new(); frontends.len()];
+        for (fi, file) in routed {
+            per_frontend[fi].push(file);
+        }
+        per_frontend.par_iter_mut().for_each(|files| {
+            files.sort_unstable();
+            files.dedup();
+        });
         per_frontend
     });
     // Recursive-descent parsers (syn especially) have no built-in nesting limit, and a deeply
@@ -348,10 +432,40 @@ pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf], opts: &ScanO
     // a generous per-worker stack so realistically-deep input is handled; the few inputs nested
     // beyond this would also blow a compiler's own limits.
     let scan = move || {
+        // 🔴 NOT when the lens kind is asked for. `Frontend::scan` is handed the whole file set, and
+        // the lens kind is the one whose unit is defined ACROSS it — "how this definition is used
+        // elsewhere" is counted over the files the scan was given. Shortening that list changes the
+        // use profile it derives, and with it the lens thickness: measured as a ±0.01 drift on four
+        // clusters, which is the parity gate earning its keep. Every other kind is a function of one
+        // file, and for those a copy of the bytes is a copy of the definitions.
+        let per_file_only = !opts.kinds.is_some_and(|ks| ks.iter().any(|k| k == "lenses"));
         let mut defs = Vec::new();
         for (fi, files) in per_frontend.into_iter().enumerate() {
-            let files: Vec<Arc<str>> = files.into_iter().collect();
-            defs.extend(frontends[fi].scan(&files, opts));
+            let (to_parse, twins) =
+                if per_file_only { one_per_content(&files) } else { (files.clone(), Vec::new()) };
+            let mut parsed = frontends[fi].scan(&to_parse, opts);
+            // Replay each parsed file's definitions onto the paths that spell the same bytes. A
+            // definition is a function of the source and where in it the definition sits — the path
+            // is recorded, never read — so this is the same `Vec<Def>` the parse would have
+            // produced, at the cost of a clone instead of a parse.
+            if !twins.is_empty() {
+                let mut by_file: rustc_hash::FxHashMap<&str, Vec<&Def>> = rustc_hash::FxHashMap::default();
+                for def in &parsed {
+                    by_file.entry(def.file.as_ref()).or_default().push(def);
+                }
+                let copies: Vec<Def> = twins
+                    .iter()
+                    .flat_map(|(source, twin)| {
+                        by_file.get(source.as_ref()).into_iter().flatten().map(move |def| {
+                            let mut copy = (*def).clone();
+                            copy.file = Arc::clone(twin);
+                            copy
+                        })
+                    })
+                    .collect();
+                parsed.extend(copies);
+            }
+            defs.extend(parsed);
         }
         defs
     };
@@ -409,6 +523,109 @@ pub fn section_index(f: &Finding) -> usize {
 
 // ── Passes ─────────────────────────────────────────────────────────────────
 
+/// Exact single-linkage clustering of a name group, over its DISTINCT canonicals only.
+///
+/// 🔴 87% of the definitions in a name group share their canonical with another member of it — on a
+/// real tree that is not a quirk, it is the thing a duplicate detector is looking for. The
+/// clustering underneath builds one suffix automaton per input and then compares pairs, so handing
+/// it the group as-is meant 369k automata over 4.65M pairs where 48k over 52k say the same thing:
+/// the pair count is quadratic in the multiplicity that carries no information.
+///
+/// **Exact, not an approximation.** Two identical strings have a Ratcliff–Obershelp ratio of
+/// exactly 1.0 (`2M/T` with `M` = length and `T` = twice it), so:
+///   - they are always joined, at any threshold ≤ 1 — a duplicate never lands in another cluster;
+///   - adding them to a cluster cannot lower its minimum pairwise ratio, which is the figure
+///     reported, so the min over the whole group equals the min over its distinct representatives.
+///
+/// 🔴 **Two representatives per canonical, not one** — the first occurrence and the last.
+/// Ratcliff–Obershelp is **asymmetric**: the recursion indexes one side, so `ratio(x, y)` and
+/// `ratio(y, x)` can differ, and the clustering computes the pair in the orientation its two
+/// indices happen to have. When a canonical occurs at several positions, the group therefore
+/// contains BOTH orientations of some pair, and the reported minimum is the lower of the two.
+/// Collapsing to a single representative computes only one orientation and reports a minimum that
+/// is too high — measured at +0.005 on four clusters, with membership unchanged, which is how this
+/// was found. Keeping the first and last occurrence preserves the orientation set exactly:
+/// `x → y` is realizable in the group iff `first(x) < last(y)`, which is what the two survivors
+/// still say. A canonical spelled once contributes one representative.
+///
+/// A canonical shared by several definitions needs no special case: its two representatives are
+/// identical, so they are an edge at any threshold and come back as a cluster of their own.
+fn cluster_distinct(
+    rationer: &difflib_fast::Rationer,
+    canons: &[&str],
+    threshold: f64,
+) -> Vec<(Vec<usize>, f64)> {
+    let mut seen: rustc_hash::FxHashMap<&str, usize> = rustc_hash::FxHashMap::default();
+    // Distinct index → the positions in `canons` that spell it, ascending by construction.
+    let mut spelled_by: Vec<Vec<usize>> = Vec::new();
+    for (pos, &s) in canons.iter().enumerate() {
+        if let Some(&d) = seen.get(s) {
+            spelled_by[d].push(pos);
+        } else {
+            seen.insert(s, spelled_by.len());
+            spelled_by.push(vec![pos]);
+        }
+    }
+
+    // 🔴 A group that spells ONE canonical needs no clustering at all, and most groups are that:
+    // 43 504 groups hold 47 733 distinct canonicals between them. Every pair is a pair of identical
+    // strings, so the answer is the whole group at ratio 1.0 — and the machinery below would reach
+    // it only after building a suffix automaton, which was 26% of the run's CPU. Nothing to compare
+    // means nothing to build.
+    if spelled_by.len() == 1 {
+        return if canons.len() >= 2 { vec![((0..canons.len()).collect(), 1.0)] } else { Vec::new() };
+    }
+
+    // Kept in position order, so a survivor pair's orientation is the one it had in the group.
+    //
+    // The second representative is only needed when something else can sit BETWEEN this canonical's
+    // first and last occurrence — that is what makes both orientations of a pair reachable. If the
+    // occurrences are CONTIGUOUS nothing does, every other canonical lies wholly before or wholly
+    // after them, and one representative at the first occurrence answers both questions: `x → y` is
+    // reachable iff some `y` follows the block, `y → x` iff some `y` precedes it, and `first(x)`
+    // decides each. So a contiguous run of copies costs one automaton, not two.
+    let mut reps: Vec<(usize, usize)> = Vec::new();
+    for (d, positions) in spelled_by.iter().enumerate() {
+        reps.push((positions[0], d));
+        let last = positions[positions.len() - 1];
+        let contiguous = last - positions[0] + 1 == positions.len();
+        if positions.len() > 1 && !contiguous {
+            reps.push((last, d));
+        }
+    }
+    reps.sort_unstable();
+    let chars: Vec<Vec<char>> = reps.iter().map(|&(pos, _)| canons[pos].chars().collect()).collect();
+
+    let mut out: Vec<(Vec<usize>, f64)> = Vec::new();
+    // A canonical's two representatives always land in the same cluster, so each contributes its
+    // positions once; clusters are disjoint, so one flag vector serves the whole loop.
+    let mut taken = vec![false; spelled_by.len()];
+    for (members, min_sim) in rationer.cluster_canonicals_chars(&chars, threshold) {
+        let mut expanded: Vec<usize> = Vec::new();
+        for r in members {
+            let d = reps[r].1;
+            if !taken[d] {
+                taken[d] = true;
+                expanded.extend_from_slice(&spelled_by[d]);
+            }
+        }
+        expanded.sort_unstable();
+        out.push((expanded, min_sim));
+    }
+    // A canonical reduced to ONE representative (its copies are contiguous) that clustered with
+    // nothing is still a cluster of its copies, pairwise 1.0 — the call saw a single string and
+    // dropped it as a singleton, so it is added back. With two representatives this could not
+    // happen: they are identical, hence an edge, hence already a cluster.
+    for (d, positions) in spelled_by.iter().enumerate() {
+        if !taken[d] && positions.len() >= 2 {
+            out.push((positions.clone(), 1.0));
+        }
+    }
+    // Same order the undeduplicated call produced: members ascending, clusters by their first.
+    out.sort_by(|a, b| a.0[0].cmp(&b.0[0]));
+    out
+}
+
 /// Pass 1 — name-gated: same-named body-kind defs clustered by structural-canonical
 /// similarity; same-named raw-text kinds (constants / type-aliases) compared by `text_orig`.
 ///
@@ -442,8 +659,8 @@ pub fn pass_name_gated(
             // All members of a `(kind.id, name)` group share a kind; any member's spec labels it.
             let kind = defs[idxs[0]].kind;
             if !kind.body {
-                let canons: Vec<String> = idxs.iter().map(|&i| defs[i].text_orig.clone()).collect();
-                let clusters = rationer.cluster_canonicals(&canons, 0.0);
+                let canons: Vec<&str> = idxs.iter().map(|&i| defs[i].text_orig.as_str()).collect();
+                let clusters = cluster_distinct(rationer, &canons, 0.0);
                 return clusters
                     .into_iter()
                     .filter(|(c, _)| c.len() >= min_size)
@@ -477,10 +694,9 @@ pub fn pass_name_gated(
                     })
                     .collect::<Vec<_>>();
             }
-            let canons: Vec<String> =
-                idxs.iter().map(|&i| defs[i].cluster_canonical.clone().unwrap_or_default()).collect();
-            rationer
-                .cluster_canonicals(&canons, threshold)
+            let canons: Vec<&str> =
+                idxs.iter().map(|&i| defs[i].cluster_canonical.as_deref().unwrap_or_default()).collect();
+            cluster_distinct(rationer, &canons, threshold)
                 .into_iter()
                 .filter(|(c, _)| c.len() >= min_size)
                 .map(|(c, min_sim)| {
@@ -840,6 +1056,13 @@ pub struct PipelineOpts {
     /// How many converge findings of each kind to report, strongest first; `0` reports all of them.
     /// See [`converge::pass_converge`] for why this pass is capped when no other is.
     pub converge_top: usize,
+    /// How many places a shared statement (or a shared subject) may occur in before converge treats
+    /// it as an idiom rather than a coincidence — `settings:converge-cap=N`.
+    ///
+    /// The pass's cost knob as well as its meaning knob: the work it admits is quadratic in this, so
+    /// dropping it from the default 60 to 20 took converge from 5.2 s to 1.5 s on a 371k-definition
+    /// tree. It reports a shorter ranking in exchange, which is why it is a knob and not a change.
+    pub converge_cap: usize,
     /// Minimum cluster size (default `2`).
     pub min_size: usize,
     /// De-escalate ERRORs whose `thickness` is below this to WARNING (default
@@ -876,6 +1099,7 @@ impl PipelineOpts {
             patternology: false,
             converge: false,
             converge_top: DEFAULT_CONVERGE_TOP,
+            converge_cap: converge::SEED_CAP,
             pattern_theta: 0.85,
             pattern_support: 3,
             pattern_min_thickness: 0.0,
@@ -967,7 +1191,7 @@ pub fn cluster(mut defs: Vec<Def>, opts: &PipelineOpts) -> Vec<Finding> {
         timed("pass4-pattern", || findings.extend(pass_patternology(&defs, opts.pattern_theta, opts.pattern_support, opts.gpu)));
     }
     if opts.converge {
-        timed("pass5-converge", || findings.extend(converge::pass_converge(&defs, opts.converge_top)));
+        timed("pass5-converge", || findings.extend(converge::pass_converge(&defs, opts.converge_top, opts.converge_cap)));
     }
 
     // Directive-driven patternology calibration: drop advisory candidates below the explicit

@@ -85,6 +85,34 @@ fn is_sync_async(a: &str, b: &str) -> bool {
 /// the exact f64 CPU+GPU hybrid; `=gpu` → `Gpu`, GPU-dominant f32; default `Cpu`). On a non-`gpu`
 /// build or with no Metal device it transparently runs on CPU — the GPU modes are always safe to ask.
 #[must_use]
+/// One function's weighted line vector, sorted by line id, and its L2 norm.
+///
+/// Counted first, then emitted in FIRST-APPEARANCE order — which is what the linear scan this
+/// replaces produced, and the order the norm is summed in, so the float total is unchanged. The
+/// weight for one line id is the same number every time it occurs, so adding it `k` times is
+/// order-independent; it is still ADDED `k` times rather than multiplied, because in floating point
+/// those are not the same. The scan was quadratic in a function's distinct lines; this is linear.
+fn weighted_row(seq: &[u32], line_weight: &[f64]) -> (Vec<(u32, f64)>, f64) {
+    let mut count: FxHashMap<u32, u32> = FxHashMap::default();
+    for &id in seq {
+        *count.entry(id).or_insert(0) += 1;
+    }
+    let mut v: Vec<(u32, f64)> = Vec::with_capacity(count.len());
+    for &id in seq {
+        if let Some(k) = count.remove(&id) {
+            let w = line_weight[id as usize];
+            let mut acc = 0.0;
+            for _ in 0..k {
+                acc += w;
+            }
+            v.push((id, acc));
+        }
+    }
+    let norm = v.iter().map(|&(_, p)| p * p).sum::<f64>().sqrt();
+    v.sort_unstable_by_key(|&(id, _)| id);
+    (v, norm)
+}
+
 pub fn type3_clusters(
     line_lists: &[Vec<String>],
     names: &[String],
@@ -117,6 +145,7 @@ pub fn type3_clusters(
         .collect();
     let total_lines: usize = seqs.iter().map(Vec::len).sum();
 
+
     // IDF: df[token] = #line-occurrences containing token (counted once per distinct line via a set).
     let mut occ: Vec<u32> = vec![0; id_text.len()];
     for seq in &seqs {
@@ -146,26 +175,37 @@ pub fn type3_clusters(
         .map(|&t| tokenize(t).iter().map(|tok| idf.get(tok).copied().unwrap_or(0.0)).sum())
         .collect();
 
-    // Per-function vector: distinct lines, weight accumulated by repeated `+= w`, then sorted by id
-    // (for the dot merge and for simjoin). Also the L2 norm, for the min_sim cosine.
-    let (rows, norms): (Vec<Vec<(u32, f64)>>, Vec<f64>) = seqs
-        .par_iter()
-        .with_min_len(128)
-        .map(|seq| {
-            let mut v: Vec<(u32, f64)> = Vec::new();
-            for &id in seq {
-                let w = line_weight[id as usize];
-                if let Some(slot) = v.iter_mut().find(|(k, _)| *k == id) {
-                    slot.1 += w;
-                } else {
-                    v.push((id, w));
-                }
-            }
-            let norm = v.iter().map(|&(_, p)| p * p).sum::<f64>().sqrt();
-            v.sort_unstable_by_key(|&(id, _)| id);
-            (v, norm)
-        })
-        .unzip();
+    // 🔴 The join runs over the DISTINCT `(line sequence, name)` pairs, not over every function.
+    // 86% of the functions here repeat another one exactly — the same duplication the rest of the
+    // tool trades on — and the join is quadratic, so that is a fifty-fold factor on its input.
+    //
+    // The IDF above is deliberately NOT deduplicated: `df` counts how many functions contain a
+    // line, which is a property of the corpus, and thinning it would reweight every vector.
+    //
+    // Sound because two functions agreeing on both keys are indistinguishable to everything below:
+    // the same row and norm, hence the same cosine to anything; the same name, hence the same
+    // `names[i] != names[j]` and `is_sync_async` verdicts; the same sequence, hence the same
+    // byte-identical rejection. A representative that joins nothing expands to a group sharing ONE
+    // name, and the caller drops any cluster with fewer than two distinct names — exactly as it
+    // dropped the singletons this replaces.
+    let mut seen: FxHashMap<(&[u32], &str), usize> = FxHashMap::default();
+    let mut reps: Vec<usize> = Vec::new();
+    let mut spoken_by: Vec<Vec<usize>> = Vec::new();
+    for i in 0..n {
+        let key = (seqs[i].as_slice(), names[i].as_str());
+        if let Some(&r) = seen.get(&key) {
+            spoken_by[r].push(i);
+        } else {
+            seen.insert(key, reps.len());
+            reps.push(i);
+            spoken_by.push(vec![i]);
+        }
+    }
+
+    // Per-representative vector: distinct lines, weight accumulated by repeated `+= w`, then sorted
+    // by id (for the dot merge and for simjoin). Also the L2 norm, for the min_sim cosine.
+    let (rows, norms): (Vec<Vec<(u32, f64)>>, Vec<f64>) =
+        reps.par_iter().with_min_len(128).map(|&i| weighted_row(&seqs[i], &line_weight)).unzip();
 
     // Exact all-pairs weighted-cosine join (replaces shingle candidate-gen + per-pair verify), on the
     // selected backend — CPU, or difflib-fast's Metal GPU hybrid when `settings:gpu=on`.
@@ -177,31 +217,35 @@ pub fn type3_clusters(
     let edges: Vec<(usize, usize)> = pairs
         .into_par_iter()
         .filter(|&(j, i, cos)| {
+            let (ri, rj) = (reps[i], reps[j]);
             cos > theta
-                && names[i] != names[j]
-                && !is_sync_async(&names[i], &names[j])
-                && seqs[i] != seqs[j]
+                && names[ri] != names[rj]
+                && !is_sync_async(&names[ri], &names[rj])
+                && seqs[ri] != seqs[rj]
         })
         .map(|(j, i, _)| (j, i))
         .collect();
 
     // Components → exact min cosine over ALL intra-component pairs (single-linkage's conservative
-    // figure; can be < θ for a chain A–B–C where A,C aren't directly joined).
-    components(n, &edges)
+    // figure; can be < θ for a chain A–B–C where A,C aren't directly joined). Taken over the
+    // representatives: a pair of twins scores exactly 1.0 and so can never be the minimum.
+    components(reps.len(), &edges)
         .into_par_iter()
-        .map(|mut members| {
-            members.sort_unstable();
+        .map(|mut group| {
+            group.sort_unstable();
             let mut min_sim = theta;
             let mut first = true;
-            for a in 0..members.len() {
-                for b in (a + 1)..members.len() {
-                    let c = cosine(&rows[members[a]], &rows[members[b]], norms[members[a]], norms[members[b]]);
+            for a in 0..group.len() {
+                for b in (a + 1)..group.len() {
+                    let c = cosine(&rows[group[a]], &rows[group[b]], norms[group[a]], norms[group[b]]);
                     if first || c < min_sim {
                         min_sim = c;
                         first = false;
                     }
                 }
             }
+            let mut members: Vec<usize> = group.iter().flat_map(|&r| spoken_by[r].iter().copied()).collect();
+            members.sort_unstable();
             (members, min_sim)
         })
         .collect()
