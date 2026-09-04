@@ -46,12 +46,11 @@ pub(crate) fn kind_spec(id: &str) -> &'static KindSpec {
 fn digest(bytes: &[u8]) -> u64 {
     const K: u64 = 0x517c_c1b7_2722_0a95;
     let mut h: u64 = bytes.len() as u64;
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        let word = u64::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]]);
-        h = (h.rotate_left(5) ^ word).wrapping_mul(K);
+    let (words, rest) = bytes.as_chunks::<8>();
+    for word in words {
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(*word)).wrapping_mul(K);
     }
-    for &b in chunks.remainder() {
+    for &b in rest {
         h = (h.rotate_left(5) ^ u64::from(b)).wrapping_mul(K);
     }
     h
