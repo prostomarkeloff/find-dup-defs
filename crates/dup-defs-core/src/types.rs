@@ -198,4 +198,15 @@ pub trait Frontend: Sync {
     fn kinds(&self, opts: &ScanOpts) -> &'static [&'static KindSpec];
     /// Parse each file once and return its definitions as [`Def`]s with canon precomputed.
     fn scan(&self, files: &[Arc<str>], opts: &ScanOpts) -> Vec<Def>;
+    /// Whether what this frontend reports for one file depends on the OTHER files it is handed,
+    /// under these options — a kind counted across the set, like a use-site profile.
+    ///
+    /// When it does not (the default), a file that repeats another's bytes yields the same
+    /// definitions, so the engine parses each content once and replays the result onto every
+    /// copy; a corpus-relative score ([`crate::lens::score_lens_defs`]) is then taken again over
+    /// the replayed set, which is the set the frontend would have scored. A frontend that answers
+    /// `true` is handed every file and owns whatever deduplication it wants.
+    fn scans_across_files(&self, _opts: &ScanOpts) -> bool {
+        false
+    }
 }

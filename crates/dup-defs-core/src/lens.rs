@@ -299,26 +299,47 @@ pub fn merge_use_facts(defs: &mut [Def], mut facts: HashMap<String, Vec<String>>
 /// while a rare callee weighs a lot. The count of *lenses that actually spoke* rides alongside,
 /// because a record whose facts all come from one lens is one opinion, not a consensus.
 pub fn score_lens_defs(defs: &mut [Def]) {
-    let mut df: HashMap<&str, usize> = HashMap::new();
-    let mut corpus = 0usize;
-    for def in defs.iter() {
-        if def.kind.id != LENSES.id {
-            continue;
-        }
-        corpus += 1;
-        if let Some(analysis) = &def.analysis {
-            for fact in analysis.type3_lines.iter().map(String::as_str).collect::<BTreeSet<_>>() {
-                *df.entry(fact).or_insert(0) += 1;
-            }
-        }
+    use rayon::prelude::*;
+    // A record's facts, distinct and sorted — the set the frequency counts and the mass sums over.
+    fn distinct(analysis: &Analysis) -> Vec<&str> {
+        let mut facts: Vec<&str> = analysis.type3_lines.iter().map(String::as_str).collect();
+        facts.sort_unstable();
+        facts.dedup();
+        facts
     }
+    // Document frequency is a sum, so it folds across threads; the tables are per thread and
+    // merged at the end. Every lens record counts toward the corpus, whether or not it carries an
+    // analysis to take facts from.
+    let (df, corpus) = defs
+        .par_iter()
+        .filter(|def| def.kind.id == LENSES.id)
+        .fold(
+            || (HashMap::<&str, usize>::new(), 0usize),
+            |(mut df, n), def| {
+                if let Some(analysis) = &def.analysis {
+                    for fact in distinct(analysis) {
+                        *df.entry(fact).or_insert(0) += 1;
+                    }
+                }
+                (df, n + 1)
+            },
+        )
+        .reduce(
+            || (HashMap::new(), 0usize),
+            |(mut a, n), (b, m)| {
+                for (fact, count) in b {
+                    *a.entry(fact).or_insert(0) += count;
+                }
+                (a, n + m)
+            },
+        );
     if corpus == 0 {
         return;
     }
     #[allow(clippy::cast_precision_loss)]
     let n = corpus as f64;
     let scores: Vec<Option<f64>> = defs
-        .iter()
+        .par_iter()
         .map(|def| {
             if def.kind.id != LENSES.id {
                 return None;
@@ -326,7 +347,8 @@ pub fn score_lens_defs(defs: &mut [Def]) {
             let analysis = def.analysis.as_ref()?;
             let mut mass = 0.0f64;
             let mut lenses_heard: BTreeSet<&str> = BTreeSet::new();
-            for fact in analysis.type3_lines.iter().map(String::as_str).collect::<BTreeSet<_>>() {
+            // In fact order — the order the mass was always summed in.
+            for fact in distinct(analysis) {
                 #[allow(clippy::cast_precision_loss)]
                 let idf = (n / df.get(fact).copied().unwrap_or(1).max(1) as f64).ln();
                 mass += idf.max(0.0);

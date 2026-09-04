@@ -1,6 +1,6 @@
 [package]
 name = "py-canon"
-version = "0.4.0"
+version = "0.4.1"
 description = "Python source → CPython ast.dump-shape canonicalization + module-level definition scan (Ruff parser). The Python frontend for find-dup-defs."
 keywords = ["python", "ast", "canonicalize", "parsing", "clone"]
 categories = ["parser-implementations", "development-tools"]
@@ -16,7 +16,7 @@ name = "py_canon"
 [dependencies]
 # The frontend↔engine contract (Def / KindSpec / Analysis / Frontend / LineMap) this crate
 # implements; the engine consumes the Defs this frontend emits.
-dup-defs-core = { path = "../dup-defs-core", version = "0.2" }
+dup-defs-core = { path = "../dup-defs-core", version = "0.2.2" }
 # Ruff's Python parser + AST + text-size (vendored as `littrs-*`, lib names `ruff_*`): one fast native
 # parser handling modern syntax (PEP 695 / PEP 701).
 littrs-ruff-python-parser = "0.6.2"

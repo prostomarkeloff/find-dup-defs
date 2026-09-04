@@ -245,6 +245,31 @@ work leaves the serial remainder exposed.
 </details>
 
 <details>
+<summary><b>The 5× that was hiding on one thread</b> (v0.13.0)</summary>
+
+Converge took 12% of the run's CPU and 55% of its wall time. The profile *by function* said
+nothing dominates; the profile *by thread* said the main thread held 16% of all CPU, three times
+any worker. The pass was not compute-bound. It was glue — a `&str`-keyed statement index, a set
+deduplicating eight million seeds, a hash map of two million pairs, a string lookup for every
+rarity, and four hundred thousand findings built and sorted so that the cap could keep a hundred —
+and all of it on one thread.
+
+The pass now runs over bodies rather than definitions (86% of definitions repeat a body), over
+integer ids with precomputed rarities rather than strings, sorts and decides per pair rather than
+filling hash tables, anti-unifies each distinct fork once over already-lexed tokens, and builds
+only the findings that can survive the cap. On a 371k-definition tree the pass went **3.9 s →
+0.8 s**; on a mixed standard-library tree **1.25 s → 0.37 s**. Every report is byte-identical,
+the uncapped ranking included.
+
+`--kinds lenses` got two levers of its own. The Python frontend parses one file per distinct
+content and **counts** the copies for the use-site lens instead of walking them — 28 763 files
+became 4 796 parses. And 79% of the characters handed to the exact clusterer never needed a suffix
+automaton: the clusterer's own length and character-multiset bounds are applied first, and a
+string with no possible partner stays out. A lens run on that tree: **16.2 s → 7.7 s**; what
+remains is inside the exact clustering itself.
+</details>
+
+<details>
 <summary><b>GPU acceleration</b> (optional, macOS / Metal) — and why it rarely matters</summary>
 
 [`difflib-fast`](https://crates.io/crates/difflib-fast) can offload the name-gated Ratcliff–Obershelp
