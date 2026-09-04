@@ -386,7 +386,7 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
             // single string that is unique per class — pure denominator, no shared numerator, and
             // it pushed genuinely-matching declarations below the cosine floor.
             let scope_lines = if kind.id == "functions" {
-                vec![crate::canon::analyze_in_scope(stmt, source, scope).xname_canonical]
+                vec![crate::canon::scope_canonical(stmt, source, scope)]
             } else {
                 Vec::new()
             };

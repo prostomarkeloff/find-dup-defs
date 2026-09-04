@@ -432,15 +432,16 @@ pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf], opts: &ScanO
     // a generous per-worker stack so realistically-deep input is handled; the few inputs nested
     // beyond this would also blow a compiler's own limits.
     let scan = move || {
-        // 🔴 NOT when the lens kind is asked for. `Frontend::scan` is handed the whole file set, and
-        // the lens kind is the one whose unit is defined ACROSS it — "how this definition is used
-        // elsewhere" is counted over the files the scan was given. Shortening that list changes the
-        // use profile it derives, and with it the lens thickness: measured as a ±0.01 drift on four
-        // clusters, which is the parity gate earning its keep. Every other kind is a function of one
-        // file, and for those a copy of the bytes is a copy of the definitions.
-        let per_file_only = !opts.kinds.is_some_and(|ks| ks.iter().any(|k| k == "lenses"));
+        // 🔴 NOT for a frontend whose output is defined ACROSS the set — the Python `use` lens
+        // counts "how this definition is used elsewhere" over the files the scan was given, and
+        // shortening that list changed the profile and with it the lens thickness (a ±0.01 drift
+        // on four clusters, which is the parity gate earning its keep). The frontend says so
+        // through `scans_across_files`, and is handed everything. For every other frontend and
+        // kind a copy of the bytes is a copy of the definitions; the one corpus-relative number a
+        // per-file frontend produces, the lens score, is taken again below over the replayed set.
         let mut defs = Vec::new();
         for (fi, files) in per_frontend.into_iter().enumerate() {
+            let per_file_only = !frontends[fi].scans_across_files(opts);
             let (to_parse, twins) =
                 if per_file_only { one_per_content(&files) } else { (files.clone(), Vec::new()) };
             let mut parsed = frontends[fi].scan(&to_parse, opts);
@@ -453,9 +454,11 @@ pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf], opts: &ScanO
                 for def in &parsed {
                     by_file.entry(def.file.as_ref()).or_default().push(def);
                 }
+                // A `Def` is a dozen strings, and there are hundreds of thousands to copy: pure
+                // per twin, so the copying runs on the pool. `collect` keeps the twin order.
                 let copies: Vec<Def> = twins
-                    .iter()
-                    .flat_map(|(source, twin)| {
+                    .par_iter()
+                    .flat_map_iter(|(source, twin)| {
                         by_file.get(source.as_ref()).into_iter().flatten().map(move |def| {
                             let mut copy = (*def).clone();
                             copy.file = Arc::clone(twin);
@@ -464,6 +467,13 @@ pub fn collect_defs(frontends: &[&dyn Frontend], paths: &[PathBuf], opts: &ScanO
                     })
                     .collect();
                 parsed.extend(copies);
+                // The score is corpus-relative: the frontend took it over the parsed files, and
+                // the corpus is the parsed files plus their copies. Re-scoring is a pure function
+                // of the record set, so this is the number the frontend would have produced had
+                // it been handed every copy.
+                if opts.wants("lenses") {
+                    dup_defs_core::lens::score_lens_defs(&mut parsed);
+                }
             }
             defs.extend(parsed);
         }
@@ -596,11 +606,32 @@ fn cluster_distinct(
     reps.sort_unstable();
     let chars: Vec<Vec<char>> = reps.iter().map(|&(pos, _)| canons[pos].chars().collect()).collect();
 
+    // 🔴 Only the representatives that can be in an edge at all are handed to the clusterer. It
+    // builds a suffix automaton for EVERY string it is given before it looks at a single pair, and
+    // on long canonicals that build was half the pass's CPU — spent on strings that its own
+    // length and character-multiset bounds then rule out of every pair they are in. Those bounds
+    // are exact upper bounds on the ratio, so a string without a partner under them is a singleton
+    // whatever the clusterer computes, and leaving it out changes no edge, no cluster, no minimum.
+    let active = candidates(&chars, threshold);
+    let subset: Vec<Vec<char>>;
+    let clustered = if active.len() == chars.len() {
+        rationer.cluster_canonicals_chars(&chars, threshold)
+    } else if active.len() < 2 {
+        Vec::new()
+    } else {
+        subset = active.iter().map(|&i| chars[i].clone()).collect();
+        rationer
+            .cluster_canonicals_chars(&subset, threshold)
+            .into_iter()
+            .map(|(members, min_sim)| (members.into_iter().map(|m| active[m]).collect(), min_sim))
+            .collect()
+    };
+
     let mut out: Vec<(Vec<usize>, f64)> = Vec::new();
     // A canonical's two representatives always land in the same cluster, so each contributes its
     // positions once; clusters are disjoint, so one flag vector serves the whole loop.
     let mut taken = vec![false; spelled_by.len()];
-    for (members, min_sim) in rationer.cluster_canonicals_chars(&chars, threshold) {
+    for (members, min_sim) in clustered {
         let mut expanded: Vec<usize> = Vec::new();
         for r in members {
             let d = reps[r].1;
@@ -624,6 +655,67 @@ fn cluster_distinct(
     // Same order the undeduplicated call produced: members ascending, clusters by their first.
     out.sort_by(|a, b| a.0[0].cmp(&b.0[0]));
     out
+}
+
+/// The strings that have at least one partner under the two exact upper bounds the clusterer
+/// filters pairs by: `ratio ≤ 2·min(|a|,|b|)/(|a|+|b|)` (lengths) and
+/// `ratio ≤ 2·Σ min(count_a(c), count_b(c))/(|a|+|b|)` (character multisets). Same formulas, same
+/// floats; the pairs admitted are a superset of the clusterer's, never a subset. Length-sorted so
+/// each string only scans the window its length admits — the clusterer's own blocking.
+fn candidates(chars: &[Vec<char>], threshold: f64) -> Vec<usize> {
+    #[allow(clippy::cast_precision_loss)]
+    let length_bound = |a: usize, b: usize| -> f64 {
+        let total = a + b;
+        if total == 0 { 1.0 } else { 2.0 * (a.min(b) as f64) / (total as f64) }
+    };
+    let counts: Vec<Vec<(char, u32)>> = chars
+        .par_iter()
+        .map(|c| {
+            let mut sorted = c.clone();
+            sorted.sort_unstable();
+            let mut out: Vec<(char, u32)> = Vec::new();
+            for ch in sorted {
+                match out.last_mut() {
+                    Some(last) if last.0 == ch => last.1 += 1,
+                    _ => out.push((ch, 1)),
+                }
+            }
+            out
+        })
+        .collect();
+    #[allow(clippy::cast_precision_loss)]
+    let multiset_bound = |i: usize, j: usize| -> f64 {
+        let (ca, cb) = (&counts[i], &counts[j]);
+        let (mut x, mut y, mut matches) = (0usize, 0usize, 0u32);
+        while x < ca.len() && y < cb.len() {
+            match ca[x].0.cmp(&cb[y].0) {
+                std::cmp::Ordering::Less => x += 1,
+                std::cmp::Ordering::Greater => y += 1,
+                std::cmp::Ordering::Equal => {
+                    matches += ca[x].1.min(cb[y].1);
+                    x += 1;
+                    y += 1;
+                }
+            }
+        }
+        let total = chars[i].len() + chars[j].len();
+        if total == 0 { 1.0 } else { 2.0 * f64::from(matches) / total as f64 }
+    };
+    let mut order: Vec<usize> = (0..chars.len()).collect();
+    order.sort_by_key(|&i| chars[i].len());
+    let mut has_partner = vec![false; chars.len()];
+    for (p, &i) in order.iter().enumerate() {
+        for &j in &order[p + 1..] {
+            if length_bound(chars[i].len(), chars[j].len()) < threshold {
+                break; // lengths only grow: every remaining partner fails the bound too
+            }
+            if !(has_partner[i] && has_partner[j]) && multiset_bound(i, j) >= threshold {
+                has_partner[i] = true;
+                has_partner[j] = true;
+            }
+        }
+    }
+    (0..chars.len()).filter(|&i| has_partner[i]).collect()
 }
 
 /// Pass 1 — name-gated: same-named body-kind defs clustered by structural-canonical
@@ -729,7 +821,10 @@ pub fn pass_name_gated(
 /// ≥2 distinct names across ≥2 files.
 #[must_use]
 pub fn pass_cross_name(defs: &[Def], min_size: usize) -> Vec<Finding> {
-    let mut buckets: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    // Bucketed by hash, then only the buckets that qualify are put in canonical order — the order
+    // the ordered map produced, at the cost of sorting a few hundred strings instead of walking a
+    // tree of long-string compares for every definition.
+    let mut buckets: rustc_hash::FxHashMap<&str, Vec<usize>> = rustc_hash::FxHashMap::default();
     for (i, d) in defs.iter().enumerate() {
         if d.kind.fn_like {
             if let Some(a) = &d.analysis {
@@ -737,15 +832,16 @@ pub fn pass_cross_name(defs: &[Def], min_size: usize) -> Vec<Finding> {
             }
         }
     }
+    let mut qualifying: Vec<(&str, Vec<usize>)> = buckets
+        .into_iter()
+        .filter(|(_, ps)| {
+            ps.len() >= min_size && ps.iter().map(|&p| defs[p].name.as_str()).collect::<BTreeSet<_>>().len() >= 2
+        })
+        .collect();
+    qualifying.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
     let mut out = Vec::new();
-    for (_, ps) in buckets {
-        if ps.len() < min_size {
-            continue;
-        }
+    for (_, ps) in qualifying {
         let names: BTreeSet<&str> = ps.iter().map(|&p| defs[p].name.as_str()).collect();
-        if names.len() < 2 {
-            continue;
-        }
         let size = defs[ps[0]].analysis.as_ref().map_or(0, |a| a.size);
         let kind = callable_kind(defs, &ps);
         let loc = ps.iter().map(|&p| defs[p].loc).max().unwrap_or(0);
@@ -795,13 +891,16 @@ pub fn type3_inputs(defs: &[Def]) -> (Vec<Vec<String>>, Vec<String>) {
 /// lines. `gpu` selects the simjoin backend for the all-pairs join (`settings:gpu=on` → GPU hybrid).
 #[must_use]
 pub fn pass_type3(defs: &[Def], theta: f64, gpu: GpuMode) -> Vec<Finding> {
-    let (mut line_lists, mut names, mut def_of) = (Vec::new(), Vec::new(), Vec::new());
+    // Borrowed, not copied: on a lens run this is thirteen million lines, and copying them was a
+    // tenth of the pass — on one thread.
+    let (mut line_lists, mut names, mut def_of): (Vec<&[String]>, Vec<&str>, Vec<usize>) =
+        (Vec::new(), Vec::new(), Vec::new());
     for (i, d) in defs.iter().enumerate() {
         if d.kind.fn_like {
             if let Some(a) = &d.analysis {
                 if a.type3_lines.len() >= SHINGLE_LINES {
-                    line_lists.push(a.type3_lines.clone());
-                    names.push(d.name.clone());
+                    line_lists.push(a.type3_lines.as_slice());
+                    names.push(d.name.as_str());
                     def_of.push(i);
                 }
             }
@@ -813,7 +912,7 @@ pub fn pass_type3(defs: &[Def], theta: f64, gpu: GpuMode) -> Vec<Finding> {
     type3::type3_clusters(&line_lists, &names, theta, gpu.to_concurrency())
         .into_iter()
         .filter_map(|(cluster, min_sim)| {
-            let distinct: BTreeSet<&str> = cluster.iter().map(|&c| names[c].as_str()).collect();
+            let distinct: BTreeSet<&str> = cluster.iter().map(|&c| names[c]).collect();
             if distinct.len() < 2 {
                 return None;
             }
@@ -1140,7 +1239,8 @@ pub fn scan_and_cluster(opts: &PipelineOpts, frontends: &[&dyn Frontend]) -> Vec
 /// is independent of clustering, so it's reported even when the cap skips those groups.
 #[must_use]
 pub fn large_name_groups(defs: &[Def], min_members: usize) -> Vec<(&'static KindSpec, String, usize)> {
-    let mut counts: BTreeMap<(&str, &str), (&'static KindSpec, usize)> = BTreeMap::new();
+    // Counted by hash; the result is sorted below, so the map's order never shows.
+    let mut counts: rustc_hash::FxHashMap<(&str, &str), (&'static KindSpec, usize)> = rustc_hash::FxHashMap::default();
     for d in defs {
         let entry = counts.entry((d.kind.id, d.name.as_str())).or_insert((d.kind, 0));
         entry.1 += 1;

@@ -300,6 +300,14 @@ fn phase_bench(spec: &str, defs: &[Def], opts: &PipelineOpts) {
         Some((p, n)) => (p, n.parse().unwrap_or(5usize).max(1)),
         None => (spec, 5usize),
     };
+    // The same kind filter and order `cluster()` applies, so a phase is benched over the defs it
+    // would actually see — `--kinds lenses` benches pass1 over the lens records, not everything.
+    let mut defs: Vec<Def> = match &opts.kinds {
+        Some(kinds) => defs.iter().filter(|d| kinds.iter().any(|k| k == d.kind.id)).cloned().collect(),
+        None => defs.to_vec(),
+    };
+    defs.sort_by(|a, b| (a.file.as_ref(), a.line, a.col).cmp(&(b.file.as_ref(), b.line, b.col)));
+    let defs = defs.as_slice();
     let rationer = difflib_fast::Rationer::new();
     let mut ms: Vec<f64> = Vec::with_capacity(iters);
     for _ in 0..iters {
@@ -311,8 +319,9 @@ fn phase_bench(spec: &str, defs: &[Def], opts: &PipelineOpts) {
             .len(),
             "pass2" => pass_cross_name(defs, opts.min_size).len(),
             "type3" => pass_type3(defs, opts.type3_theta, opts.gpu).len(),
+            "converge" => find_dup_defs::converge::pass_converge(defs, opts.converge_top, opts.converge_cap).len(),
             other => {
-                eprintln!("[bench] unknown phase '{other}' (use pass1|pass2|type3)");
+                eprintln!("[bench] unknown phase '{other}' (use pass1|pass2|type3|converge)");
                 return;
             }
         };
@@ -356,12 +365,14 @@ fn render_bench(spec: &str, findings: &[Finding], selected: &[&dyn Frontend], cl
 /// `FDD_BENCH=type3:<iters>` + `FDD_SNAPSHOT=<dir>`. Dev-only perf scaffolding.
 fn type3_bench(spec: &str, line_lists: &[Vec<String>], names: &[String], cli: &Cli) {
     let iters = spec.split_once(':').and_then(|(_, n)| n.parse().ok()).unwrap_or(5usize).max(1);
+    let lists: Vec<&[String]> = line_lists.iter().map(Vec::as_slice).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let mut ms: Vec<f64> = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = std::time::Instant::now();
         let r = find_dup_defs::type3::type3_clusters(
-            line_lists,
-            names,
+            &lists,
+            &names,
             cli.type3_theta,
             difflib_fast::Concurrency::Cpu,
         );
@@ -1560,6 +1571,43 @@ fn short_path_root(file: &str, canon_root: &Path) -> String {
     p.strip_prefix(canon_root).map_or_else(|_| file.to_owned(), |rel| rel.to_string_lossy().into_owned())
 }
 
+/// [`short_path_root`] for every distinct file of the report, with the real path resolved once per
+/// DIRECTORY rather than once per file.
+///
+/// 🔴 `canonicalize` walks every component of a path through the kernel, and the report names
+/// tens of thousands of files in a few thousand directories — the walk was a quarter of the render.
+/// A regular file's real path is its directory's real path plus its name, so the directory is
+/// resolved once and the file is only `lstat`ed to confirm it is not itself a link. A file that
+/// is a link, or that cannot be examined, or whose directory cannot be resolved, goes through the
+/// per-file resolution exactly as before — so the string is the same string in every case.
+fn short_paths<'f>(files: &[&'f str], canon_root: &Path) -> HashMap<&'f str, String> {
+    let mut dirs: Vec<&Path> = files.iter().filter_map(|f| Path::new(f).parent()).collect();
+    dirs.sort_unstable();
+    dirs.dedup();
+    let real_dir: HashMap<&Path, Option<PathBuf>> =
+        dirs.par_iter().map(|&d| (d, std::fs::canonicalize(d).ok())).collect();
+    files
+        .par_iter()
+        .map(|&file| {
+            let path = Path::new(file);
+            let via_dir = match (path.parent().and_then(|d| real_dir.get(d)), path.file_name()) {
+                (Some(Some(dir)), Some(name)) => std::fs::symlink_metadata(path)
+                    .ok()
+                    .filter(|meta| !meta.file_type().is_symlink())
+                    .map(|_| dir.join(name)),
+                _ => None,
+            };
+            let shown = match via_dir {
+                Some(real) => real
+                    .strip_prefix(canon_root)
+                    .map_or_else(|_| file.to_owned(), |rel| rel.to_string_lossy().into_owned()),
+                None => short_path_root(file, canon_root),
+            };
+            (file, shown)
+        })
+        .collect()
+}
+
 /// The trailing marker on a `DUPLICATE` line: similarity / pass tag + thickness triage signals
 /// (`T=…`, `loc=…`, `args=…`). `args` is dropped when 0 (constants, type-aliases, classes) to
 /// keep the line scannable. Constants / type-aliases with no similarity tag still get a `loc`
@@ -1676,8 +1724,7 @@ fn format_report(
         findings.iter().flat_map(|f| f.members.iter().map(|(file, _, _)| file.as_str())).collect();
     files.sort_unstable();
     files.dedup();
-    let pathmap: HashMap<&str, String> =
-        files.par_iter().map(|&file| (file, short_path_root(file, &canon_root))).collect();
+    let pathmap: HashMap<&str, String> = short_paths(&files, &canon_root);
 
     // Written into ONE buffer rather than a `Vec<String>` joined at the end: a report of this size is
     // a million-odd lines, and every one of them was an allocation whose only purpose was to be

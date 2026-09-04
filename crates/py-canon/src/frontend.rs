@@ -40,6 +40,23 @@ pub(crate) fn kind_spec(id: &str) -> &'static KindSpec {
         .unwrap_or_else(|| unreachable!("py-canon emitted unknown kind {id:?}"))
 }
 
+/// A content digest that only narrows — the bytes decide — so it is the cheapest word-at-a-time
+/// multiply-and-rotate rather than a keyed hash: over a quarter-gigabyte tree the default hasher
+/// was a measurable share of the scan.
+fn digest(bytes: &[u8]) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h: u64 = bytes.len() as u64;
+    let mut chunks = bytes.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]]);
+        h = (h.rotate_left(5) ^ word).wrapping_mul(K);
+    }
+    for &b in chunks.remainder() {
+        h = (h.rotate_left(5) ^ u64::from(b)).wrapping_mul(K);
+    }
+    h
+}
+
 /// Python frontend over Ruff's parser.
 pub struct Python;
 
@@ -57,22 +74,83 @@ impl Frontend for Python {
             KINDS
         }
     }
+    /// The `use` lens counts a name's mentions across the whole set, so in lens mode this frontend
+    /// takes every file — and deduplicates by content itself, see [`Python::scan`].
+    fn scans_across_files(&self, opts: &ScanOpts) -> bool {
+        opts.wants("lenses")
+    }
     fn scan(&self, files: &[Arc<str>], opts: &ScanOpts) -> Vec<Def> {
-        let mut defs: Vec<Def> = files
+        if !opts.wants("lenses") {
+            return files
+                .par_iter()
+                .flat_map(|f| {
+                    fs::read_to_string(&**f).map_or_else(|_| Vec::new(), |src| scan_source(&src, f, opts))
+                })
+                .collect();
+        }
+        // 🔴 In lens mode the engine hands over EVERY file, twins included: the `use` lens counts
+        // how many places mention a name across the whole set, which is a fact about the tree and
+        // not about any one file, so the engine cannot thin the list for it. That does not mean
+        // every file has to be parsed. A twin is the same bytes again, and the same bytes produce
+        // the same definitions and the same use sites; so the content is read once, parsed once,
+        // its definitions replayed onto each twin's path, and its use sites counted once per copy.
+        // On a real monorepo that is one parse in six.
+        let sources: Vec<Option<String>> = files.par_iter().map(|f| fs::read_to_string(&**f).ok()).collect();
+        let digests: Vec<u64> = sources
             .par_iter()
-            .flat_map(|f| {
-                fs::read_to_string(&**f).map_or_else(|_| Vec::new(), |src| scan_source(&src, f, opts))
+            .map(|src| digest(src.as_deref().unwrap_or("").as_bytes()))
+            .collect();
+        // The digest narrows it; the bytes decide it. Which copy is parsed does not vary between
+        // runs: the first in the (sorted) list. A file that cannot be read is its own group, and the
+        // scan skips it as it always did.
+        let mut by_digest: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+        let mut parse: Vec<usize> = Vec::new();
+        let mut copies_of: Vec<Vec<usize>> = vec![Vec::new(); files.len()];
+        for (i, src) in sources.iter().enumerate() {
+            let Some(content) = src else {
+                parse.push(i);
+                continue;
+            };
+            let seen = by_digest.entry(digests[i]).or_default();
+            if let Some(&source) = seen.iter().find(|&&r| sources[r].as_deref() == Some(content.as_str())) {
+                copies_of[source].push(i);
+            } else {
+                seen.push(i);
+                parse.push(i);
+            }
+        }
+        let parsed: Vec<Vec<Def>> = parse
+            .par_iter()
+            .map(|&i| sources[i].as_ref().map_or_else(Vec::new, |src| scan_source(src, &files[i], opts)))
+            .collect();
+        // Definitions in file order for the parsed files, then each twin's copies. The order matters
+        // to exactly one consumer — `merge_use_facts` attaches a name's use facts to the FIRST
+        // definition bearing it — and a twin's source always precedes the twin, so the first bearer
+        // is a parsed file's definition in either order.
+        let copies: Vec<Def> = parse
+            .par_iter()
+            .zip(&parsed)
+            .flat_map_iter(|(&i, found)| {
+                copies_of[i].iter().flat_map(move |&twin| {
+                    found.iter().map(move |def| {
+                        let mut copy = def.clone();
+                        copy.file = Arc::clone(&files[twin]);
+                        copy
+                    })
+                })
             })
             .collect();
+        let mut defs: Vec<Def> = parsed.into_iter().flatten().collect();
+        defs.extend(copies);
         // Phase two: the body scan above supplies the anchors (every top-level name it found), so
-        // the profile pass needs no resolver — only a second walk of the same files.
-        if opts.wants("lenses") {
-            // The `use` lens sees a definition from outside, so its facts exist only once every
-            // file has been read; scoring is corpus-relative for the same reason.
-            let facts = crate::uses::use_facts(files, &defs);
-            dup_defs_core::lens::merge_use_facts(&mut defs, facts);
-            dup_defs_core::lens::score_lens_defs(&mut defs);
-        }
+        // the profile pass needs no resolver — only a second walk of the same files. The `use` lens
+        // sees a definition from outside, so its facts exist only once every file has been read;
+        // scoring is corpus-relative for the same reason.
+        let distinct: Vec<(&str, usize)> =
+            parse.iter().filter_map(|&i| sources[i].as_deref().map(|src| (src, 1 + copies_of[i].len()))).collect();
+        let facts = crate::uses::use_facts(&distinct, &defs);
+        dup_defs_core::lens::merge_use_facts(&mut defs, facts);
+        dup_defs_core::lens::score_lens_defs(&mut defs);
         defs
     }
 }

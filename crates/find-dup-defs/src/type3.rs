@@ -25,7 +25,7 @@
 use difflib_fast::simjoin::{cosine_join_with, Corpus};
 use difflib_fast::Concurrency;
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::simgraph::{components, cosine};
 
@@ -114,8 +114,8 @@ fn weighted_row(seq: &[u32], line_weight: &[f64]) -> (Vec<(u32, f64)>, f64) {
 }
 
 pub fn type3_clusters(
-    line_lists: &[Vec<String>],
-    names: &[String],
+    line_lists: &[&[String]],
+    names: &[&str],
     theta: f64,
     concurrency: Concurrency,
 ) -> Vec<(Vec<usize>, f64)> {
@@ -124,19 +124,11 @@ pub fn type3_clusters(
         return Vec::new();
     }
     // Intern distinct lines → ids (lexicographic / byte order, stable), then per-function id sequences.
-    let mut id_text: Vec<&str> = {
-        let mut seen: FxHashSet<&str> = FxHashSet::default();
-        let mut distinct: Vec<&str> = Vec::new();
-        for lines in line_lists {
-            for line in lines {
-                if seen.insert(line.as_str()) {
-                    distinct.push(line.as_str());
-                }
-            }
-        }
-        distinct
-    };
-    id_text.sort_unstable();
+    // Sorted and deduplicated on the pool rather than fed one at a time into a set: on a lens run
+    // that is thirteen million lines, and the set was the pass's one sequential stretch.
+    let mut id_text: Vec<&str> = line_lists.par_iter().flat_map_iter(|lines| lines.iter().map(String::as_str)).collect();
+    id_text.par_sort_unstable();
+    id_text.dedup();
     let line_id: FxHashMap<&str, u32> = id_text.iter().enumerate().map(|(i, &t)| (t, i as u32)).collect();
     let seqs: Vec<Vec<u32>> = line_lists
         .par_iter()
@@ -153,16 +145,27 @@ pub fn type3_clusters(
             occ[id as usize] += 1;
         }
     }
-    let mut df: FxHashMap<&str, u64> = FxHashMap::default();
-    for (id, &text) in id_text.iter().enumerate() {
-        let count = u64::from(occ[id]);
-        let mut toks: Vec<&str> = tokenize(text);
-        toks.sort_unstable();
-        toks.dedup();
-        for t in toks {
-            *df.entry(t).or_insert(0) += count;
-        }
-    }
+    // A sum of counts, so it folds across threads: per-thread tables, merged at the end.
+    let df: FxHashMap<&str, u64> = id_text
+        .par_iter()
+        .enumerate()
+        .with_min_len(512)
+        .fold(FxHashMap::default, |mut df: FxHashMap<&str, u64>, (id, &text)| {
+            let count = u64::from(occ[id]);
+            let mut toks: Vec<&str> = tokenize(text);
+            toks.sort_unstable();
+            toks.dedup();
+            for t in toks {
+                *df.entry(t).or_insert(0) += count;
+            }
+            df
+        })
+        .reduce(FxHashMap::default, |mut a, b| {
+            for (t, c) in b {
+                *a.entry(t).or_insert(0) += c;
+            }
+            a
+        });
     let idf: FxHashMap<&str, f64> = if total_lines == 0 {
         FxHashMap::default()
     } else {
@@ -192,7 +195,7 @@ pub fn type3_clusters(
     let mut reps: Vec<usize> = Vec::new();
     let mut spoken_by: Vec<Vec<usize>> = Vec::new();
     for i in 0..n {
-        let key = (seqs[i].as_slice(), names[i].as_str());
+        let key = (seqs[i].as_slice(), names[i]);
         if let Some(&r) = seen.get(&key) {
             spoken_by[r].push(i);
         } else {
@@ -220,7 +223,7 @@ pub fn type3_clusters(
             let (ri, rj) = (reps[i], reps[j]);
             cos > theta
                 && names[ri] != names[rj]
-                && !is_sync_async(&names[ri], &names[rj])
+                && !is_sync_async(names[ri], names[rj])
                 && seqs[ri] != seqs[rj]
         })
         .map(|(j, i, _)| (j, i))

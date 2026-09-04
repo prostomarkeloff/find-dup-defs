@@ -326,8 +326,8 @@ impl<'a> Dump<'a> {
         Self { anchor: Some(anchor), ..Dump::new(src, locals) }
     }
 
-    /// Module-scope mode: `locals` carries the union of the function's own bound names and the
-    /// module's, `scope` the module's alone (the set that also applies in attribute position).
+    /// Module-scope mode: `locals` carries the function's own bound names, `scope` the module's —
+    /// both rename in name position, only `scope` in attribute position.
     fn with_scope(
         src: &'a str,
         locals: &'a HashSet<String>,
@@ -337,8 +337,16 @@ impl<'a> Dump<'a> {
     }
 
     /// In cross-name mode, rewrite a bound local to its positional `_v{n}` placeholder.
+    ///
+    /// A name is bound if the definition binds it OR, in module-scope mode, if the module does:
+    /// the two sets are consulted in turn rather than merged, because merging them meant copying
+    /// the module's whole scope into every function's local set, once per function.
     fn rename_id(&mut self, id: &str) -> String {
-        dup_defs_core::alpha_rename(&mut self.map, self.locals, id)
+        let bound = [self.locals, self.scope].into_iter().flatten().find(|set| set.contains(id));
+        match bound {
+            Some(set) => dup_defs_core::alpha_rename(&mut self.map, Some(set), id),
+            None => id.to_owned(),
+        }
     }
 
     /// An attribute whose name the *module* declares (a field of one of its classes) is a slot too:
@@ -2462,24 +2470,16 @@ pub(crate) fn canon_site(
     (format!("{tag}({})", parts.join(", ")), dump.count)
 }
 
-/// Analyze a top-level definition in **module scope**: the alpha-rename set is the module's own
-/// bound names plus the definition's locals, so every identity the module introduced becomes a slot
-/// and only the grammar of external calls survives. See [`Dump::scope`].
-pub(crate) fn analyze_in_scope(stmt: &Stmt, src: &str, scope: &HashSet<String>) -> AnalyzedFn {
-    let cluster_canonical = Dump::new(src, None).stmt(stmt);
+/// The module-scope canonical alone — what the `scope` lens contributes. Its predecessor rendered
+/// the definition three ways (a names-preserved dump, this one, and a full unparse) and the lens
+/// read one of them; the other two were computed per function to be dropped.
+pub(crate) fn scope_canonical(stmt: &Stmt, src: &str, scope: &HashSet<String>) -> String {
     let mut collect = Collect::default();
     if let Stmt::FunctionDef(func) = stmt {
         collect.add_params(&func.parameters);
     }
     collect.visit_stmt(stmt);
-    let mut locals = collect.bound;
-    locals.extend(scope.iter().cloned());
-    let mut dump = Dump::with_scope(src, &locals, scope);
-    let xname_canonical = dump.stmt(stmt);
-    let size = dump.count;
-    let statements = statement_stream(unparse_depths(stmt, src, &locals, dump.map));
-    let type3_lines = statements.iter().map(|s| s.line.clone()).collect();
-    AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, statements, size }
+    Dump::with_scope(src, &collect.bound, scope).stmt(stmt)
 }
 
 /// Every name this definition mentions — the raw material for [`Facets::reaches`].

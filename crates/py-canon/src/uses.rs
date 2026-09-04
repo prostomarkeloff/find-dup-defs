@@ -42,8 +42,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
-use std::fs;
-use std::sync::Arc;
 
 use dup_defs_core::Def;
 use rayon::prelude::*;
@@ -390,29 +388,44 @@ struct Profile<'a> {
 
 /// Turn the collected sites into the profiles that survive the floors. Sites are put in canonical
 /// order *before* attribute slots are numbered, so neither canonical depends on file layout.
+///
+/// Each site comes with how many files spell it — a site found in a file that exists in five copies
+/// is five sites. The profile is a multiset, and the count is carried rather than the site cloned:
+/// a repeated site sorts next to itself, numbers no new slot, and contributes its fact that many
+/// times, which is exactly what five copies of it would have done.
 fn build_profiles(
-    by_name: BTreeMap<&str, Vec<Site>>,
+    by_name: BTreeMap<&str, Vec<(Site, usize)>>,
     min_sites: usize,
     max_sites: usize,
     min_shapes: usize,
 ) -> Vec<Profile<'_>> {
     by_name
-        .into_iter()
-        .filter(|(_, sites)| sites.len() >= min_sites && sites.len() <= max_sites)
+        .into_par_iter()
+        .filter(|(_, sites)| {
+            let n: usize = sites.iter().map(|(_, copies)| copies).sum();
+            n >= min_sites && n <= max_sites
+        })
         .filter_map(|(name, mut sites)| {
-            sites.sort_by(|a, b| a.canon.cmp(&b.canon));
+            sites.sort_by(|a, b| a.0.canon.cmp(&b.0.canon));
             let mut slots: HashMap<String, u32> = HashMap::new();
             let xname: Vec<String> =
-                sites.iter().map(|s| rewrite_marks(&s.canon, Some(&mut slots))).collect();
+                sites.iter().map(|(s, _)| rewrite_marks(&s.canon, Some(&mut slots))).collect();
             if xname.iter().collect::<HashSet<_>>().len() < min_shapes {
                 return None;
             }
             // Contexts and neighbours are sets: a shape repeated across sites says nothing new,
             // and their whole point is to be coarser than the canonical.
-            let ctxs: BTreeSet<&str> = sites.iter().map(|s| s.ctx).collect();
+            let ctxs: BTreeSet<&str> = sites.iter().map(|(s, _)| s.ctx).collect();
             let cooc: BTreeSet<&str> =
-                sites.iter().flat_map(|s| s.cooc.iter().map(String::as_str)).collect();
-            let mut facts: Vec<String> = xname.into_iter().map(|f| format!("use:{f}")).collect();
+                sites.iter().flat_map(|(s, _)| s.cooc.iter().map(String::as_str)).collect();
+            let mut facts: Vec<String> = Vec::new();
+            for (fact, (_, copies)) in xname.into_iter().zip(&sites) {
+                let fact = format!("use:{fact}");
+                for _ in 1..*copies {
+                    facts.push(fact.clone());
+                }
+                facts.push(fact);
+            }
             facts.extend(ctxs.into_iter().map(|c| format!("usectx:{c}")));
             facts.extend(cooc.into_iter().map(|c| format!("cooc:{c}")));
             Some(Profile { name, facts })
@@ -424,11 +437,15 @@ fn build_profiles(
 
 /// The use-site facts of every definition that has any, keyed by name and already prefixed by
 /// channel (`use:` / `usectx:` / `cooc:`), merged into the lens records by
-/// [`crate::lenses::merge_use_facts`]. `defs`
+/// [`dup_defs_core::lens::merge_use_facts`]. `defs`
 /// supplies the anchors (every top-level name the body scan already found); method names are
 /// excluded because they are qualified (`Foo.bar`) and never appear as a bare `Name`.
+///
+/// `sources` is each distinct file's text with how many files spell it: a site found in a file
+/// that exists in five copies is five sites, exactly as walking the five copies would have found
+/// it five times — and a profile is a multiset, so the count is what it keeps.
 #[must_use]
-pub(crate) fn use_facts(files: &[Arc<str>], defs: &[Def]) -> HashMap<String, Vec<String>> {
+pub(crate) fn use_facts(sources: &[(&str, usize)], defs: &[Def]) -> HashMap<String, Vec<String>> {
     // Anchors: top-level names only, first declaration wins on a name collision (the same
     // convention `pass_name_gated` uses when one name covers several definitions).
     let mut decl: BTreeMap<&str, &Def> = BTreeMap::new();
@@ -443,18 +460,16 @@ pub(crate) fn use_facts(files: &[Arc<str>], defs: &[Def]) -> HashMap<String, Vec
         return HashMap::new();
     }
 
-    let per_file: Vec<Vec<Site>> = files
-        .par_iter()
-        .map(|f| fs::read_to_string(&**f).map_or_else(|_| Vec::new(), |src| collect_sites(&src, &known)))
-        .collect();
+    let per_file: Vec<Vec<Site>> = sources.par_iter().map(|&(src, _)| collect_sites(src, &known)).collect();
 
-    // Group sites by anchor. `files` is already sorted, so this is deterministic before the
-    // canonical sort inside `build_profiles` even runs.
-    let mut by_name: BTreeMap<&str, Vec<Site>> = BTreeMap::new();
-    for sites in per_file {
+    // Group sites by anchor. The order sites arrive in is not observable past this point: the
+    // profile sorts them by canonical, and two sites with one canonical are interchangeable to
+    // everything that reads a profile.
+    let mut by_name: BTreeMap<&str, Vec<(Site, usize)>> = BTreeMap::new();
+    for (&(_, copies), sites) in sources.iter().zip(per_file) {
         for site in sites {
             if let Some((k, _)) = decl.get_key_value(site.name.as_str()) {
-                by_name.entry(k).or_default().push(site);
+                by_name.entry(k).or_default().push((site, copies));
             }
         }
     }
@@ -534,7 +549,7 @@ mod tests {
         };
         assert_ne!(body("ImageCache"), body("PromptStore"), "bodies must diverge for this to be the point");
 
-        let facts = use_facts(&files, &defs);
+        let facts = use_facts(&[(a, 1), (b, 1)], &defs);
         let get = |n: &str| facts.get(n).unwrap_or_else(|| panic!("no use facts for {n}")).clone();
         assert_eq!(get("ImageCache"), get("PromptStore"), "identical handling ⇒ identical use facts");
     }

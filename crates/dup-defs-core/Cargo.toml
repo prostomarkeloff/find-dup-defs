@@ -1,6 +1,6 @@
 [package]
 name = "dup-defs-core"
-version = "0.2.1"
+version = "0.2.2"
 description = "The find-dup-defs frontend↔engine contract — Def / KindSpec / Analysis / the Frontend trait (+ LineMap). Frontend-agnostic; both py-canon and ts-canon depend on it."
 keywords = ["ast", "canonicalize", "parsing", "clone", "duplicate"]
 categories = ["development-tools"]
@@ -11,6 +11,11 @@ authors.workspace = true
 
 [lib]
 name = "dup_defs_core"
+
+[dependencies]
+# The corpus-relative lens scoring folds a document-frequency table over every lens record and
+# scores each against it; both halves are per record and run on the pool.
+rayon = "1"
 
 [lints]
 workspace = true
