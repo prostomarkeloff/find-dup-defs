@@ -20,6 +20,9 @@ use serde::Serialize;
 
 mod snapshot;
 
+#[cfg(test)]
+mod report_tests;
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -541,43 +544,7 @@ fn main() {
     }
     let large_groups = timed("large-groups", || large_name_groups(&defs, SUGGEST_CAP));
     let mut findings = cluster(defs, &opts);
-    // What each directive actually matched, indexed alongside `directives`. Recorded during the
-    // pass that already asks `d.matches(f)` for every pair, so it costs nothing — and it is the
-    // only place the answer exists at all: after `retain` the suppressed findings are gone, and a
-    // consumer re-deriving the matching outside would be building a second implementation of it.
-    let mut hits: Vec<Vec<JsonDirectiveHit>> = vec![Vec::new(); directives.len()];
-    if !directives.is_empty() {
-        // Order of effects (unchanged): notes accumulate from every matching directive (even a
-        // `suppress`, so a suppress with a `=note` still leaves its reason if another directive
-        // also matches); then severity steps by the summed escalate(−1)/de-escalate(+1) (clamped);
-        // then `suppress` drops the finding. `set:` directives are pipeline config (applied above),
-        // never finding filters, so they're skipped here.
-        for f in &mut findings {
-            let mut step = 0i32;
-            for (i, d) in directives.iter().enumerate() {
-                if d.action == LintAction::Set || !d.matches(f) {
-                    continue;
-                }
-                hits[i].push(JsonDirectiveHit { key: allowlist_key(f), files: member_files(f, &cli.repo_root) });
-                if let Some(n) = &d.note {
-                    f.notes.push(n.clone());
-                }
-                match d.action {
-                    LintAction::Deescalate => step += 1,
-                    LintAction::Escalate => step -= 1,
-                    _ => {}
-                }
-            }
-            if step != 0 {
-                f.severity = Severity::from_index(f.severity.to_index() + step);
-            }
-        }
-        findings.retain(|f| {
-            !directives
-                .iter()
-                .any(|d| d.action == LintAction::Suppress && d.matches(f))
-        });
-    }
+    let hits = timed("directives", || apply_directives(&mut findings, &directives, &cli.repo_root));
     let directive_report: Vec<JsonDirective> = directives
         .iter()
         .zip(origins.iter())
@@ -1608,6 +1575,15 @@ fn short_paths<'f>(files: &[&'f str], canon_root: &Path) -> HashMap<&'f str, Str
         .collect()
 }
 
+/// Разрешает каждый файл отчёта один раз; повторные участники используют тот же путь.
+fn report_paths<'f>(findings: impl Iterator<Item = &'f Finding>, repo_root: &Path) -> HashMap<&'f str, String> {
+    let canon_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut files: Vec<&str> = findings.flat_map(|f| f.members.iter().map(|(file, _, _)| file.as_str())).collect();
+    files.sort_unstable();
+    files.dedup();
+    short_paths(&files, &canon_root)
+}
+
 /// The trailing marker on a `DUPLICATE` line: similarity / pass tag + thickness triage signals
 /// (`T=…`, `loc=…`, `args=…`). `args` is dropped when 0 (constants, type-aliases, classes) to
 /// keep the line scannable. Constants / type-aliases with no similarity tag still get a `loc`
@@ -1715,16 +1691,7 @@ fn format_report(
     let include_converge = findings.iter().any(|f| f.pass == "converge" || f.pass == "converge-family");
     let sections = report_sections(frontends, warn, error, include_patterns, include_converge, scan_opts);
 
-    // `short_path` does two `fs::canonicalize` calls per member (realpath → getattrlist/open/stat
-    // per path component) — ~90% of render at scale, repeated for every one of ~200k members. Hoist
-    // the (constant) repo-root canonicalize, and resolve each DISTINCT file ONCE, in parallel; the
-    // render loop then does a hash lookup. Byte-identical output (same per-file display string).
-    let canon_root = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
-    let mut files: Vec<&str> =
-        findings.iter().flat_map(|f| f.members.iter().map(|(file, _, _)| file.as_str())).collect();
-    files.sort_unstable();
-    files.dedup();
-    let pathmap: HashMap<&str, String> = short_paths(&files, &canon_root);
+    let pathmap = report_paths(findings.iter().copied(), repo_root);
 
     // Written into ONE buffer rather than a `Vec<String>` joined at the end: a report of this size is
     // a million-odd lines, and every one of them was an allocation whose only purpose was to be
@@ -1855,11 +1822,69 @@ fn allowlist_key(f: &Finding) -> String {
     format!("{rule} {}", f.name)
 }
 
-/// Distinct repo-relative files a finding's members live in, sorted — the other half of its
-/// fingerprint. Sorted and de-duplicated so two members in one file don't make the identity depend
-/// on member order.
-fn member_files(f: &Finding, repo_root: &Path) -> Vec<String> {
-    f.members.iter().map(|(file, _, _)| short_path(file, repo_root)).collect::<BTreeSet<_>>().into_iter().collect()
+/// Уникальные пути участников в порядке сортировки образуют файловую часть отпечатка.
+fn member_files(f: &Finding, paths: &HashMap<String, String>) -> Vec<String> {
+    f.members.iter().map(|(file, _, _)| paths[file].clone()).collect::<BTreeSet<_>>().into_iter().collect()
+}
+
+/// Сопоставляет независимые находки параллельно, применяет эффекты в порядке директив.
+/// Аудит включает подавленные находки; severity ограничивается после суммы всех шагов.
+fn apply_directives(
+    findings: &mut Vec<Finding>,
+    directives: &[directiva::Directive<LintAction>],
+    repo_root: &Path,
+) -> Vec<Vec<JsonDirectiveHit>> {
+    if directives.is_empty() {
+        return Vec::new();
+    }
+    let matched: Vec<Vec<usize>> = findings
+        .par_iter()
+        .map(|f| {
+            directives
+                .iter()
+                .enumerate()
+                .filter_map(|(i, d)| (d.action != LintAction::Set && d.matches(f)).then_some(i))
+                .collect()
+        })
+        .collect();
+    // Ключи принадлежат таблице: подавление находок ниже освобождает исходные строки.
+    let paths: HashMap<String, String> = report_paths(
+        findings.iter().zip(&matched).filter_map(|(f, indices)| (!indices.is_empty()).then_some(f)),
+        repo_root,
+    )
+    .into_iter()
+    .map(|(file, shown)| (file.to_owned(), shown))
+    .collect();
+    let mut matched = matched.into_iter();
+    let mut hits: Vec<Vec<JsonDirectiveHit>> = vec![Vec::new(); directives.len()];
+    findings.retain_mut(|f| {
+        let indices = matched.next().expect("one match list per finding");
+        if indices.is_empty() {
+            return true;
+        }
+        let key = allowlist_key(f);
+        let files = member_files(f, &paths);
+        let mut step = 0i32;
+        let mut suppressed = false;
+        for i in indices {
+            let d = &directives[i];
+            hits[i].push(JsonDirectiveHit { key: key.clone(), files: files.clone() });
+            if let Some(n) = &d.note {
+                f.notes.push(n.clone());
+            }
+            match d.action {
+                LintAction::Deescalate => step += 1,
+                LintAction::Escalate => step -= 1,
+                LintAction::Suppress => suppressed = true,
+                _ => {}
+            }
+        }
+        if step != 0 {
+            f.severity = Severity::from_index(f.severity.to_index() + step);
+        }
+        !suppressed
+    });
+    hits
 }
 
 /// The directive's action as its canonical token — `LintAction` is a foreign enum, so it cannot
@@ -1892,6 +1917,7 @@ fn directive_text(d: &directiva::Directive<LintAction>) -> String {
 
 /// Machine-readable groups + summary — byte-for-byte the Python `render_json` (indent=2).
 fn render_json(findings: &[Finding], repo_root: &Path, directives: Vec<JsonDirective>) -> String {
+    let pathmap = report_paths(findings.iter(), repo_root);
     let groups: Vec<JsonGroup> = findings
         .iter()
         .map(|f| {
@@ -1906,7 +1932,7 @@ fn render_json(findings: &[Finding], repo_root: &Path, directives: Vec<JsonDirec
                 thickness: f.thickness,
                 loc: f.loc,
                 args: f.args,
-                members: f.members.iter().map(|(file, line, _)| JsonMember { file: short_path(file, repo_root), line: *line }).collect(),
+                members: f.members.iter().map(|(file, line, _)| JsonMember { file: pathmap[file.as_str()].clone(), line: *line }).collect(),
                 allowlist_key: allowlist_key(f),
                 notes: f.notes.clone(),
                 facets: f.facets.clone(),
