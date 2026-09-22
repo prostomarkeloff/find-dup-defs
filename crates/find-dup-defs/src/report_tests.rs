@@ -71,6 +71,49 @@ fn directives_preserve_note_order_summed_severity_and_suppressed_hits() {
 }
 
 #[test]
+fn a_hit_carries_the_strength_the_finding_entered_the_directive_pass_with() {
+    use super::{apply_directives, Finding, LintAction, Severity};
+    use dup_defs_core::kinds::FUNCTIONS;
+
+    let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mixed"));
+    let finding = |name: &str, pass, severity, thickness| Finding {
+        pass,
+        kind: &FUNCTIONS,
+        name: name.to_owned(),
+        severity,
+        min_sim: None,
+        loc: 3,
+        args: 1,
+        thickness,
+        snippet: String::new(),
+        notes: Vec::new(),
+        pattern: None,
+        facets: Vec::new(),
+        members: vec![(root.join("py/core_a.py").display().to_string(), 1, 0)],
+    };
+    let mut findings = vec![
+        finding("stepped", "cross-name", Severity::Error, 0.62),
+        finding("dropped/ranked", "converge", Severity::Info, 0.07),
+    ];
+    let directives: Vec<_> = ["de-escalate:stepped=down", "suppress:ranked=tail"]
+        .iter()
+        .map(|s| directiva::parse_as::<LintAction>(s).unwrap())
+        .collect();
+
+    let hits = apply_directives(&mut findings, &directives, root);
+
+    // The severity is the one the finding brought INTO the directive pass: a consumer asking "what
+    // would this have been reported as" must not be told the answer after the directive changed it.
+    let stepped = &hits[0][0];
+    assert_eq!((stepped.pass, stepped.severity, stepped.thickness), ("cross-name", "ERROR", 0.62));
+    assert_eq!(findings[0].severity, Severity::Warning, "the finding itself is still stepped");
+    // A suppressed finding is gone from the report, and this is the only place its strength survives.
+    let dropped = &hits[1][0];
+    assert_eq!((dropped.pass, dropped.severity, dropped.thickness), ("converge", "INFO", 0.07));
+    assert_eq!(findings.len(), 1);
+}
+
+#[test]
 fn batched_paths_match_scalar_resolution() {
     let root = std::env::temp_dir().join(format!("fdd-report-paths-{}", std::process::id()));
     let repo = root.join("repo");

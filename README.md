@@ -364,7 +364,10 @@ with the rule, so the *why* is still there when someone reads the file a year la
 
 Globs support `{a,b,c}` alternation, so one paste covers a whole convention family. `--json`
 reports what each directive matched (`directives[]`, with `origin` and a `matched` count) —
-`matched: 0` is a directive that no longer suppresses anything.
+`matched: 0` is a directive that no longer suppresses anything. Each matched finding is named by
+its `key` and `files`, and carries the `pass`, `thickness` and `severity` it had before any
+directive stepped it. A suppressed finding is gone from `groups[]`, so this is where its strength
+survives — enough to tell a suppressed ERROR from an entry in the uncapped converge ranking's tail.
 
 **Pipeline settings** ride the same channel:
 

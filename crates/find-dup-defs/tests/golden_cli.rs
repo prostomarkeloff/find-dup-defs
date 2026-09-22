@@ -187,6 +187,45 @@ fn directive_from_a_file_reports_its_line() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// `(key, pass, severity, thickness)` — what a consumer needs to judge a finding's strength. The
+/// thickness is compared as its JSON text: both sides are the same f64 printed by the same writer.
+type Strength = (String, String, String, String);
+
+fn sorted_strengths<'v>(items: impl Iterator<Item = &'v serde_json::Value>, key: &str) -> Vec<Strength> {
+    let mut out: Vec<Strength> = items
+        .map(|item| {
+            (
+                item[key].as_str().expect("key").to_owned(),
+                item["pass"].as_str().expect("pass").to_owned(),
+                item["severity"].as_str().expect("severity").to_owned(),
+                item["thickness"].to_string(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn a_suppressed_finding_is_reported_with_the_strength_it_would_have_shown() {
+    // Suppression drops the finding from `groups`, so the directive report is the only place its
+    // strength survives. Without it a consumer cannot tell a suppressed ERROR from a suppressed
+    // entry deep in the converge ranking's tail — and an uncapped ranking is mostly tail.
+    let plain: serde_json::Value =
+        serde_json::from_str(&run_in(FIX_CONVERGE, &["--converge", "--converge-top", "0", "--json"])).expect("json");
+    let shown = sorted_strengths(plain["groups"].as_array().expect("groups[]").iter(), "allowlist_key");
+    assert!(shown.iter().any(|s| s.1.starts_with("converge")), "the fixture must exercise the ranking");
+
+    let all_gone: serde_json::Value = serde_json::from_str(&run_in(
+        FIX_CONVERGE,
+        &["--converge", "--converge-top", "0", "--json", "-D", "suppress:*=everything"],
+    ))
+    .expect("json");
+    assert!(all_gone["groups"].as_array().expect("groups[]").is_empty(), "every finding was suppressed");
+    let hits = all_gone["directives"][0]["findings"].as_array().expect("findings[]");
+    assert_eq!(sorted_strengths(hits.iter(), "key"), shown, "each hit says what its finding would have shown");
+}
+
 #[test]
 fn unknown_kind_exits_nonzero() {
     // Previously an unrecognized `--kinds` value selected no kind at all: the scan collected
