@@ -175,7 +175,9 @@ struct Cli {
     ///   `-D note:<methods>For*.begin_body=v2 refactor target`
     ///
     /// `--json` reports what each directive matched (`directives[]`, with its `origin` and a
-    /// `matched` count) — `matched: 0` is a directive that no longer suppresses anything.
+    /// `matched` count) — `matched: 0` is a directive that no longer suppresses anything. Each
+    /// matched finding carries its `pass`, `thickness` and the `severity` it had before any directive
+    /// stepped it, so a suppressed finding's strength is still readable.
     #[arg(long = "directive", short = 'D', value_name = "DIRECTIVE")]
     directives: Vec<String>,
 }
@@ -1774,10 +1776,24 @@ struct JsonGroup {
 /// allowlist key plus the files involved. **Lines are deliberately absent** — they move on any edit
 /// above the definition, so including them would report a directive as touching something new every
 /// time an unrelated import was added.
+///
+/// 🔴 It also says how strong the finding was. A suppressed finding is gone from `groups[]`, so this
+/// is the only place its strength survives — and without it a consumer cannot tell a suppressed ERROR
+/// from an entry deep in the uncapped converge ranking, which is mostly tail: findings that no report
+/// would ever show. A directive that starts matching one more of those has hidden nothing.
 #[derive(Serialize, Clone)]
 struct JsonDirectiveHit {
     key: String,
     files: Vec<String>,
+    /// The pass that produced the finding — the same vocabulary as `groups[].pass`.
+    pass: &'static str,
+    /// The severity the finding carried INTO the directive pass, before any `escalate` /
+    /// `de-escalate` stepped it: "what would this have been reported as" must not be answered with
+    /// what a directive already did to it.
+    severity: &'static str,
+    /// The finding's thickness — the same number as `groups[].thickness`, and the one the converge
+    /// ranking is ordered by.
+    thickness: f64,
 }
 
 /// What one `-D` directive did on this run.
@@ -1864,11 +1880,19 @@ fn apply_directives(
         }
         let key = allowlist_key(f);
         let files = member_files(f, &paths);
+        // Read before the loop steps anything: the hit reports the severity the finding came in with.
+        let severity = f.severity.label();
         let mut step = 0i32;
         let mut suppressed = false;
         for i in indices {
             let d = &directives[i];
-            hits[i].push(JsonDirectiveHit { key: key.clone(), files: files.clone() });
+            hits[i].push(JsonDirectiveHit {
+                key: key.clone(),
+                files: files.clone(),
+                pass: f.pass,
+                severity,
+                thickness: f.thickness,
+            });
             if let Some(n) = &d.note {
                 f.notes.push(n.clone());
             }
