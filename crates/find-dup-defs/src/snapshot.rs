@@ -14,6 +14,8 @@ use std::sync::Arc;
 use dup_defs_core::{Analysis, CanonDialect, Def, KindSpec};
 use serde::{Deserialize, Serialize};
 
+use find_dup_defs::Type3Input;
+
 use crate::{Finding, Severity};
 
 #[derive(Serialize, Deserialize)]
@@ -30,6 +32,12 @@ struct KindSnap {
 struct AnalysisSnap {
     xname_canonical: String,
     type3_lines: Vec<String>,
+    /// `#[serde(default)]` so a snapshot written before the field existed loads with none.
+    #[serde(default)]
+    type_refs: Vec<String>,
+    /// Likewise.
+    #[serde(default)]
+    type3_units: Vec<(u32, String)>,
     size: usize,
     /// Serialized [`CanonDialect`] (`"cpython_ast"` | `"rust"` | `""`=other). `#[serde(default)]`
     /// (empty) so a pre-tristate snapshot with no `dialect` falls back to `legacy_cpython_ast` below.
@@ -151,6 +159,8 @@ pub fn dump_defs(dir: &Path, defs: &[Def]) -> std::io::Result<()> {
             analysis: d.analysis.as_ref().map(|a| AnalysisSnap {
                 xname_canonical: a.xname_canonical.clone(),
                 type3_lines: a.type3_lines.clone(),
+                type_refs: a.type_refs.clone(),
+                type3_units: a.type3_units.clone(),
                 size: a.size,
                 dialect: dialect_tag(a.canon_dialect).to_owned(),
                 cpython_ast: false,
@@ -188,6 +198,8 @@ pub fn load_defs(dir: &Path) -> std::io::Result<Vec<Def>> {
                 analysis: s.analysis.map(|a| Analysis {
                     xname_canonical: a.xname_canonical,
                     type3_lines: a.type3_lines,
+                    type_refs: a.type_refs,
+                    type3_units: a.type3_units,
                     size: a.size,
                     canon_dialect: dialect_from(&a.dialect, a.cpython_ast),
                 }),
@@ -224,20 +236,23 @@ pub fn dump_findings(dir: &Path, findings: &[Finding]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Serialize the Type-3 inputs `(line_lists, names)` to `<dir>/type3.json` — plain strings, tiny
-/// next to the full `defs.json`, so a Type-3 bench loads in milliseconds.
-pub fn dump_type3(dir: &Path, line_lists: &[Vec<String>], names: &[String]) -> std::io::Result<()> {
+/// Serialize the Type-3 inputs `(line_lists, part_lists, names, owners)` to `<dir>/type3.json` —
+/// plain strings and ids, tiny next to the full `defs.json`, so a Type-3 bench loads in milliseconds.
+pub fn dump_type3(dir: &Path, input: &Type3Input) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let file = std::fs::File::create(dir.join("type3.json"))?;
-    serde_json::to_writer(std::io::BufWriter::new(file), &(line_lists, names))?;
+    serde_json::to_writer(
+        std::io::BufWriter::new(file),
+        &(&input.line_lists, &input.part_lists, &input.names, &input.owners),
+    )?;
     Ok(())
 }
 
-/// Reload the Type-3 inputs `(line_lists, names)` from `<dir>/type3.json`.
-pub fn load_type3(dir: &Path) -> std::io::Result<(Vec<Vec<String>>, Vec<String>)> {
+/// Reload the Type-3 inputs from `<dir>/type3.json`.
+pub fn load_type3(dir: &Path) -> std::io::Result<Type3Input> {
     let file = std::fs::File::open(dir.join("type3.json"))?;
-    let v = serde_json::from_reader(std::io::BufReader::new(file))?;
-    Ok(v)
+    let (line_lists, part_lists, names, owners) = serde_json::from_reader(std::io::BufReader::new(file))?;
+    Ok(Type3Input { line_lists, part_lists, names, owners })
 }
 
 /// Reload `findings` from `<dir>/findings.json` (snippet comes back empty — render ignores it).

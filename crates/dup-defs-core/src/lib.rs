@@ -22,10 +22,11 @@ mod types;
 
 pub mod kinds;
 
+pub mod decide;
 pub mod lens;
 pub mod reach;
 
-pub use canon::{alpha_rename, count_loc, is_upper_snake, AnalyzedFn};
+pub use canon::{alpha_rename, count_loc, is_upper_snake, type_slot, AnalyzedFn, TYPE_SLOT_PREFIX};
 pub use kinds::{kind_spec, KIND_IDS};
 pub use loc::LineMap;
 pub use types::{Analysis, CanonDialect, Def, Facets, Frontend, KindSpec, ScanOpts, Statement};

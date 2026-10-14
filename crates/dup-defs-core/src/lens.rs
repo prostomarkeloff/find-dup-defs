@@ -259,6 +259,8 @@ pub fn lens_def(
             xname_canonical: canonical,
             size: stitched.len(),
             type3_lines: stitched,
+            type_refs: Vec::new(),
+            type3_units: Vec::new(),
             canon_dialect: dialect,
         }),
         thickness: None,
@@ -441,6 +443,6 @@ mod tests {
         assert_eq!(def.lang, "rs");
         assert_eq!(def.analysis.expect("analysis").canon_dialect, CanonDialect::Rust);
         // A projection reaches nothing of its own; the body def answers that.
-        assert!(def.facets.reaches.is_empty());
+        assert!(def.facets.reaches.is_empty(), "a projection reached: {:?}", def.facets.reaches);
     }
 }

@@ -247,12 +247,14 @@ pub(crate) fn classify(source: &str, stmt: &Stmt) -> Option<(&'static str, Strin
 /// Returned together rather than reassembled at each call site: one analysis produced all three, and
 /// handing them back separately invites a caller to pair a def's canon with another's stream.
 fn split_analysis(analyzed: AnalyzedFn) -> (Option<String>, Option<Analysis>, Vec<Statement>) {
-    let AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, statements, size } = analyzed;
+    let AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, type_refs, type3_units, statements, size } = analyzed;
     (
         Some(cluster_canonical),
         Some(Analysis {
             xname_canonical,
             type3_lines,
+            type_refs,
+            type3_units,
             size,
             canon_dialect: CanonDialect::CPythonAst,
         }),
@@ -290,6 +292,14 @@ fn method_canon(canon_text: &str) -> (Option<String>, Option<Analysis>, Vec<Stat
     }
 }
 
+/// What one file's names stand for, read once and handed to every definition in it.
+struct FileNames<'a> {
+    /// Name → the dotted path it reaches, in the form [`Facets::reaches`] is written in.
+    reaches: &'a std::collections::HashMap<String, Arc<str>>,
+    /// The same file's names, for the propositions a definition tests ([`Facets::decides`]).
+    decides: &'a crate::decides::FileScope,
+}
+
 /// Methods of one class as `Def`s (`kind = methods`, class-qualified names). Recurses into
 /// nested classes (`Outer.Inner.foo`); classes hidden inside a *function* are never reached.
 fn method_defs(
@@ -298,7 +308,7 @@ fn method_defs(
     lines: &LineMap,
     file: &Arc<str>,
     parent_chain: &str,
-    imports: &std::collections::HashMap<String, Arc<str>>,
+    names: &FileNames<'_>,
     out: &mut Vec<Def>,
 ) {
     let Stmt::ClassDef(class) = stmt else { return };
@@ -324,7 +334,9 @@ fn method_defs(
                 let args = count_args(&node.parameters);
                 let canon_text = apply_receiver_strip(source, start, end, &node.parameters);
                 let (cluster_canonical, analysis, statements) = method_canon(&canon_text);
-                let reaches = reached_paths(inner, imports);
+                let reaches = reached_paths(inner, names.reaches);
+                let decided = crate::decides::decides(inner, names.decides);
+                let identity = Some(Arc::from(dup_defs_core::decide::local(names.decides.module(), &name)));
                 out.push(Def {
                     lang: "py",
                     kind: &METHODS,
@@ -338,10 +350,19 @@ fn method_defs(
                     cluster_canonical,
                     analysis,
                     thickness: None,
-                    facets: Facets { statements, reaches },
+                    facets: Facets {
+                        statements,
+                        reaches,
+                        decides: decided.atoms,
+                        identity,
+                        params: decided.params,
+                        calls: decided.calls,
+                        mentions: decided.mentions,
+                        loose_keywords: decided.loose,
+                    },
                 });
             }
-            Stmt::ClassDef(_) => method_defs(source, inner, lines, file, &parent, imports, out),
+            Stmt::ClassDef(_) => method_defs(source, inner, lines, file, &parent, names, out),
             _ => {}
         }
     }
@@ -355,10 +376,14 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
     // The file's import table, resolved once: what each bound name stands for. Python already writes
     // its paths with dots, so `reach_path` here is about agreeing with the other frontends on the
     // form rather than translating a separator.
-    let imports: std::collections::HashMap<String, Arc<str>> = crate::canon::module_imports(source)
-        .into_iter()
-        .map(|i| (i.local, reach_path(&i.path.split('.').collect::<Vec<_>>())))
+    let written_imports = crate::canon::module_imports(source);
+    let imports: std::collections::HashMap<String, Arc<str>> = written_imports
+        .iter()
+        .map(|i| (i.local.clone(), reach_path(&i.path.split('.').collect::<Vec<_>>())))
         .collect();
+    // What each name stands for, for the propositions a definition tests: relative imports keep their
+    // dots here, since they resolve against the file's own package.
+    let scope_of_names = crate::decides::FileScope::new(file, &written_imports, &module.body);
     let mut defs: Vec<Def> = Vec::new();
     // Module scope is a property of the file, so it is collected once before any definition is
     // canonicalized against it.
@@ -367,7 +392,7 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
     let scope = (!lenses.is_empty()).then(|| crate::canon::module_bound_names(&module.body));
     for stmt in &module.body {
         if matches!(stmt, Stmt::ClassDef(_)) {
-            method_defs(source, stmt, &lines, file, "", &imports, &mut defs);
+            method_defs(source, stmt, &lines, file, "", &FileNames { reaches: &imports, decides: &scope_of_names }, &mut defs);
         }
         let Some((kind_id, name, start, end, args)) = classify(source, stmt) else { continue };
         let (line, col) = lines.loc0(start);
@@ -376,6 +401,17 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
         let kind = kind_spec(kind_id);
         let (cluster_canonical, analysis, statements) = top_def_canon(kind, stmt, source);
         let reaches = reached_paths(stmt, &imports);
+        let decided = crate::decides::decides(stmt, &scope_of_names);
+        let identity = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_))
+            .then(|| Arc::from(dup_defs_core::decide::local(scope_of_names.module(), &name)));
+        // A record's constructor takes its fields: those are the parameters its calls fill.
+        let record_params: Vec<Arc<str>> = match (stmt, &identity) {
+            (Stmt::ClassDef(_), Some(id)) => scope_of_names
+                .record(id)
+                .map(|fields| fields.iter().map(|(f, _)| Arc::from(f.as_str())).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
         if let Some(scope) = &scope {
             // The `scope` lens contributes a single fact: the whole body canonicalized with every
             // name the module introduced erased. One fact rather than one per statement, because
@@ -407,7 +443,16 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
             cluster_canonical,
             analysis,
             thickness: None,
-            facets: Facets { statements, reaches },
+            facets: Facets {
+                statements,
+                reaches,
+                decides: decided.atoms,
+                identity,
+                params: if record_params.is_empty() { decided.params } else { record_params },
+                calls: decided.calls,
+                mentions: decided.mentions,
+                loose_keywords: decided.loose,
+            },
         });
     }
     defs
@@ -678,9 +723,9 @@ mod tests {
         let file: Arc<str> = Arc::from("<test>");
         let defs = scan_source(src, &file, &ScanOpts::default());
         let h = defs.iter().find(|d| d.name == "h").expect("h");
-        assert!(h.facets.reaches.is_empty());
+        assert!(h.facets.reaches.is_empty(), "nothing imported, yet it reaches: {:?}", h.facets.reaches);
         // Empty reach is not empty facets: the stream is still there.
-        assert!(!h.facets.statements.is_empty());
+        assert!(!h.facets.statements.is_empty(), "an empty reach must not empty the statement stream");
     }
 
     #[test]

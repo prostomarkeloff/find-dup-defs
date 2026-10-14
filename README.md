@@ -91,7 +91,7 @@ Exit code is non-zero when an ERROR survives, so it drops into CI as-is.
 | [Does it actually work?](#does-it-actually-work) | benchmarks vs CPD/jscpd, results on 38 real repos |
 | [Thickness](#thickness-the-number-you-sort-by) | the refactor-payoff score you sort by |
 | [Directives](#directives-tuning-you-can-commit) | the committed config that decides what gates |
-| [Beyond duplicates](#beyond-duplicates) | [patternology](#patternology) · [lenses](#lenses) · [converge](#converge) |
+| [Beyond duplicates](#beyond-duplicates) | [patternology](#patternology) · [lenses](#lenses) · [converge](#converge) · [decisions](#decisions) |
 | [For agents](#for-agents) | the JSON contract |
 | [Architecture](#architecture) · [CLI](#cli-reference) · [Limitations](#limitations) | the rest |
 
@@ -180,6 +180,64 @@ collapse to the same shape. The Type-3 pass goes further: it builds IDF-weighted
 and runs them through [`difflib-fast`'s](https://crates.io/crates/difflib-fast) `simjoin`, an exact
 L2AP weighted-cosine join (every pair with `cos ≥ θ`, no LSH approximation, asserted bit-identical
 to brute force), then single-linkages the survivors.
+
+Two refinements keep those shapes honest:
+
+- **Types are names too.** A Python annotation does nothing at runtime, so the alpha-renamed
+  canonical turns every type reference in an annotation into a `_T{n}` slot. The renaming is
+  consistent, not an erasure, so `f(a: X, b: X)` and `f(a: X, b: Y)` still differ. A call inside an
+  annotation (`Annotated[T, Depends(f)]`) is a value read at runtime, so it stays as written.
+- **A Type-3 unit depends on itself alone.** Slots are renumbered within each line, so one added
+  parameter no longer rewrites every later line. The types an annotation names ride as units of
+  their own: a shared type still counts, and a different one costs only its own weight. Type-3
+  leaves to cross-name exactly the pairs cross-name reports (equal canonicals), not every pair whose
+  lines happen to coincide.
+
+On an application corpus of ~48k definitions, this raised cross-name ERRORs from 12 to 42. Two-member
+Type-3 pairs went +172 / −30. In a hand-labelled sample, 57 of 61 added pairs were real copies, and
+20 of the 30 dropped ones were.
+
+Two more take the comparison from how a definition is written to what it does:
+
+- **A normal form first.** Every Python function is rewritten to one representative of its
+  equivalence class under a fixed set of oriented rules before the name-agnostic canonicals are
+  taken: negation normal form, a fixed orientation for comparisons and for the branches of an
+  `if`, guard form instead of nesting, `if`/`else` statements in place of conditional expressions,
+  `return a or b` in place of the ladder that spells it, a comprehension in place of the loop that
+  accumulates one, `a, b = x, y` split, `x += e` expanded, `match` on values as the ladder it
+  abbreviates, dead statements dropped — and, for the exact pass only, a temporary named and used
+  once replaced by its value. The rules are the elementary case of equality saturation: no search,
+  one direction each, applied to a fixed point. The Type-3 pass reads the form that keeps every
+  statement, because its unit is the statement and folding two short ones into one long one costs
+  it real near-copies (measured: a fifth of a labelled set).
+- **Statements agree in part.** Type-3 scores a pair by the *soft cosine* of its line vectors
+  (Sidorov et al. 2014): two lines contribute by the Jaccard of their parts — the line and every
+  sub-expression inside it — so a token changed deep in a long statement costs the parts it sits
+  in, not the statement. The exact cosine join still generates the candidates, over the lines and
+  over the sub-expressions alone.
+
+- **No line floor.** Type-3 used to need three lines to look at a function at all, because a
+  cosine over two lines says nothing. What keeps two one-liners that do different things apart is
+  now that they do different things: a pair must share at least one *step* beyond its signature and
+  the types it names. A function of any length takes part.
+
+Measured on a mutation-injection benchmark (Roy & Cordy 2009: real functions under twenty
+semantics-preserving rewrites, one to five at a time, injected back into their tree): the set
+passes find 99.6% of the equivalent variants where they found 74.6% before, five rewrites deep 99%
+where 56%, and functions below the old line floor 99% where 12%; false pairs stay at about one per
+hundred variants. On the tree itself: hand-labelled real near-copies 64% → 73% with six false pairs
+in twenty where there were five, and cross-name + Type-3 pairs in the application code 178 → 324.
+
+Every Type-3 finding also carries a p-value: how often two definitions of these sizes would share a
+set of units this improbable under the bipartite configuration model fitted to the corpus — the
+null the [decisions](#decisions) pass is built on. It is evidence, not the verdict. It was tried as
+the verdict, in three forms, and measured: significance alone over every pair reported forty times
+the Type-3 pairs with half of a labelled set of non-copies among them (at the size of a real tree,
+almost any pair the join admits shares more than chance); counting the multiplicity over the
+candidates instead let the cut vanish into the rate; and on a tree of forty definitions the null
+can call nothing significant and dropped a family of three near-copies the pass had always found.
+Sharing more than chance is necessary for a copy; it is not what a copy is, which is sharing most.
+So the proportion decides, and the evidence is reported.
 
 So the answer to "why not CPD" isn't one feature, it's the stack: cluster by *meaning* not tokens,
 **calibrate the noise ourselves**, **rank by refactor-payoff** instead of dumping a flat list — and
@@ -404,7 +462,7 @@ signal (`/vendor/`, `/third_party/`, `/util/vs/`, `/fixtures/`, …). Same-name 
 
 ## Beyond duplicates
 
-Three opt-in passes, all advisory, none of them ever an ERROR gate. They answer questions the
+Four opt-in passes, all advisory, none of them ever an ERROR gate. They answer questions the
 duplicate passes structurally can't reach.
 
 | | asks | flag |
@@ -412,6 +470,7 @@ duplicate passes structurally can't reach.
 | [**Patternology**](#patternology) | this shape recurs in seven functions — should it be one helper? | `--patternology` |
 | [**Lenses**](#lenses) | same architecture, zero shared identifiers — are these the same thing? | `--kinds lenses` |
 | [**Converge**](#converge) | these two are about the same thing — *where do they stop agreeing?* | `--converge` |
+| [**Decisions**](#decisions) | written nothing alike — do these two *decide on the same facts*? | `--decisions` |
 
 ---
 
@@ -708,6 +767,145 @@ drops 70% of the pass's findings, because there statements genuinely do occur in
 places.
 </details>
 
+---
+
+### Decisions
+
+Every pass above compares how definitions are **written**. A rule kept in two places is usually written
+two ways: one copy raises where the other returns a sentinel, one filters a loop where the other
+refuses a request, one reads a snapshot where the other reads the row, one tests `x != A` where the
+other tests `x == A`. The body passes see two unrelated functions, and they are right to — the text
+differs. What the two keep in common is the **support** of the decision: the set of facts it tests.
+
+```python
+def refuse(order):                         def offers(items):
+    if order.status != Status.OPEN:            return [i for i in items
+        raise Closed                                   if i.status == Status.OPEN
+    if not order.paid:                                 and i.paid]
+        raise Unpaid
+```
+
+Both decide on `Status.OPEN = _.status` and `? _.paid` — the same two facts, no shared line.
+
+In a tree where the guard and the filter sit among forty definitions deciding on facts of their own
+(the committed `decisions` test fixture):
+
+```console
+$ find-dup-defs ./tests/fixtures/decisions --decisions
+--- decisions in functions (one decision, written in two places) ---
+DUPLICATE FUNCTION [INFO]: offers / refuse  [T=0.00, n=2, loc=7, args=1]  votes[2]: decides×2 members×2
+  # decide on 2 shared fact(s), 0.89 expected by chance; surprise 14.9 nats (null mean 0.8);
+  # p = 4.9e-5 under the bipartite configuration model, Benjamini–Hochberg cut 5.1e-5 at FDR 0.05 over 990 pairs
+  #   · @app.models.Status.OPEN = _.status
+  #   · ? _.paid
+  py/app/catalog.py:4
+  py/app/orders.py:12
+```
+
+Two facts, rare in this tree, shared by two small definitions: just past the cut over 990 pairs, which
+is what `T=0.00` says. A decision written twice in a real tree usually shares more.
+
+<details>
+<summary><b>The facts</b> — what is read off a definition, and why each rule is the language's, not the tool's</summary>
+
+A fact is an **atom**: a relation over terms, with no polarity, because a decision's support is the same
+for a test and its negation.
+
+- **Where propositions are:** every comparison wherever it stands (a query filter tests the same fact as
+  an `if`); every expression in a position the language tests for truth — `if`/`elif`/`while`/`assert`/
+  conditional tests, comprehension `if`s, match guards, and the operands of `and`/`or`/`not` (the last
+  operand of `and`/`or` only when the whole is tested — `x or 0` is a default, not a test); `match`
+  patterns; `isinstance`/`issubclass` as membership in a type; `bool(x)` as the truth of `x`;
+  `x in (a, b)` on a literal as `x == a or x == b`.
+- **What a term is:** a name the definition binds is a hole (its spelling is the writer's); an imported
+  name is the path it was imported from; a name the module defines is a local path, named the way the
+  rest of the tree imports that module — learned from the imports the corpus wrote, not from a list of
+  source roots; an attribute read off a hole is the attribute (`_.status`); a call is its callee and the
+  constants it was handed. A local assigned exactly once to a value the text fixes is that value; read
+  bare, one assigned once to a call is that computation.
+
+Two choices are modelling rather than semantics, applied uniformly: `is` and `==` are one relation, and
+so are the four order comparisons.
+</details>
+
+<details>
+<summary><b>The statistics</b> — a validated projection, and two statistics under one null</summary>
+
+Definitions and facts form a bipartite graph; two definitions deciding alike are a pair in its
+projection. Which pairs are more than chance is the question of validated projections (Saracco et al.
+2015 and 2017; Neal 2014), answered here the same way:
+
+- **Null:** the bipartite configuration model, fitted to both degree sequences — every definition keeps
+  its number of facts and every fact its number of definitions, in expectation. Fitted over degree
+  classes, so a few hundred unknowns at any corpus size.
+- **Statistics,** under that one null (`-D settings:decision-statistic=…`):
+  - `count` — how many facts two definitions share, with its exact Poisson-binomial tail. The published
+    statistic. It weighs a fact half the tree tests the same as one two definitions test.
+  - `surprise` (default) — `Σ −ln q` over the shared facts, `q` the null probability that both hold the
+    fact: the improbability of the shared *set*, with a Lugannani–Rice saddlepoint tail (within 14–21% of
+    the exact law from 5·10⁻² down to 10⁻¹⁰ on the test fixture).
+- **Multiplicity:** Benjamini–Hochberg over every pair of definitions, at a false-discovery rate the
+  reader sets (`-D settings:decision-fdr=…`, default 0.05). It assumes independent or positively
+  dependent p-values; pairs sharing a definition are neither proven to be.
+
+Each class pair's critical value at the rate is computed once, and the join keeps only the pairs that
+could clear it — exact, since the Benjamini–Hochberg threshold never exceeds the rate.
+</details>
+
+<details>
+<summary><b>The closed world</b> — parameters and record fields, as an assumption you ask for</summary>
+
+`-D settings:decision-closed-world=on` reads the corpus as all there is:
+
+- a **parameter** holds an identity when every call to its function passes it, explicitly, as that
+  identity — interprocedural constant propagation, solved to a fixed point since the value may itself
+  be a parameter of the caller;
+- a **record's field** (a class with no base, no `__init__`/`__new__`/`__post_init__`, annotated fields)
+  is a parameter of its constructor, read off any value whose class the text names — an annotation, a
+  constructor call, a field annotated with a record.
+
+Nothing is inferred for a function or class read as a value anywhere (handed on, queried, validated),
+decorated, or called once with `*args`/`**kwargs`; nor for a field name that a keyword to an unnamed
+callee or an attribute assignment could write past the constructor. These guards catch what the text
+shows — not reflection, dispatch by string, or callers outside the scanned tree. That is why it is off by
+default: true of an application, mostly false of a library. A finding that leans on it says so next to the
+fact that needed it.
+</details>
+
+<details>
+<summary><b>Measured</b> — blind labels, recall against a set chosen before the tool existed</summary>
+
+On one production Python tree (≈6.7k definitions that test anything, ≈20M pairs):
+
+| method | findings | top-20 relevant | random 20 beyond rank 20 |
+|---|---|---|---|
+| decisions, `surprise` | 634 | 20 | 18 |
+| decisions, `count` | 31 | 20 | 11 of 11 |
+| converge (pairs) | 51 362 | 10 | 0 |
+| Type-3 | 50 | 10 | 2 |
+
+Pooled from all methods, shuffled, labelled without knowing which method proposed a pair; relevant =
+the same predicate over the same entity maintained in two places (parallel case analysis over one enum,
+one filter written twice, a predicate re-tested inline next to the function that already computes it).
+Later additions were sampled the same way: the intraprocedural rules 38 of 40, closed-world findings 20
+of 20, record fields 14 of 15. One labeller; at twenty a sample, 18/20 is anywhere in 68–99%.
+
+Recall, on twelve pairs found by hand before the pass existed: `count` 0, `surprise` 3, `surprise` with
+the closed world 5. Converge ranks the same pairs between 5 000th and 24 000th. The seven still missed
+need what the pass does not do: a rule split across a function and a helper it calls (facts are never
+inlined across calls — reuse is not duplication), a field derived by a conditional rather than passed,
+or a predicate of a single fact pasted into a long function, which no statistic over twenty million pairs
+can call significant.
+
+Tried and measured as an alternative: the same facts as an eleventh [lens](#lenses). Voting with the
+other ten it recovers none of the pass's pairs — a rule written twice disagrees by construction on
+control, failures and effects; alone, under the Type-3 cosine, it recovers a quarter, and most of what it
+adds is single-linkage chaining.
+
+The pass runs in about 0.3 s on that tree. `FDD_DUMP_DECIDES=<path>` writes every definition's facts as
+JSON lines, the input the labels were made against.
+</details>
+
 ## For agents
 
 The JSON output is built so an agent never has to round-trip to the filesystem. Each finding ships:
@@ -825,6 +1023,10 @@ CONVERGE (opt-in · advisory, never ERROR · py, rs, ts)
                             families of many that do the same thing around one subject
   --converge-top <N>        Keep the strongest N of each kind (default 50; 0 = every one)
 
+DECISIONS (opt-in · advisory, never ERROR · py)
+  --decisions               Definitions that decide on the same facts, however they are written;
+                            pairs and families, validated under the bipartite configuration model
+
 FILTERS / MODES
   -D, --directive <S>       ACTION:[<KIND>]NAME[@PATH][=NOTE], repeatable. ACTION ∈
                             suppress / de-escalate / escalate / note / set:KEY=VALUE.
@@ -841,6 +1043,9 @@ SETTINGS (via -D 'settings:KEY=VALUE')
   max-name-group=<N>        Cap for name-gated clustering
   pattern-min-thickness=<F> Drop patternology's thin tail
   converge-cap=<N>          Converge seeding cap (default 60)
+  decision-fdr=<F>          Decisions false-discovery rate (default 0.05)
+  decision-statistic=surprise|count   Which statistic weighs a pair (default surprise)
+  decision-closed-world=on|off        Infer parameters and record fields from their callers
   gpu=on|gpu+cpu|gpu|off    Metal offload (requires --features gpu)
 ```
 </details>
@@ -863,7 +1068,10 @@ The honest ledger:
   effectively unique (measured: 2435 distinct across 2444 classes in one production tree) and
   degrades on trees where one name covers hundreds of definitions — the case `--max-name-group`
   exists for.
-- **Type-4 clones** (same logic, different syntax) are out of scope.
+- **Type-4 clones** (same logic, different syntax) in general are out of scope — program equivalence is
+  undecidable. The [decisions](#decisions) pass reaches one decidable slice of them: two definitions that
+  test the same facts, whatever form the tests take. It is Python-only for now; the atom grammar is
+  shared, so another frontend lights it up by filling `Facets::decides`.
 - **Token-level sub-expression duplication** is out of scope too; pair with jscpd or PMD CPD if you
   need it.
 - **The thickness constants** were tuned on the benchmark corpora above. Your codebase may want

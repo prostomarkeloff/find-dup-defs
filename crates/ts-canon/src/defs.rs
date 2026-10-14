@@ -149,6 +149,8 @@ fn canon_for(kind: &KindSpec, text: &str) -> (Option<String>, Option<Analysis>, 
                 Some(Analysis {
                     xname_canonical: a.xname_canonical,
                     type3_lines: a.type3_lines,
+                    type_refs: a.type_refs,
+                    type3_units: a.type3_units,
                     size: a.size,
                     canon_dialect: CanonDialect::Other,
                 }),
@@ -230,7 +232,7 @@ fn build_def(
         cluster_canonical,
         analysis,
         thickness: None,
-        facets: Facets { statements, reaches },
+        facets: Facets { statements, reaches, ..Facets::default() },
     }
 }
 
@@ -667,10 +669,13 @@ mod tests {
         let b = "interface I { c?: Foo; b: number[]; a: string; }\n";
         // A declaration is a set: the same interface with its members reordered is the same shape.
         assert_eq!(lens_record(a, "I"), lens_record(b, "I"));
-        assert!(!lens_record(a, "I").is_empty());
+        assert!(!lens_record(a, "I").is_empty(), "three members clear the thinness floor and carry a record");
         // Two members would fall under the thinness floor and carry no record at all — a projection
         // with fewer facts than that matches trivially.
-        assert!(lens_record("interface J { a: string; b: number; }\n", "J").is_empty());
+        assert!(
+            lens_record("interface J { a: string; b: number; }\n", "J").is_empty(),
+            "two members fall under the thinness floor and carry no record"
+        );
     }
 
     #[test]

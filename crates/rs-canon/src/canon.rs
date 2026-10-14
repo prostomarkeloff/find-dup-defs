@@ -844,7 +844,15 @@ fn analyze(name: &str, sig: &Signature, body: &Block) -> AnalyzedFn {
 
     let lines = type3_lines(body, &locals);
     let statements = statement_stream(name, sig, body, &locals);
-    AnalyzedFn { cluster_canonical: cluster, xname_canonical: xname, type3_lines: lines, statements, size }
+    AnalyzedFn {
+        cluster_canonical: cluster,
+        xname_canonical: xname,
+        type3_lines: lines,
+        type_refs: Vec::new(),
+        type3_units: Vec::new(),
+        statements,
+        size,
+    }
 }
 
 /// The body canonicalized with every name the **file** introduced erased — the widest rung of the

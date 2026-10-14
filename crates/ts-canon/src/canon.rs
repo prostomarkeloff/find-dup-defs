@@ -1407,7 +1407,15 @@ fn analyze_one(text: &str) -> Option<AnalyzedFn> {
     let lines: Vec<String> = body_stmts.iter().map(|s| line_d.stmt(s)).collect();
 
     let statements = statement_stream(params, body_stmts, &locals, is_async);
-    Some(AnalyzedFn { cluster_canonical, xname_canonical: xname, type3_lines: lines, statements, size })
+    Some(AnalyzedFn {
+        cluster_canonical,
+        xname_canonical: xname,
+        type3_lines: lines,
+        type_refs: Vec::new(),
+        type3_units: Vec::new(),
+        statements,
+        size,
+    })
 }
 
 #[must_use]

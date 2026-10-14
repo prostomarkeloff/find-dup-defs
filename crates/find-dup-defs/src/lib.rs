@@ -19,7 +19,9 @@
 //! Each cluster is graded ERROR / WARNING / INFO, with optional thickness-based
 //! demotion/escalation passes the caller can request via [`PipelineOpts`].
 
+mod bicm;
 pub mod converge;
+pub mod decide;
 pub mod patternology;
 mod simgraph;
 pub mod type3;
@@ -47,13 +49,15 @@ pub fn timed<T>(label: &str, f: impl FnOnce() -> T) -> T {
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
-/// Cross-name: ERROR only when the alpha-renamed canonical has ≥ this many AST
-/// nodes. Avoids escalating "two `return []` one-liners" to ERROR purely on a
-/// renamed-exact match.
+/// Cross-name: ERROR only when the alpha-renamed canonical has ≥ this many AST nodes. Avoids
+/// escalating "two `return []` one-liners" to ERROR purely on a renamed-exact match. A policy on
+/// how much copied text gates a build; measured as an alternative, the rarity of the copy under
+/// the corpus's null escalated every rare three-liner on a small tree and tripled the ERRORs on a
+/// large one, so the count stays and the null's p-value rides along as a note.
 pub const SUBSTANCE_NODES: usize = 20;
-/// Type-3 minimum line count: only functions with ≥ this many name-agnostic lines are joined.
-pub const SHINGLE_LINES: usize = 3;
-/// Type-3 cluster's min-cosine ≥ this → ERROR (else WARNING).
+/// Type-3 cluster's min soft cosine ≥ this → ERROR (else WARNING): the tier is a policy on how
+/// alike two functions must be to gate a build, and so a number the reader owns, like
+/// `--error-thickness`.
 pub const TYPE3_ERROR_THETA: f64 = 0.9;
 /// Patternology family's min structural cosine ≥ this → WARNING (else INFO). Patternology never
 /// reaches ERROR — structural similarity is advisory, not a gate.
@@ -523,6 +527,8 @@ pub fn section_index(f: &Finding) -> usize {
             "pattern" => PATTERN_SECTION_OFFSET,
             "converge" => converge::CONVERGE_SECTION_OFFSET,
             "converge-family" => converge::FAMILY_SECTION_OFFSET,
+            "decision" => decide::DECISION_SECTION_OFFSET,
+            "decision-family" => decide::DECISION_FAMILY_SECTION_OFFSET,
             _ => 0,
         }
     } else {
@@ -868,55 +874,105 @@ pub fn pass_cross_name(defs: &[Def], min_size: usize) -> Vec<Finding> {
     out
 }
 
-/// The `(line_lists, names)` inputs the Type-3 pass feeds to [`type3::type3_clusters`] — the
-/// `fn_like` defs with ≥ `SHINGLE_LINES` lines. Exposed so a perf bench can snapshot just this
-/// (tiny, plain-string) slice instead of the whole `Vec<Def>`.
-#[must_use]
-pub fn type3_inputs(defs: &[Def]) -> (Vec<Vec<String>>, Vec<String>) {
-    let (mut line_lists, mut names) = (Vec::new(), Vec::new());
-    for d in defs {
-        if d.kind.fn_like {
-            if let Some(a) = &d.analysis {
-                if a.type3_lines.len() >= SHINGLE_LINES {
-                    line_lists.push(a.type3_lines.clone());
-                    names.push(d.name.clone());
-                }
-            }
-        }
-    }
-    (line_lists, names)
+/// What the Type-3 pass joins — every `fn_like` def with a canonical. Exposed so a perf bench can
+/// snapshot just this (tiny, plain-string) slice instead of the whole `Vec<Def>`.
+#[derive(Debug, Default)]
+pub struct Type3Input {
+    /// Per function, its units: each canonical line with its slots renumbered **within the line**.
+    ///
+    /// A frontend numbers slots in order of first appearance across the whole body, which is right
+    /// for the exact pass and wrong for this one. A Type-3 clone is a copy with statements added,
+    /// removed or changed (Roy, Cordy & Koschke, 2009), and the pass compares bags of lines to
+    /// tolerate exactly that — but with body-wide numbering one added parameter shifts every later
+    /// `_v{n}`, so a single insertion rewrote every line and two functions agreeing on nine lines
+    /// out of nine shared none. A unit's canonical form has to depend on the unit alone.
+    ///
+    /// Each type reference the frontend reports apart ([`dup_defs_core::Analysis::type_refs`]) follows
+    /// as a unit of its own, `: Name` — a shared type weighs as shared vocabulary, a different one
+    /// only its own weight.
+    ///
+    /// There is no floor on how many lines a function needs to take part. There was one — three —
+    /// because a cosine over two lines says nothing; the null model says what two shared lines are
+    /// worth given how rare they are, and a two-line function sharing two rare lines is a finding.
+    ///
+    pub line_lists: Vec<Vec<String>>,
+    /// Per function, the sub-expressions of its lines ([`dup_defs_core::Analysis::type3_units`]),
+    /// each with the index of its line in `line_lists`, renumbered within themselves like lines. A
+    /// statement is one unit and a token changed inside it costs the whole statement; its
+    /// sub-expressions are the parts the change did not reach, and two lines agree in part through
+    /// them — see [`type3`] for how they are read.
+    pub part_lists: Vec<Vec<(u32, String)>>,
+    /// Per function, its name.
+    pub names: Vec<String>,
+    /// Per function, its cross-name bucket: equal ids ⇔ equal alpha-renamed canonicals, the pairs
+    /// the exact pass reports and this one leaves to it.
+    pub owners: Vec<u32>,
 }
 
-/// Pass 3 — Type-3 (`ECScan`): renamed near-copy callables via IDF-weighted cosine over name-agnostic
-/// lines. `gpu` selects the simjoin backend for the all-pairs join (`settings:gpu=on` → GPU hybrid).
+/// [`Type3Input`] plus, per function, its index in `defs`.
+fn type3_rows(defs: &[Def]) -> (Type3Input, Vec<usize>) {
+    let rows: Vec<(usize, &dup_defs_core::Analysis)> = defs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| d.analysis.as_ref().filter(|a| d.kind.fn_like && !a.type3_lines.is_empty()).map(|a| (i, a)))
+        .collect();
+    let line_lists: Vec<Vec<String>> = rows
+        .par_iter()
+        .with_min_len(128)
+        .map(|(_, a)| {
+            let statements = a.type3_lines.iter().map(|line| converge::line_slots_local(line, a.canon_dialect));
+            statements.chain(a.type_refs.iter().map(|name| format!(": {name}"))).collect()
+        })
+        .collect();
+    let part_lists: Vec<Vec<(u32, String)>> = rows
+        .par_iter()
+        .with_min_len(128)
+        .map(|(_, a)| {
+            a.type3_units.iter().map(|(line, unit)| (*line, converge::line_slots_local(unit, a.canon_dialect))).collect()
+        })
+        .collect();
+    let mut bucket: rustc_hash::FxHashMap<&str, u32> = rustc_hash::FxHashMap::default();
+    let owners: Vec<u32> = rows
+        .iter()
+        .map(|(_, a)| {
+            let next = u32::try_from(bucket.len()).unwrap_or(u32::MAX);
+            *bucket.entry(a.xname_canonical.as_str()).or_insert(next)
+        })
+        .collect();
+    let names: Vec<String> = rows.iter().map(|&(i, _)| defs[i].name.clone()).collect();
+    let def_of: Vec<usize> = rows.iter().map(|&(i, _)| i).collect();
+    (Type3Input { line_lists, part_lists, names, owners }, def_of)
+}
+
+/// The Type-3 pass's input over `defs` — see [`Type3Input`].
+#[must_use]
+pub fn type3_inputs(defs: &[Def]) -> Type3Input {
+    type3_rows(defs).0
+}
+
+/// Pass 3 — Type-3 (`ECScan`): renamed near-copy callables — a soft cosine over name-agnostic lines.
+/// `theta` is the join's threshold and the pass's; `gpu` selects the simjoin backend for the
+/// all-pairs join (`settings:gpu=on` → GPU hybrid).
 #[must_use]
 pub fn pass_type3(defs: &[Def], theta: f64, gpu: GpuMode) -> Vec<Finding> {
-    // Borrowed, not copied: on a lens run this is thirteen million lines, and copying them was a
-    // tenth of the pass — on one thread.
-    let (mut line_lists, mut names, mut def_of): (Vec<&[String]>, Vec<&str>, Vec<usize>) =
-        (Vec::new(), Vec::new(), Vec::new());
-    for (i, d) in defs.iter().enumerate() {
-        if d.kind.fn_like {
-            if let Some(a) = &d.analysis {
-                if a.type3_lines.len() >= SHINGLE_LINES {
-                    line_lists.push(a.type3_lines.as_slice());
-                    names.push(d.name.as_str());
-                    def_of.push(i);
-                }
-            }
-        }
-    }
-    if names.len() < 2 {
+    let (input, def_of) = type3_rows(defs);
+    if input.names.len() < 2 {
         return Vec::new();
     }
-    type3::type3_clusters(&line_lists, &names, theta, gpu.to_concurrency())
+    let line_lists: Vec<&[String]> = input.line_lists.iter().map(Vec::as_slice).collect();
+    let part_lists: Vec<&[(u32, String)]> = input.part_lists.iter().map(Vec::as_slice).collect();
+    let prepared = timed("  type3-prep", || type3::Prepared::new(&line_lists, &part_lists));
+    let (input, def_of, prepared) = (&input, &def_of, &prepared);
+    let names: Vec<&str> = input.names.iter().map(String::as_str).collect();
+    type3::type3_clusters(prepared, &names, &input.owners, theta, gpu.to_concurrency())
         .into_iter()
-        .filter_map(|(cluster, min_sim)| {
-            let distinct: BTreeSet<&str> = cluster.iter().map(|&c| names[c]).collect();
+        .filter_map(|cluster| {
+            let distinct: BTreeSet<&str> = cluster.members.iter().map(|&c| names[c]).collect();
             if distinct.len() < 2 {
                 return None;
             }
-            let members: Vec<usize> = cluster.iter().map(|&c| def_of[c]).collect();
+            let min_sim = cluster.min_sim;
+            let members: Vec<usize> = cluster.members.iter().map(|&c| def_of[c]).collect();
             let kind = callable_kind(defs, &members);
             let loc = members.iter().map(|&i| defs[i].loc).max().unwrap_or(0);
             let args = members.iter().map(|&i| defs[i].args).max().unwrap_or(0);
@@ -929,10 +985,10 @@ pub fn pass_type3(defs: &[Def], theta: f64, gpu: GpuMode) -> Vec<Finding> {
                 loc,
                 args,
                 thickness: cluster_thickness(defs, members.iter().copied(), min_sim, || {
-                    thickness(loc, args, cluster.len(), min_sim)
+                    thickness(loc, args, members.len(), min_sim)
                 }),
-                snippet: defs[def_of[cluster[0]]].text_orig.clone(),
-                notes: Vec::new(),
+                snippet: defs[members[0]].text_orig.clone(),
+                notes: vec![format!("evidence: p = {:.1e} under the bipartite configuration model", cluster.worst_p)],
                 members: members.iter().map(|&i| member(defs, i)).collect(),
                 pattern: None,
                 facets: facet_votes(defs, members.iter().copied()),
@@ -1132,7 +1188,7 @@ pub struct PipelineOpts {
     pub threshold: f64,
     /// Name-gated ERROR floor (default `0.85`).
     pub error_threshold: f64,
-    /// Type-3 cosine detection floor (default `0.7`).
+    /// Type-3 soft-cosine detection floor (default `0.7`).
     pub type3_theta: f64,
     /// Run the patternology pass (structural meta-pattern families). Opt-in (default `false`): it is
     /// informational/codometry, not part of the duplicate gate.
@@ -1162,6 +1218,13 @@ pub struct PipelineOpts {
     /// dropping it from the default 60 to 20 took converge from 5.2 s to 1.5 s on a 371k-definition
     /// tree. It reports a shorter ranking in exchange, which is why it is a knob and not a change.
     pub converge_cap: usize,
+    /// Run the decisions pass: definitions that decide on the same facts, however they are written.
+    /// Opt-in (default `false`) and advisory. Its only cut is learned from the corpus — see
+    /// [`decide::pass_decisions`].
+    pub decisions: bool,
+    /// The decisions pass's false-discovery rate and statistic (`settings:decision-fdr`,
+    /// `settings:decision-statistic`).
+    pub decision: decide::DecisionOpts,
     /// Minimum cluster size (default `2`).
     pub min_size: usize,
     /// De-escalate ERRORs whose `thickness` is below this to WARNING (default
@@ -1199,6 +1262,8 @@ impl PipelineOpts {
             converge: false,
             converge_top: DEFAULT_CONVERGE_TOP,
             converge_cap: converge::SEED_CAP,
+            decisions: false,
+            decision: decide::DecisionOpts::default(),
             pattern_theta: 0.85,
             pattern_support: 3,
             pattern_min_thickness: 0.0,
@@ -1293,6 +1358,11 @@ pub fn cluster(mut defs: Vec<Def>, opts: &PipelineOpts) -> Vec<Finding> {
     if opts.converge {
         timed("pass5-converge", || findings.extend(converge::pass_converge(&defs, opts.converge_top, opts.converge_cap)));
     }
+    if opts.decisions {
+        // After the body passes, which it reads: a pair they already cluster is a copy, theirs to report.
+        let found = timed("pass6-decisions", || decide::pass_decisions(&defs, &findings, &opts.decision));
+        findings.extend(found);
+    }
 
     // Directive-driven patternology calibration: drop advisory candidates below the explicit
     // thickness floor (`set:pattern-min-thickness`, proposed by `--calibrate`). Default `0.0` → no-op,
@@ -1323,4 +1393,128 @@ pub fn cluster(mut defs: Vec<Def>, opts: &PipelineOpts) -> Vec<Finding> {
         }
     }
     findings
+}
+
+#[cfg(test)]
+mod type3_tests {
+    use std::sync::Arc;
+
+    use dup_defs_core::{Analysis, CanonDialect, Def, Facets};
+
+    use super::{pass_type3, GpuMode};
+
+    fn def(name: &str, src: &str) -> Def {
+        let a = py_canon::analyze_functions(&[src.to_owned()]).pop().flatten().expect("a function definition");
+        Def {
+            lang: "py",
+            kind: &py_canon::FUNCTIONS,
+            name: name.to_owned(),
+            file: Arc::from(format!("{name}.py")),
+            line: 1,
+            col: 0,
+            loc: src.lines().count(),
+            args: 1,
+            text_orig: src.to_owned(),
+            cluster_canonical: Some(a.cluster_canonical),
+            analysis: Some(Analysis {
+                xname_canonical: a.xname_canonical,
+                type3_lines: a.type3_lines,
+                type_refs: a.type_refs,
+                type3_units: a.type3_units,
+                size: a.size,
+                canon_dialect: CanonDialect::CPythonAst,
+            }),
+            thickness: None,
+            facets: Facets::default(),
+        }
+    }
+
+    /// Unrelated bodies, so the weighting has a corpus to call a line common or rare against — and
+    /// enough of them, with enough of their own, that two functions sharing twenty units is more
+    /// than the null expects. In a corpus of eight, two functions holding a third of every unit
+    /// there is would share most of them by chance, and the null says so.
+    fn corpus(defs: &mut Vec<Def>) {
+        for i in 0..40 {
+            let src = format!(
+                "def other{i}(rows, limit):\n    kept = [r for r in rows if r.rank > {i}]\n    \
+                 total = measure_{i}(kept, limit)\n    if total > {i}:\n        kept.sort(key=lambda r: r.field_{i})\n    \
+                 return kept[:limit], total\n"
+            );
+            defs.push(def(&format!("other{i}"), &src));
+        }
+    }
+
+    fn pairs(defs: &[Def]) -> Vec<String> {
+        pass_type3(defs, 0.7, GpuMode::Cpu).into_iter().map(|f| f.name).collect()
+    }
+
+    #[test]
+    fn one_added_parameter_does_not_rewrite_every_line() {
+        // Body-wide numbering shifted every `_v{n}` after the extra parameter, so these two agreed on
+        // nine statements and shared no unit at all.
+        let body = "    raw = identity.payload\n    name = raw.get('username')\n    if isinstance(name, str):\n        \
+                    out['username'] = name\n    first = raw.get('first_name')\n    if isinstance(first, str):\n        \
+                    out['first_name'] = first\n    return out\n";
+        let mut defs = vec![
+            def("build_payload", &format!("def build_payload(identity, out):\n{body}")),
+            def("build_context", &format!("def build_context(base, identity, out):\n{body}")),
+        ];
+        corpus(&mut defs);
+        assert_eq!(pairs(&defs), ["build_context/build_payload"]);
+    }
+
+    #[test]
+    fn a_pair_the_exact_pass_owns_is_left_to_it() {
+        let mut defs = vec![
+            def("from_jwt", "def from_jwt(p: Jwt) -> int | None:\n    v = p.get('uid')\n    if isinstance(v, int):\n        return v\n    return None\n"),
+            def("from_refresh", "def from_refresh(p: Refresh) -> int | None:\n    v = p.get('uid')\n    if isinstance(v, int):\n        return v\n    return None\n"),
+        ];
+        corpus(&mut defs);
+        assert_eq!(
+            defs[0].analysis.as_ref().map(|a| &a.xname_canonical),
+            defs[1].analysis.as_ref().map(|a| &a.xname_canonical),
+            "the two canonicals agree"
+        );
+        assert!(pairs(&defs).is_empty(), "equal canonicals are the cross-name pass's finding");
+    }
+
+    #[test]
+    fn equal_units_with_different_canonicals_are_still_reported() {
+        // Line for line alike, yet one returns what it read first and the other what it read second:
+        // the exact pass does not have this pair, so this pass may not hand it over.
+        let mut defs = vec![
+            def("first", "def first(a, b):\n    x = load(a)\n    y = load(b)\n    return x\n"),
+            def("second", "def second(a, b):\n    x = load(a)\n    y = load(b)\n    return y\n"),
+        ];
+        corpus(&mut defs);
+        assert_eq!(pairs(&defs), ["first/second"]);
+    }
+
+    #[test]
+    fn a_token_changed_inside_a_long_line_costs_only_its_share() {
+        // Four lines agree and the fifth — the long one, most of the function's weight — differs by
+        // one keyword argument. As whole units the pair shares four lines in five with the heavy one
+        // lost, and the plain cosine sits under the threshold; the soft cosine credits the long line
+        // for the sub-expressions the edit did not touch, and the join finds the pair on them.
+        let body = "    rows = load_rows(orders)\n    kept = [r for r in rows if r.ok]\n    total = sum(r.amount for r in kept)\n    label = describe(owner)\n";
+        let long = "    return render(template=template_for(owner.locale), owner=owner, label=label, items=[describe(r) for r in kept], total=total, count=len(kept), currency=owner.currency.code, mode=";
+        let left = format!("def summary_for_user(owner, orders):\n{body}{long}'full')\n");
+        let right = format!("def summary_for_group(owner, orders):\n{body}{long}'brief')\n");
+        let mut defs = vec![def("summary_for_user", &left), def("summary_for_group", &right)];
+        corpus(&mut defs);
+        assert_eq!(pairs(&defs), ["summary_for_group/summary_for_user"]);
+    }
+
+    #[test]
+    fn a_shared_signature_without_a_shared_step_is_not_a_copy() {
+        // The header and the types it names count toward the similarity, and here they are most of
+        // it; but the one thing each function does, the other does not, and two definitions with
+        // one interface are not one definition written twice.
+        let mut defs = vec![
+            def("rows_a", "def rows_a(self) -> list[tuple[Row, ...]]:\n    return self.rows\n"),
+            def("rows_b", "def rows_b(self) -> list[tuple[Row, ...]]:\n    return self.items\n"),
+        ];
+        corpus(&mut defs);
+        assert!(pairs(&defs).is_empty(), "one interface over two different steps is not one definition written twice");
+    }
 }

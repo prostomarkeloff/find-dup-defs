@@ -156,16 +156,18 @@ impl DefCanon {
 
     /// A callable: canonical forms, statement stream, and the paths it reaches.
     fn callable(analyzed: AnalyzedFn, block: &syn::Block, imports: &HashMap<String, Arc<str>>) -> Self {
-        let AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, statements, size } = analyzed;
+        let AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, type_refs, type3_units, statements, size } = analyzed;
         Self {
             cluster: Some(cluster_canonical),
             analysis: Some(Analysis {
                 xname_canonical,
                 type3_lines,
+                type_refs,
+                type3_units,
                 size,
                 canon_dialect: CanonDialect::Rust,
             }),
-            facets: Facets { statements, reaches: reached_paths(block, imports) },
+            facets: Facets { statements, reaches: reached_paths(block, imports), ..Facets::default() },
         }
     }
 }

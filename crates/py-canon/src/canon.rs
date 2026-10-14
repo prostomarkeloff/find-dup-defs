@@ -8,6 +8,15 @@
 //! difflib ratios (clustering) and the alpha-renamed equality (cross-name) aligned with CPython's
 //! `ast` — a terser form drifts the ratios. Two passes, both off one `Collect` of bound locals:
 //! clustering keeps identifiers, cross-name alpha-renames them (`_v{n}`) and blanks the def name.
+//!
+//! Cross-name also renames every **type reference in annotation position** to a `_T{n}` slot
+//! ([`dup_defs_core::type_slot`]): a parameter / return / variable annotation, and a type
+//! parameter's name, bound and default. Python attaches no behaviour to an annotation, so two bodies
+//! differing only in declared types run the same code — the textbook Type-2 clone. A *call* inside an
+//! annotation is a value, not a type (the typing grammar admits no calls), so `Annotated[T,
+//! Depends(f)]` keeps `Depends(f)` verbatim: that metadata is read at runtime, and it is exactly what
+//! must keep two such definitions apart. Here, and only here, the name-agnostic canonical departs from
+//! CPython's `ast.dump`.
 #![allow(clippy::doc_markdown)]
 
 use std::collections::{HashMap, HashSet};
@@ -236,7 +245,7 @@ fn repr_float(value: f64) -> String {
 }
 
 #[allow(clippy::float_cmp)] // complex literals carry an exact 0.0 real part
-fn repr_number(num: &Number) -> String {
+pub(crate) fn repr_number(num: &Number) -> String {
     match num {
         Number::Int(value) => format!("{value}"),
         Number::Float(value) => repr_float(*value),
@@ -304,6 +313,10 @@ struct Dump<'a> {
     /// reaches. What survives is the grammar of talking to things the module did not define:
     /// `session.get(…)`, `.filter(…).delete()`. `None` ⇒ historical behaviour.
     scope: Option<&'a HashSet<String>>,
+    /// Type reference → its `_T{n}` slot, numbered in order of first appearance.
+    tmap: HashMap<String, u32>,
+    /// Inside an annotation and not inside a call within it — where a name is a type reference.
+    in_type: bool,
 }
 
 impl<'a> Dump<'a> {
@@ -317,6 +330,8 @@ impl<'a> Dump<'a> {
             top_def_pending: true,
             anchor: None,
             scope: None,
+            tmap: HashMap::new(),
+            in_type: false,
         }
     }
 
@@ -355,6 +370,28 @@ impl<'a> Dump<'a> {
     /// grammar the shape is written in.
     fn rename_attr(&mut self, attr: &str) -> String {
         dup_defs_core::alpha_rename(&mut self.map, self.scope, attr)
+    }
+
+    /// An annotation, dumped as a type expression: in a name-agnostic dump its type references
+    /// become `_T{n}` slots (see the module docs). The clustering dump keeps them verbatim.
+    fn annotation(&mut self, expr: &Expr) -> String {
+        if self.locals.is_none() {
+            return self.expr(expr);
+        }
+        let outer = std::mem::replace(&mut self.in_type, true);
+        let out = self.expr(expr);
+        self.in_type = outer;
+        out
+    }
+
+    /// A type parameter's own name: declared here, referenced from the annotations, so it takes the
+    /// same slot they do.
+    fn type_param_name(&mut self, name: &str) -> String {
+        if self.locals.is_some() {
+            dup_defs_core::type_slot(&mut self.tmap, name)
+        } else {
+            name.to_owned()
+        }
     }
 
     /// Emit one AST node `name(field, …)` applying the `show_empty=False` + keyword-switch rule.
@@ -452,7 +489,7 @@ impl<'a> Dump<'a> {
     /// `arg(arg, annotation?, type_comment?)` — the param name is a rename target.
     fn arg_node(&mut self, param: &Parameter) -> String {
         let name = self.rename_id(param.name.id.as_str());
-        let annotation = param.annotation.as_ref().map(|a| self.expr(a));
+        let annotation = param.annotation.as_ref().map(|a| self.annotation(a));
         self.node(
             "arg",
             vec![("arg", F::P(repr_str(&name))), ("annotation", opt(annotation)), ("type_comment", F::Skip)],
@@ -628,30 +665,23 @@ impl<'a> Dump<'a> {
     fn type_param(&mut self, tp: &ast::TypeParam) -> String {
         match tp {
             ast::TypeParam::TypeVar(t) => {
-                let bound = t.bound.as_ref().map(|b| self.expr(b));
-                let default = t.default.as_ref().map(|d| self.expr(d));
+                let name = self.type_param_name(t.name.id.as_str());
+                let bound = t.bound.as_ref().map(|b| self.annotation(b));
+                let default = t.default.as_ref().map(|d| self.annotation(d));
                 self.node(
                     "TypeVar",
-                    vec![
-                        ("name", F::P(repr_str(t.name.id.as_str()))),
-                        ("bound", opt(bound)),
-                        ("default_value", opt(default)),
-                    ],
+                    vec![("name", F::P(repr_str(&name))), ("bound", opt(bound)), ("default_value", opt(default))],
                 )
             }
             ast::TypeParam::ParamSpec(t) => {
-                let default = t.default.as_ref().map(|d| self.expr(d));
-                self.node(
-                    "ParamSpec",
-                    vec![("name", F::P(repr_str(t.name.id.as_str()))), ("default_value", opt(default))],
-                )
+                let name = self.type_param_name(t.name.id.as_str());
+                let default = t.default.as_ref().map(|d| self.annotation(d));
+                self.node("ParamSpec", vec![("name", F::P(repr_str(&name))), ("default_value", opt(default))])
             }
             ast::TypeParam::TypeVarTuple(t) => {
-                let default = t.default.as_ref().map(|d| self.expr(d));
-                self.node(
-                    "TypeVarTuple",
-                    vec![("name", F::P(repr_str(t.name.id.as_str()))), ("default_value", opt(default))],
-                )
+                let name = self.type_param_name(t.name.id.as_str());
+                let default = t.default.as_ref().map(|d| self.annotation(d));
+                self.node("TypeVarTuple", vec![("name", F::P(repr_str(&name))), ("default_value", opt(default))])
             }
         }
     }
@@ -760,6 +790,15 @@ impl<'a> Dump<'a> {
 
     #[allow(clippy::too_many_lines)]
     fn expr(&mut self, expr: &Expr) -> String {
+        // A type reference is one slot however it is spelled: `typing.Optional` names one type, not
+        // an attribute read. The anchor keeps its own slot even in type position.
+        if self.in_type {
+            if let Some(reference) = type_reference(expr).filter(|r| self.anchor != Some(r.as_str())) {
+                let id = dup_defs_core::type_slot(&mut self.tmap, &reference);
+                let ctx = self.ctx(ExprContext::Load);
+                return self.node("Name", vec![("id", F::P(repr_str(&id))), ("ctx", F::P(ctx))]);
+            }
+        }
         match expr {
             Expr::Name(n) => {
                 // In use-profile mode the anchored definition's own name is the slot, not a free
@@ -797,10 +836,13 @@ impl<'a> Dump<'a> {
                 let on_anchor = self
                     .anchor
                     .is_some_and(|a0| matches!(c.func.as_ref(), Expr::Name(n) if n.id.as_str() == a0));
+                // A call is a value even inside an annotation — `Depends(f)` in `Annotated[T, …]`.
+                let outer = std::mem::replace(&mut self.in_type, false);
                 let func = self.expr(&c.func);
                 let args: Vec<String> = c.arguments.args.iter().map(|a| self.expr(a)).collect();
                 let keywords: Vec<String> =
                     c.arguments.keywords.iter().map(|k| self.keyword_at(k, on_anchor)).collect();
+                self.in_type = outer;
                 self.node("Call", vec![("func", F::P(func)), ("args", flist(args)), ("keywords", flist(keywords))])
             }
             Expr::BinOp(b) => {
@@ -967,7 +1009,7 @@ impl<'a> Dump<'a> {
                 let body = self.body(&f.body, true);
                 let decorators: Vec<String> =
                     if strip_deco { Vec::new() } else { f.decorator_list.iter().map(|d| self.expr(&d.expression)).collect() };
-                let returns = f.returns.as_ref().map(|r| self.expr(r));
+                let returns = f.returns.as_ref().map(|r| self.annotation(r));
                 let type_params = self.type_params(f.type_params.as_deref());
                 self.node(
                     cpy,
@@ -1046,7 +1088,7 @@ impl<'a> Dump<'a> {
             }
             Stmt::AnnAssign(a) => {
                 let target = self.expr(&a.target);
-                let annotation = self.expr(&a.annotation);
+                let annotation = self.annotation(&a.annotation);
                 let value = a.value.as_ref().map(|v| self.expr(v));
                 let simple = i32::from(a.simple);
                 self.node(
@@ -1344,16 +1386,109 @@ struct Unparse<'a> {
     /// Block nesting of the statement being written. Emitted as leading spaces, which every
     /// existing caller trims away; [`unparse_depths`] is the one that reads it back.
     indent: usize,
+    /// `Some` when writing the Type-3 lines: type reference → `_T{n}` slot, handed
+    /// over from the [`Dump`] as `map` is. `None` writes types as spelled — the statement stream.
+    tmap: Option<HashMap<String, u32>>,
+    /// Inside an annotation and not inside a call within it — see [`Dump::in_type`].
+    in_type: bool,
+    /// Every type reference turned into a slot, in order of appearance — [`AnalyzedFn::type_refs`].
+    mentions: Vec<String>,
+    /// Type parameters the definition declares: renamed like any type, but bound here, so not
+    /// vocabulary it shares with anything.
+    declared_types: HashSet<String>,
+    /// `Some` when writing the Type-3 lines: every sub-expression worth a unit of its own, rendered
+    /// exactly as it appears inside its line, with the index of that line —
+    /// [`AnalyzedFn::type3_units`].
+    units: Option<Vec<(u32, String)>>,
+    /// Logical lines started so far ([`Self::fill`] calls) — the index a captured unit is filed under.
+    fills: u32,
+    /// How many expressions enclose the one being written: `1` for a statement's own expression.
+    expr_depth: u32,
+}
+
+/// Whether an expression is a Type-3 unit of its own: a node with structure, not a bare name or a
+/// literal (which carry no agreement by themselves) nor a slice or a starred operand (which are not
+/// expressions a reader would call a part).
+fn is_unit(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(_)
+        | Expr::Attribute(_)
+        | Expr::Subscript(_)
+        | Expr::BinOp(_)
+        | Expr::BoolOp(_)
+        | Expr::Compare(_)
+        | Expr::UnaryOp(_)
+        | Expr::If(_)
+        | Expr::Lambda(_)
+        | Expr::ListComp(_)
+        | Expr::SetComp(_)
+        | Expr::DictComp(_)
+        | Expr::Generator(_)
+        | Expr::Await(_)
+        | Expr::Yield(_)
+        | Expr::YieldFrom(_)
+        | Expr::Named(_)
+        | Expr::FString(_) => true,
+        Expr::List(l) => !l.elts.is_empty(),
+        Expr::Tuple(t) => !t.elts.is_empty(),
+        Expr::Set(s) => !s.elts.is_empty(),
+        Expr::Dict(d) => !d.items.is_empty(),
+        _ => false,
+    }
 }
 
 impl Unparse<'_> {
+    /// Write an expression and, when collecting units, keep what was written for it as one.
+    /// `buffered` regions swap the output buffer, so the slice is taken from whichever buffer the
+    /// expression was written into — the text is the same.
+    fn expr(&mut self, expr: &Expr, ctx: u8) {
+        let start = self.out.len();
+        self.expr_depth += 1;
+        self.expr_inner(expr, ctx);
+        self.expr_depth -= 1;
+        // A proper sub-expression only: the statement's own expression is the line, already a unit,
+        // and counting it again would double the weight of exactly the text an edit changes.
+        if self.units.is_some() && self.expr_depth > 0 && !self.in_type && is_unit(expr) {
+            let unit = self.out[start..].to_owned();
+            let line = self.fills.saturating_sub(1);
+            if let Some(units) = self.units.as_mut() {
+                units.push((line, unit));
+            }
+        }
+    }
+
     fn rename_id(&mut self, id: &str) -> String {
         dup_defs_core::alpha_rename(&mut self.map, self.locals, id)
+    }
+
+    /// An annotation, written as a type expression — the line form of [`Dump::annotation`] when
+    /// writing the Type-3 lines, verbatim otherwise.
+    fn annotation(&mut self, expr: &Expr, ctx: u8) {
+        if self.tmap.is_none() {
+            self.expr(expr, ctx);
+            return;
+        }
+        let outer = std::mem::replace(&mut self.in_type, true);
+        self.expr(expr, ctx);
+        self.in_type = outer;
+    }
+
+    /// A type parameter's own name — the line form of [`Dump::type_param_name`].
+    fn type_param_name(&mut self, name: &str) {
+        let name = match self.tmap.as_mut() {
+            Some(tmap) => {
+                self.declared_types.insert(name.to_owned());
+                dup_defs_core::type_slot(tmap, name)
+            }
+            None => name.to_owned(),
+        };
+        self.write(&name);
     }
 
     /// Start a new logical line (CPython `fill`): a newline unless we're at the start, then the
     /// current block nesting as leading spaces.
     fn fill(&mut self, text: &str) {
+        self.fills += 1;
         if !self.out.is_empty() {
             self.out.push('\n');
         }
@@ -1410,7 +1545,7 @@ impl Unparse<'_> {
                 self.write(")");
                 if let Some(returns) = &f.returns {
                     self.write(" -> ");
-                    self.expr(returns, prec::TEST);
+                    self.annotation(returns, prec::TEST);
                 }
                 self.write(":");
                 self.body(&f.body, true);
@@ -1479,7 +1614,7 @@ impl Unparse<'_> {
                     self.write(")");
                 }
                 self.write(": ");
-                self.expr(&a.annotation, prec::TEST);
+                self.annotation(&a.annotation, prec::TEST);
                 if let Some(v) = &a.value {
                     self.write(" = ");
                     self.expr(v, prec::TEST);
@@ -1668,7 +1803,17 @@ impl Unparse<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn expr(&mut self, expr: &Expr, ctx: u8) {
+    fn expr_inner(&mut self, expr: &Expr, ctx: u8) {
+        if self.in_type {
+            if let (Some(reference), Some(tmap)) = (type_reference(expr), self.tmap.as_mut()) {
+                let slot = dup_defs_core::type_slot(tmap, &reference);
+                if !self.declared_types.contains(&reference) {
+                    self.mentions.push(reference);
+                }
+                self.write(&slot);
+                return;
+            }
+        }
         match expr {
             Expr::Name(n) => {
                 let id = self.rename_id(n.id.as_str());
@@ -1717,6 +1862,7 @@ impl Unparse<'_> {
                 self.write(a.attr.id.as_str());
             }
             Expr::Call(c) => {
+                let outer = std::mem::replace(&mut self.in_type, false);
                 self.expr(&c.func, prec::ATOM);
                 self.write("(");
                 let mut first = true;
@@ -1735,6 +1881,7 @@ impl Unparse<'_> {
                     self.keyword(kw);
                 }
                 self.write(")");
+                self.in_type = outer;
             }
             Expr::Subscript(s) => {
                 self.expr(&s.value, prec::ATOM);
@@ -2037,7 +2184,7 @@ impl Unparse<'_> {
         self.write(&name);
         if let Some(annotation) = &param.annotation {
             self.write(": ");
-            self.expr(annotation, prec::TEST);
+            self.annotation(annotation, prec::TEST);
         }
     }
 
@@ -2105,23 +2252,23 @@ impl Unparse<'_> {
             first = false;
             match tp {
                 ast::TypeParam::TypeVar(t) => {
-                    self.write(t.name.id.as_str());
+                    self.type_param_name(t.name.id.as_str());
                     if let Some(bound) = &t.bound {
                         self.write(": ");
-                        self.expr(bound, prec::TEST);
+                        self.annotation(bound, prec::TEST);
                     }
                     if let Some(default) = &t.default {
                         self.write(" = ");
-                        self.expr(default, prec::TEST);
+                        self.annotation(default, prec::TEST);
                     }
                 }
                 ast::TypeParam::TypeVarTuple(t) => {
                     self.write("*");
-                    self.write(t.name.id.as_str());
+                    self.type_param_name(t.name.id.as_str());
                 }
                 ast::TypeParam::ParamSpec(t) => {
                     self.write("**");
-                    self.write(t.name.id.as_str());
+                    self.type_param_name(t.name.id.as_str());
                 }
             }
         }
@@ -2306,12 +2453,25 @@ impl Unparse<'_> {
     }
 }
 
-/// Unparse the alpha-renamed function and split into stripped, non-empty lines (the Type-3 units).
-fn unparse_lines(stmt: &Stmt, src: &str, locals: &HashSet<String>, map: HashMap<String, u32>) -> Vec<String> {
-    unparse_depths(stmt, src, locals, map).into_iter().map(|(_, line)| line).collect()
+/// A type reference as written — `X`, `typing.Optional` — or `None` when `expr` is not a name or a
+/// chain of attribute reads off one. A dotted path names one type, so it becomes one slot.
+fn type_reference(expr: &Expr) -> Option<String> {
+    let (root, attrs) = crate::decides::chain(expr);
+    let root = root?;
+    Some(std::iter::once(root).chain(attrs).collect::<Vec<_>>().join("."))
 }
 
-/// [`unparse_lines`] keeping each line's **block nesting**.
+/// What one unparse of a function yields: its lines with their block depth, and — in the Type-3
+/// mode (`tmap` given) — the type references turned into slots and the sub-expression units.
+struct Unparsed {
+    lines: Vec<(usize, String)>,
+    type_refs: Vec<String>,
+    units: Vec<(u32, String)>,
+}
+
+/// Unparse the alpha-renamed function into stripped, non-empty lines keeping each line's **block
+/// nesting**, plus the type references the unparse turned into slots and the sub-expression units
+/// (neither when `tmap` is `None`, which writes types as spelled — the statement stream).
 ///
 /// Order alone cannot tell `for _v0 in _v1: / foo() / bar()` from the same three statements where
 /// `bar()` runs *after* the loop instead of inside it — flattened, both are one sequence. Depth is
@@ -2322,14 +2482,32 @@ fn unparse_depths(
     src: &str,
     locals: &HashSet<String>,
     map: HashMap<String, u32>,
-) -> Vec<(usize, String)> {
-    let mut up = Unparse { out: String::new(), src, locals: Some(locals), map, blanked: false, indent: 0 };
+    tmap: Option<HashMap<String, u32>>,
+) -> Unparsed {
+    let units = tmap.as_ref().map(|_| Vec::new());
+    let mut up = Unparse {
+        out: String::new(),
+        src,
+        locals: Some(locals),
+        map,
+        blanked: false,
+        indent: 0,
+        tmap,
+        in_type: false,
+        mentions: Vec::new(),
+        declared_types: HashSet::new(),
+        units,
+        fills: 0,
+        expr_depth: 0,
+    };
     up.stmt(stmt);
-    up.out
+    let lines = up
+        .out
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| ((l.len() - l.trim_start().len()) / 4, l.trim().to_owned()))
-        .collect()
+        .collect();
+    Unparsed { lines, type_refs: up.mentions, units: up.units.unwrap_or_default() }
 }
 
 // ---------------------------------------------------------------------------
@@ -2369,23 +2547,20 @@ fn normalize_one(text: &str) -> Option<(String, Vec<String>, usize)> {
     let parsed = parse_module(text).ok()?;
     let module = parsed.into_syntax();
     let stmt = module.body.first()?;
-    let Stmt::FunctionDef(func) = stmt else {
+    if !matches!(stmt, Stmt::FunctionDef(_)) {
         return None; // ruff folds async into StmtFunctionDef; classes/others are out of scope here
-    };
+    }
+    // Two normal forms, as in `analyze_stmt`: the lines keep every statement, the canonical inlines.
+    let statement_form = crate::normal::normal_form(stmt, false);
+    let line_locals = collect_locals(&statement_form);
+    let typed = unparse_depths(&statement_form, text, &line_locals, HashMap::new(), Some(HashMap::new()));
+    let lines = typed.lines.into_iter().map(|(_, line)| line).collect();
 
-    let mut collect = Collect::default();
-    collect.add_params(&func.parameters); // top fn's params (nested defs' params are not locals)
-    collect.visit_stmt(stmt);
-    let locals = collect.bound;
-
+    let exact_form = crate::normal::with_inlining(&statement_form);
+    let locals = collect_locals(&exact_form); // top fn's params (nested defs' params are not locals)
     let mut dump = Dump::new(text, Some(&locals));
-    let canonical = dump.stmt(stmt);
+    let canonical = dump.stmt(&exact_form);
     let size = dump.count;
-
-    // Type-3 shingle units: `ast.unparse(normalized_fn).splitlines()` stripped — reproduced exactly
-    // (CPython 3.14 unparse) so the ECScan IDF/cosine matches the CPython `ast` reference bit-for-bit. The
-    // rename map from the dump pass is reused so the `_v{n}` numbering is identical to the canonical.
-    let lines = unparse_lines(stmt, text, &locals, dump.map);
     Some((canonical, lines, size))
 }
 
@@ -2402,30 +2577,51 @@ pub fn normalize_functions(texts: &[String]) -> Vec<Option<(String, Vec<String>,
 /// excluded — matching the decorator-stripped def *text* the text-based path canonicalized — so a
 /// canonical built from a file's AST node is byte-identical to one built by re-parsing the def text.
 pub(crate) fn analyze_stmt(stmt: &Stmt, src: &str) -> Option<AnalyzedFn> {
-    let Stmt::FunctionDef(func) = stmt else {
+    let Stmt::FunctionDef(_) = stmt else {
         return None;
     };
     let cluster_canonical = Dump::new(src, None).stmt(stmt);
 
-    let mut collect = Collect::default();
-    collect.add_params(&func.parameters);
-    collect.visit_stmt(stmt);
-    let locals = collect.bound;
-
+    // The statement stream keeps the definition as written: converge reads it to say where two
+    // definitions stop agreeing, and a rewritten line would point the reader at code that is not
+    // there.
+    let locals = collect_locals(stmt);
     let mut dump = Dump::new(src, Some(&locals));
-    let xname_canonical = dump.stmt(stmt);
+    dump.stmt(stmt);
+    let statements = statement_stream(unparse_depths(stmt, src, &locals, dump.map, None).lines);
+
+    // The name-agnostic canonicals are taken from the normal form (`normal.rs`): what the exact and
+    // Type-3 passes compare is the meaning the rules reach, not the spelling. The Type-3 lines come
+    // from the form that keeps every statement; the exact canonical from the one that also inlines
+    // single-use temporaries — see `normal_form` for why the two passes read two forms. Slot numbers
+    // in the lines are their own (the pass renumbers per line), so the lines need no dump of theirs.
+    let statement_form = crate::normal::normal_form(stmt, false);
+    let line_locals = collect_locals(&statement_form);
+    let typed = unparse_depths(&statement_form, src, &line_locals, HashMap::new(), Some(HashMap::new()));
+    let type3_lines = typed.lines.into_iter().map(|(_, line)| line).collect();
+
+    let exact_form = crate::normal::with_inlining(&statement_form);
+    let locals = collect_locals(&exact_form);
+    let mut dump = Dump::new(src, Some(&locals));
+    let xname_canonical = dump.stmt(&exact_form);
     let size = dump.count;
-    let statements = statement_stream(unparse_depths(stmt, src, &locals, dump.map));
-    let type3_lines = statements.iter().map(|s| s.line.clone()).collect();
-    Some(AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, statements, size })
+    Some(AnalyzedFn {
+        cluster_canonical,
+        xname_canonical,
+        type3_lines,
+        type_refs: typed.type_refs,
+        type3_units: typed.units,
+        statements,
+        size,
+    })
 }
 
 /// The unparser's `(depth, line)` pairs as the engine's statement stream.
 ///
-/// Python's Type-3 shingles and its statement stream are the same unit — the unparser already walks
-/// into nested blocks and one line comes out per statement — so the two are built from one traversal
-/// here. That coincidence is Python's, not the contract's: the other frontends shingle differently
-/// and produce the stream separately.
+/// One line per statement, as the unparser walks into nested blocks, with the types spelled as
+/// written: the Type-3 lines are the same statements with their types as slots (reported apart as
+/// [`AnalyzedFn::type_refs`]), a second walk because the two readers need different things from an
+/// annotation — converge parts two definitions on the names they use, a type among them.
 fn statement_stream(pairs: Vec<(usize, String)>) -> Vec<Statement> {
     pairs
         .into_iter()
@@ -2685,7 +2881,8 @@ mod import_tests {
 
     #[test]
     fn star_binds_no_name_to_attribute_a_use_to() {
-        assert!(pairs("from a.b import *\n").is_empty());
+        let bound = pairs("from a.b import *\n");
+        assert!(bound.is_empty(), "a star import binds no name, got: {bound:?}");
     }
 
     #[test]
@@ -2700,6 +2897,64 @@ mod import_tests {
 
     #[test]
     fn unparsable_source_yields_nothing_rather_than_panicking() {
-        assert!(pairs("def (:\n").is_empty());
+        let bound = pairs("def (:\n");
+        assert!(bound.is_empty(), "unparsable source binds nothing, got: {bound:?}");
+    }
+}
+
+#[cfg(test)]
+mod type_slot_tests {
+    use super::{analyze_one, AnalyzedFn};
+
+    fn analyzed(src: &str) -> AnalyzedFn {
+        analyze_one(src).expect("a function definition")
+    }
+
+    #[test]
+    fn bodies_differing_only_in_declared_types_are_one_canonical() {
+        // The Type-2 clone by definition: Python runs the same code whatever the annotations say.
+        let a = analyzed("def f(p: Token) -> int | None:\n    v = p.get('uid')\n    return v\n");
+        let b = analyzed("def g(q: Claims) -> int | None:\n    v = q.get('uid')\n    return v\n");
+        assert_eq!(a.xname_canonical, b.xname_canonical);
+    }
+
+    #[test]
+    fn types_are_renamed_consistently_not_erased() {
+        // Parameterized matching: one bijection has to carry the types of one onto the other's.
+        let same = analyzed("def f(a: X, b: X) -> None:\n    pass\n");
+        let mixed = analyzed("def f(a: X, b: Y) -> None:\n    pass\n");
+        assert_ne!(same.xname_canonical, mixed.xname_canonical);
+    }
+
+    #[test]
+    fn a_call_inside_an_annotation_is_a_value_and_stays() {
+        // Metadata like `Depends(...)` is read at runtime — exactly what keeps two otherwise equal
+        // handlers apart.
+        let member = analyzed("def h(u: Annotated[User, Depends(as_member)]) -> None:\n    pass\n");
+        let admin = analyzed("def h(u: Annotated[User, Depends(as_admin)]) -> None:\n    pass\n");
+        assert_ne!(member.xname_canonical, admin.xname_canonical);
+        assert!(member.xname_canonical.contains("as_member"));
+        assert!(!member.xname_canonical.contains("'User'"));
+    }
+
+    #[test]
+    fn type3_lines_slot_the_types_and_report_them_apart() {
+        let a = analyzed("def f(p: Token) -> int | None:\n    x: models.Row = load(p)\n    return x\n");
+        assert_eq!(a.type_refs, ["Token", "int", "models.Row"]);
+        // Slot numbers follow the lines' own walk — the signature before the body, as with `_v{n}`;
+        // the engine renumbers each unit on its own anyway.
+        assert_eq!(a.type3_lines[0], "def _fn(_v0: _T0) -> _T1 | None:");
+        assert_eq!(a.type3_lines[1], "_v1: _T2 = load(_v0)");
+        // The statement stream keeps them as written: converge parts definitions on names, a type
+        // among them.
+        assert_eq!(a.statements[0].line, "def _fn(_v0: Token) -> int | None:");
+    }
+
+    #[test]
+    fn a_declared_type_parameter_is_bound_not_vocabulary() {
+        let a = analyzed("def first[T](items: list[T]) -> T:\n    return items[0]\n");
+        assert_eq!(a.type_refs, ["list"]);
+        let b = analyzed("def head[U](rows: list[U]) -> U:\n    return rows[0]\n");
+        assert_eq!(a.xname_canonical, b.xname_canonical);
     }
 }

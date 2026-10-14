@@ -114,7 +114,7 @@ const MAX_STATEMENTS: usize = 200;
 enum Tok<'a> {
     /// A name the corpus itself chose.
     Name(&'a str),
-    /// `_v{n}` / `_s{n}` / `_fn` / `_` — grammar, not identity.
+    /// `_v{n}` / `_T{n}` / `_s{n}` / `_fn` / `_` — grammar, not identity.
     Slot(&'a str),
     /// A quoted or numeric literal, taken whole.
     Lit(&'a str),
@@ -128,6 +128,7 @@ fn is_slot(token: &str) -> bool {
         || token
             .strip_prefix("_v")
             .or_else(|| token.strip_prefix("_s"))
+            .or_else(|| token.strip_prefix(dup_defs_core::TYPE_SLOT_PREFIX))
             .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
@@ -280,6 +281,13 @@ fn slot_normalize(toks: &[Tok<'_>], len: usize) -> String {
         }
     }
     out
+}
+
+/// One canonical line with its slots renumbered from zero **within the line** — the Type-3 pass's
+/// unit (see [`crate::Type3Input`] for why that unit may not depend on the rest of the body). The
+/// index key above, read as a line: whitespace lexes as punctuation, so the text keeps its spacing.
+pub(crate) fn line_slots_local(line: &str, dialect: CanonDialect) -> String {
+    slot_normalize(&tokens(line, Vocab::of(dialect)), line.len())
 }
 
 /// **Control skeleton**: the line — given lexed — with all vocabulary holed out, leaving the grammar.
@@ -2148,7 +2156,7 @@ struct Family {
 /// rather than exhaustive enumeration: the groups here are bounded by [`SEED_CAP`], but the shape is
 /// exactly the dense component where exhaustive enumeration blows up, and a family that is *a*
 /// maximal clique rather than *the* largest one answers the question just as well.
-fn clique_cover(vertices: &[u32], edges: &HashMap<u32, HashSet<u32>>) -> Vec<Vec<u32>> {
+pub(crate) fn clique_cover(vertices: &[u32], edges: &HashMap<u32, HashSet<u32>>) -> Vec<Vec<u32>> {
     let mut unclaimed: HashSet<u32> = vertices.iter().copied().collect();
     let mut out = Vec::new();
     while !unclaimed.is_empty() {
@@ -2740,6 +2748,8 @@ mod tests {
             analysis: Some(Analysis {
                 xname_canonical: String::new(),
                 type3_lines: Vec::new(),
+                type_refs: Vec::new(),
+                type3_units: Vec::new(),
                 size: statements.len(),
                 // The fixture lines below are source-like, so they must be read with the source
                 // vocabulary — `Other` would say the bare words are AST node tags.
@@ -2749,6 +2759,7 @@ mod tests {
             facets: Facets {
                 statements,
                 reaches: reaches.iter().map(|r| Arc::from(*r)).collect(),
+                ..Facets::default()
             },
         }
     }
@@ -2818,7 +2829,8 @@ mod tests {
             "node tags are grammar, the quoted identifier is the name"
         );
         // A quoted run that is not identifier-shaped is a message, whichever dialect wrote it.
-        assert!(names("Str('failed to reach {}')", Vocab::SExpr).is_empty());
+        let message = names("Str('failed to reach {}')", Vocab::SExpr);
+        assert!(message.is_empty(), "a message is not a name: {message:?}");
     }
 
     fn graph(edges: &[(u32, u32)]) -> HashMap<u32, HashSet<u32>> {
@@ -2884,7 +2896,7 @@ mod tests {
     fn two_definitions_sharing_nothing_are_not_a_finding() {
         let a = def("a", "one.py", &body(&[("_v1 = alpha(_v0)", 1), ("return _v1", 1)]), &[]);
         let b = def("b", "two.py", &body(&[("_v1 = beta(_v0)", 1), ("raise Boom", 1)]), &[]);
-        assert!(pass_converge(&[a, b], 0, super::SEED_CAP).is_empty());
+        assert!(pass_converge(&[a, b], 0, super::SEED_CAP).is_empty(), "no shared statement, no shared subject: nothing to diverge from");
     }
 
     #[test]
@@ -2932,6 +2944,6 @@ mod tests {
     #[test]
     fn a_definition_does_not_diverge_from_itself() {
         let a = def("a", "one.py", &body(&[("_v1 = f(_v0)", 1), ("_v1 = f(_v0)", 1), ("return _v1", 1)]), &[]);
-        assert!(pass_converge(&[a], 0, super::SEED_CAP).is_empty());
+        assert!(pass_converge(&[a], 0, super::SEED_CAP).is_empty(), "a repeated statement inside one body is not a pair");
     }
 }
