@@ -70,7 +70,7 @@ const CTX_NOISE: &[&str] = &["Load", "Store", "Del"];
 
 /// Minimum kept node-type-sequence length for a function to participate. A handful of nodes (a
 /// `return []` one-liner) has no meta-pattern to speak of; this is the structural analogue of the
-/// Type-3 `SHINGLE_LINES` floor.
+/// line floor the Type-3 pass had before its verdict became a question for the corpus's null.
 pub const MIN_SKELETON_NODES: usize = 8;
 
 /// Recover the preorder sequence of AST node-type constructors from an `ast.dump`-style canonical.

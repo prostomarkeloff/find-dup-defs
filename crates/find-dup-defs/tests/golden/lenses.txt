@@ -55,7 +55,7 @@ DUPLICATE LENSES [WARNING]: add_numbers/plus_numbers  [normalized-exact, T=0.35,
 
 
 --- duplicate lens consensus (cross-name Type-3, IDF-weighted cosine) ---
-DUPLICATE LENSES [WARNING]: Cache/Repository  [ast sim 0.70, T=0.50, n=3, loc=10, args=15]  votes[4]: control×3 effects×2 outgoing×2 failures×1
+DUPLICATE LENSES [WARNING]: Cache/Repository  [ast sim 0.70, T=0.50, n=3, loc=10, args=15]  votes[4]: control×3 effects×2 outgoing×2 failures×1  # evidence: p = 2.3e-2 under the bipartite configuration model
   py/core_a.py:20
   py/core_a.py:33
   py/core_b.py:20

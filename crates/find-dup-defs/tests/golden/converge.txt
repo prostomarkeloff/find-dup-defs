@@ -5,6 +5,11 @@
 --- duplicate functions (cross-name, exact AST-normalized) ---
 
 --- duplicate functions (cross-name Type-3, IDF-weighted cosine) ---
+DUPLICATE FUNCTION [WARNING]: channel_admits/import_permits/upload_allows  [ast sim 0.75, T=0.44, n=3, loc=7, args=2]  # evidence: p = 1.0e-1 under the bipartite configuration model
+  py/guards.py:10
+  py/guards.py:19
+  py/guards.py:28
+
 
 --- duplicate methods (cross-file, AST sim warn=0.5 error=0.85) ---
 
@@ -46,4 +51,4 @@ DUPLICATE FUNCTION [INFO]: channel_admits / import_permits / upload_allows  [T=0
 
 
 --- families of methods (converge — many places, one subject, one shape) ---
-# summary: 0 ERROR, 5 WARNING groups
+# summary: 0 ERROR, 6 WARNING groups

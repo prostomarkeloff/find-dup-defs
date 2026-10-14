@@ -17,6 +17,9 @@ const FIX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mixed");
 /// reach imports and word one shape differently, and adding those to `mixed` would move every
 /// existing golden for a pass they have nothing to do with.
 const FIX_CONVERGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/converge");
+/// A third tree for the decisions pass: one rule written twice — once as a guard, once as a filter —
+/// among forty definitions that decide on facts of their own, so the null has a corpus to be a null of.
+const FIX_DECISIONS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/decisions");
 
 fn run(extra: &[&str]) -> String {
     run_in(FIX, extra)
@@ -95,6 +98,17 @@ fn converge_matches_golden() {
         &run_in(FIX_CONVERGE, &["--converge", "--show-info"]),
         include_str!("golden/converge.txt"),
         "converge.txt",
+    );
+}
+
+#[test]
+fn decisions_matches_golden() {
+    // Locks the facts, the null and the cut together: the guard and the filter share no line and are
+    // found; the forty definitions sharing a common fact or two are not.
+    assert_golden(
+        &run_in(FIX_DECISIONS, &["--decisions", "--show-info"]),
+        include_str!("golden/decisions.txt"),
+        "decisions.txt",
     );
 }
 

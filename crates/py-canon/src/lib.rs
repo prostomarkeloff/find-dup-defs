@@ -10,9 +10,11 @@
 //! types.
 
 mod canon;
+mod decides;
 mod defs;
 mod frontend;
 mod lenses;
+mod normal;
 mod uses;
 
 pub use canon::{

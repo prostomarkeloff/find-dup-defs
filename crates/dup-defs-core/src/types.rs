@@ -59,12 +59,22 @@ pub enum CanonDialect {
 /// * `xname_canonical` — alpha-renamed structural canonical (bound locals → positional
 ///   `_v{n}`, top def name blanked); the cross-name pass buckets on this.
 /// * `type3_lines` — per-statement renamed lines for the Type-3 IDF-cosine pass.
+/// * `type_refs` — the type references the definition's annotations name, in order, when its
+///   language attaches no behaviour to an annotation and the frontend therefore writes them as
+///   `_T{n}` slots in the two fields above; empty otherwise. See [`AnalyzedFn::type_refs`].
+/// * `type3_units` — the sub-expressions of the lines, further units for the Type-3 pass; empty for
+///   a frontend that reports only lines. See [`AnalyzedFn::type3_units`].
 /// * `size` — node count of the alpha-renamed canonical, the cross-name "substance" gate.
 /// * `canon_dialect` — the [`CanonDialect`] of `xname_canonical`, for dialect-specific passes.
+///
+/// [`AnalyzedFn::type_refs`]: crate::AnalyzedFn::type_refs
+/// [`AnalyzedFn::type3_units`]: crate::AnalyzedFn::type3_units
 #[derive(Clone, Debug)]
 pub struct Analysis {
     pub xname_canonical: String,
     pub type3_lines: Vec<String>,
+    pub type_refs: Vec<String>,
+    pub type3_units: Vec<(u32, String)>,
     pub size: usize,
     pub canon_dialect: CanonDialect,
 }
@@ -123,6 +133,35 @@ pub struct Facets {
     /// Normalizing the separator is the frontend's job because only it knows what a path is; the
     /// prefix lattice over the result is the engine's, and is language-blind.
     pub reaches: Vec<Arc<str>>,
+    /// What the definition **decides on**: every proposition its body tests, as a canonical atom,
+    /// sorted and deduplicated.
+    ///
+    /// Every other facet describes how a definition is *written*. Two places that make one decision
+    /// independently are written differently by construction — one raises where the other returns a
+    /// sentinel, one filters a loop where the other refuses a request, one reads a snapshot where the
+    /// other reads the row — and the only thing they keep in common is the set of facts the decision
+    /// depends on. That set is the support of a Boolean function, and the support is invariant under
+    /// everything the writing varies: negation, splitting one test into several, reordering them.
+    ///
+    /// The atom grammar is [`crate::decide`]'s, shared by every frontend: a frontend decides which of
+    /// its expressions are propositions and what each operand's identity is; the spelling is common.
+    pub decides: Vec<Arc<str>>,
+    /// The definition's own identity, as a term in that grammar (a local path) — what the corpus's
+    /// calls name it by. `None` for a definition nothing can call by name.
+    pub identity: Option<Arc<str>>,
+    /// The parameters a call fills, in the order positional arguments fill them. Empty when the call
+    /// sites the corpus shows are not all there are (a decorated definition is called by whatever it
+    /// was registered with) — then nothing is inferred about what the parameters hold.
+    pub params: Vec<Arc<str>>,
+    /// The calls the definition makes to names it reaches as paths.
+    pub calls: Vec<crate::decide::CallSite>,
+    /// Every path the definition reads as a *value* rather than calling it — a function handed on as a
+    /// callback, a class passed somewhere. Such a callee is called from places no call site shows.
+    pub mentions: Vec<Arc<str>>,
+    /// Keyword names the definition passes to calls whose callee it cannot name as a path — a method
+    /// of a value, a callable it was handed. Any of them may write a record's field of that name
+    /// (`replace(x, f=…)`), so a field so named is never inferred from its constructors alone.
+    pub loose_keywords: Vec<Arc<str>>,
 }
 
 /// One definition lowered to the engine's feature record. Produced by [`Frontend::scan`] with

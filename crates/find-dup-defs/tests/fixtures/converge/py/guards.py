@@ -1,7 +1,7 @@
 """Three guards around one module, one shape, three vocabularies — the family's case.
 
-Textually they share almost nothing; what they share is the module they reach and the shape of
-the decision they make. That is the pair the body passes cannot see and the family rubric can.
+Every name differs; what they share is the module they reach and the shape of the decision they
+make. Renamed, they are copies one callee apart — Type-3 says so; the family rubric names the shape.
 """
 
 from domain.access.plans import plan_for, seat_ceiling, row_ceiling, byte_ceiling

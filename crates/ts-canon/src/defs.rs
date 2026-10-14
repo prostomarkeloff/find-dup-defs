@@ -149,6 +149,8 @@ fn canon_for(kind: &KindSpec, text: &str) -> (Option<String>, Option<Analysis>, 
                 Some(Analysis {
                     xname_canonical: a.xname_canonical,
                     type3_lines: a.type3_lines,
+                    type_refs: a.type_refs,
+                    type3_units: a.type3_units,
                     size: a.size,
                     canon_dialect: CanonDialect::Other,
                 }),
@@ -230,7 +232,7 @@ fn build_def(
         cluster_canonical,
         analysis,
         thickness: None,
-        facets: Facets { statements, reaches },
+        facets: Facets { statements, reaches, ..Facets::default() },
     }
 }
 

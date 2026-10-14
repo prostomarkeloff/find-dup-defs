@@ -259,6 +259,8 @@ pub fn lens_def(
             xname_canonical: canonical,
             size: stitched.len(),
             type3_lines: stitched,
+            type_refs: Vec::new(),
+            type3_units: Vec::new(),
             canon_dialect: dialect,
         }),
         thickness: None,

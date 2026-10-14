@@ -20,6 +20,29 @@ pub struct AnalyzedFn {
     pub xname_canonical: String,
     /// Per-statement renamed lines — the Type-3 pass's shingles.
     pub type3_lines: Vec<String>,
+    /// The type references the annotations name, in order — filled only by a frontend whose
+    /// language attaches no behaviour to an annotation, which writes them as `_T{n}` slots in the
+    /// lines above ([`type_slot`]).
+    ///
+    /// A statement line used to carry two facts at once — what the statement does and which types
+    /// its annotations name — so a changed annotation made the whole line a different unit, and two
+    /// near-copies typed differently shared nothing on their signature. Erasing the types instead
+    /// threw away the agreement of two copies that do share them, which was often most of what they
+    /// shared. Reported apart, each is its own fact: the statement agrees whatever the types, and the
+    /// engine weighs a shared type as shared vocabulary and a different one at its own weight.
+    pub type_refs: Vec<String>,
+    /// The sub-expressions of the lines above — every call, attribute chain, subscript, operator
+    /// application, comprehension, lambda and display the statements contain, rendered the same way
+    /// the lines are, each with the index (into `type3_lines`) of the line it sits in. Empty for a
+    /// frontend that reports only lines.
+    ///
+    /// A line is one unit, so a near-copy that differs by one token inside a long statement loses
+    /// the whole statement's agreement at once, and in a short function that is most of it. The
+    /// sub-expressions are the parts of that statement the edit did not touch: through them two
+    /// lines agree *in part*, on everything but the subtrees the token sits in. This is the
+    /// characteristic-vector idea of DECKARD (Jiang et al. 2007) and the path-context idea of
+    /// code2vec (Alon et al. 2019), taken at the granularity a bag-of-units measure can use.
+    pub type3_units: Vec<(u32, String)>,
     /// Every statement of the body at every nesting level, in source order — a *different* unit
     /// from [`Self::type3_lines`], which each frontend shingles as suits the Type-3 pass. Empty
     /// when the frontend does not walk statements. Rides to the engine as
@@ -30,14 +53,23 @@ pub struct AnalyzedFn {
 }
 
 impl AnalyzedFn {
-    /// Build one from the four fields every frontend already had, with no statement stream.
+    /// Build one from the four fields every frontend already had, with no statement stream and no
+    /// sub-expression units.
     ///
     /// The honest constructor for a frontend that has not yet been taught to walk statements: it
     /// says "nothing to report" rather than fabricating a flat stream, and every pass reading them
     /// is self-gating on the empty vector.
     #[must_use]
     pub fn flat(cluster_canonical: String, xname_canonical: String, type3_lines: Vec<String>, size: usize) -> Self {
-        Self { cluster_canonical, xname_canonical, type3_lines, statements: Vec::new(), size }
+        Self {
+            cluster_canonical,
+            xname_canonical,
+            type3_lines,
+            type_refs: Vec::new(),
+            type3_units: Vec::new(),
+            statements: Vec::new(),
+            size,
+        }
     }
 }
 
@@ -73,5 +105,30 @@ pub fn alpha_rename(map: &mut HashMap<String, u32>, locals: Option<&HashSet<Stri
         }
     }
     name.to_owned()
+}
+
+/// The spelling every name-agnostic canonical gives a renamed **type reference**: `_T{n}`.
+pub const TYPE_SLOT_PREFIX: &str = "_T";
+
+/// Rename a type reference to its `_T{n}` slot, stable within one definition — the type-position
+/// counterpart of [`alpha_rename`].
+///
+/// Why types are renamed at all: a Type-2 clone is *syntactically identical except for variations in
+/// identifiers, literals and types* (Roy, Cordy & Koschke, 2009). Keeping the annotations verbatim
+/// made two bodies that agree line for line, and differ only in the declared type of their argument,
+/// two different canonicals — so neither the exact pass nor the near-copy pass saw them.
+///
+/// Renamed **consistently** rather than erased, which is parameterized matching (Baker, 1995): two
+/// definitions agree only if one bijection maps the types of the first onto the types of the second,
+/// so `f(a: X, b: X)` and `f(a: X, b: Y)` stay apart. Only frontends whose language attaches no
+/// behaviour to an annotation may call this; where types select behaviour, renaming them would merge
+/// definitions that run differently.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // a def's distinct type-reference count is far below u32::MAX
+#[allow(clippy::implicit_hasher)] // always called with the frontends' std-hasher maps
+pub fn type_slot(map: &mut HashMap<String, u32>, name: &str) -> String {
+    let next = map.len() as u32;
+    let slot = *map.entry(name.to_owned()).or_insert(next);
+    format!("{TYPE_SLOT_PREFIX}{slot}")
 }
 

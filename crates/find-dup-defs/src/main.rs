@@ -129,6 +129,13 @@ struct Cli {
     /// ordering exists to push away, not a set of weaker findings.
     #[arg(long, default_value_t = find_dup_defs::DEFAULT_CONVERGE_TOP)]
     converge_top: usize,
+    /// Run the decisions pass: **one decision written in several places** — definitions that test
+    /// the same facts however differently they are written (one raises where another returns, one
+    /// filters a loop where another refuses a request). Off by default and always advisory. Its cut
+    /// is learned, not set: a pair is reported when it outweighs the strongest pair a scrambled copy
+    /// of the corpus produces. Works for every language whose frontend fills `Facets::decides`.
+    #[arg(long)]
+    decisions: bool,
     /// Patternology structural-cosine detection floor (whole-function family edge when cosine ≥ this).
     /// Structural similarity is noisier than textual, so the floor sits higher than `--type3-theta`.
     /// Families are maximal cliques (every pair ≥ this), so a moderate floor is safe — no blob.
@@ -207,6 +214,41 @@ fn apply_setting(opts: &mut PipelineOpts, key: &str, value: &str) {
                 std::process::exit(2);
             };
             opts.converge_cap = n.max(2);
+        }
+        // The decisions pass's false-discovery rate: the share of its findings the reader accepts
+        // being chance.
+        "decision-fdr" => {
+            match value.parse::<f64>() {
+                Ok(rate) if rate > 0.0 && rate < 1.0 => opts.decision.fdr = rate,
+                _ => {
+                    eprintln!("find-dup-defs: settings:decision-fdr expects a rate in (0, 1), got {value:?}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        // Which statistic weighs a pair under the decisions pass's null: `surprise` (default) or the
+        // literature's `count`.
+        "decision-statistic" => {
+            opts.decision.statistic = match value.trim() {
+                "surprise" => find_dup_defs::decide::Statistic::Surprise,
+                "count" => find_dup_defs::decide::Statistic::Count,
+                other => {
+                    eprintln!("find-dup-defs: settings:decision-statistic expects surprise or count, got {other:?}");
+                    std::process::exit(2);
+                }
+            };
+        }
+        // Read the corpus as a closed world for the decisions pass: a parameter every visible call
+        // fills alike is that value. An assumption about the corpus, so it is asked for by name.
+        "decision-closed-world" => {
+            opts.decision.closed_world = match value.trim() {
+                "on" | "true" | "yes" | "1" => true,
+                "off" | "false" | "no" | "0" => false,
+                other => {
+                    eprintln!("find-dup-defs: settings:decision-closed-world expects on or off, got {other:?}");
+                    std::process::exit(2);
+                }
+            };
         }
         "max-name-group" => {
             let Ok(n) = value.parse::<usize>() else {
@@ -368,16 +410,19 @@ fn render_bench(spec: &str, findings: &[Finding], selected: &[&dyn Frontend], cl
 
 /// Loop `type3_clusters` over snapshot inputs and report min/median (ms). Driven by
 /// `FDD_BENCH=type3:<iters>` + `FDD_SNAPSHOT=<dir>`. Dev-only perf scaffolding.
-fn type3_bench(spec: &str, line_lists: &[Vec<String>], names: &[String], cli: &Cli) {
+fn type3_bench(spec: &str, input: &find_dup_defs::Type3Input, cli: &Cli) {
     let iters = spec.split_once(':').and_then(|(_, n)| n.parse().ok()).unwrap_or(5usize).max(1);
-    let lists: Vec<&[String]> = line_lists.iter().map(Vec::as_slice).collect();
-    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let lists: Vec<&[String]> = input.line_lists.iter().map(Vec::as_slice).collect();
+    let parts: Vec<&[(u32, String)]> = input.part_lists.iter().map(Vec::as_slice).collect();
+    let names: Vec<&str> = input.names.iter().map(String::as_str).collect();
+    let prepared = find_dup_defs::type3::Prepared::new(&lists, &parts);
     let mut ms: Vec<f64> = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = std::time::Instant::now();
         let r = find_dup_defs::type3::type3_clusters(
-            &lists,
+            &prepared,
             &names,
+            &input.owners,
             cli.type3_theta,
             difflib_fast::Concurrency::Cpu,
         );
@@ -466,6 +511,9 @@ fn main() {
         converge_top: cli.converge_top,
         // Directive-only (`-D settings:converge-cap=N`).
         converge_cap: find_dup_defs::converge::SEED_CAP,
+        decisions: cli.decisions,
+        // Directive-only (`-D settings:decision-fdr=…`, `-D settings:decision-statistic=…`).
+        decision: find_dup_defs::decide::DecisionOpts::default(),
         pattern_theta: cli.pattern_theta,
         pattern_support: cli.pattern_support,
         // No CLI flag — directive-only (`-D settings:pattern-min-thickness=…`), applied below via
@@ -494,8 +542,8 @@ fn main() {
             let findings = snapshot::load_findings(&dir).expect("load findings.json");
             render_bench(&spec, &findings, &selected, &cli);
         } else if spec.starts_with("type3") {
-            let (line_lists, names) = snapshot::load_type3(&dir).expect("load type3.json");
-            type3_bench(&spec, &line_lists, &names, &cli);
+            let input = snapshot::load_type3(&dir).expect("load type3.json");
+            type3_bench(&spec, &input, &cli);
         } else {
             let defs = snapshot::load_defs(&dir).expect("load defs.json");
             phase_bench(&spec, &defs, &opts);
@@ -509,17 +557,17 @@ fn main() {
     // Dump the scanned defs for snapshot benches (see the FDD_SNAPSHOT path above).
     // Cheap: dump just the Type-3 inputs (scan → dump → exit), no 2.6GB defs.json.
     if let Ok(dir) = std::env::var("FDD_DUMP_T3") {
-        let (ll, nm) = find_dup_defs::type3_inputs(&defs);
-        snapshot::dump_type3(std::path::Path::new(&dir), &ll, &nm).expect("dump type3");
-        eprintln!("[dump] type3 → {dir}/type3.json ({} fns)", nm.len());
+        let input = find_dup_defs::type3_inputs(&defs);
+        snapshot::dump_type3(std::path::Path::new(&dir), &input).expect("dump type3");
+        eprintln!("[dump] type3 → {dir}/type3.json ({} fns)", input.names.len());
         return;
     }
     if let Ok(dir) = std::env::var("FDD_DUMP") {
         snapshot::dump_defs(std::path::Path::new(&dir), &defs).expect("dump defs");
         eprintln!("[dump] defs → {dir}/defs.json ({} defs)", defs.len());
-        let (ll, nm) = find_dup_defs::type3_inputs(&defs);
-        snapshot::dump_type3(std::path::Path::new(&dir), &ll, &nm).expect("dump type3");
-        eprintln!("[dump] type3 → {dir}/type3.json ({} fns)", nm.len());
+        let input = find_dup_defs::type3_inputs(&defs);
+        snapshot::dump_type3(std::path::Path::new(&dir), &input).expect("dump type3");
+        eprintln!("[dump] type3 → {dir}/type3.json ({} fns)", input.names.len());
     }
     // Focused phase micro-bench on freshly-scanned defs (no snapshot): `FDD_BENCH=pass1:5` etc.
     // `scan:N` re-runs the whole collect_defs (read + parse + canon) N times for profiling.
@@ -579,7 +627,7 @@ fn main() {
             section_index(a)
                 .cmp(&section_index(b))
                 .then_with(|| {
-                    if a.pass.starts_with("converge") {
+                    if a.pass.starts_with("converge") || a.pass.starts_with("decision") {
                         b.thickness.partial_cmp(&a.thickness).unwrap_or(std::cmp::Ordering::Equal)
                     } else {
                         std::cmp::Ordering::Equal
@@ -1639,6 +1687,7 @@ fn report_sections(
     error: f64,
     include_patterns: bool,
     include_converge: bool,
+    include_decisions: bool,
     scan_opts: &dup_defs_core::ScanOpts,
 ) -> Vec<(usize, String)> {
     let sim = format!("AST sim warn={warn} error={error}");
@@ -1674,6 +1723,16 @@ fn report_sections(
                     format!("families of {} (converge — many places, one subject, one shape)", k.noun_plural),
                 ));
             }
+            if include_decisions {
+                rows.push((
+                    base + find_dup_defs::decide::DECISION_SECTION_OFFSET,
+                    format!("decisions in {} (one decision, written in two places)", k.noun_plural),
+                ));
+                rows.push((
+                    base + find_dup_defs::decide::DECISION_FAMILY_SECTION_OFFSET,
+                    format!("decision families in {} (one decision, written in many places)", k.noun_plural),
+                ));
+            }
         }
     }
     rows.sort_by_key(|(idx, _)| *idx);
@@ -1691,7 +1750,9 @@ fn format_report(
 ) -> String {
     let include_patterns = findings.iter().any(|f| f.pass == "pattern");
     let include_converge = findings.iter().any(|f| f.pass == "converge" || f.pass == "converge-family");
-    let sections = report_sections(frontends, warn, error, include_patterns, include_converge, scan_opts);
+    let include_decisions = findings.iter().any(|f| f.pass.starts_with("decision"));
+    let sections =
+        report_sections(frontends, warn, error, include_patterns, include_converge, include_decisions, scan_opts);
 
     let pathmap = report_paths(findings.iter().copied(), repo_root);
 

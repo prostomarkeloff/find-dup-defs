@@ -1,0 +1,32 @@
+--- duplicate constants (cross-file, by name) ---
+
+--- duplicate functions (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate functions (cross-name, exact AST-normalized) ---
+
+--- duplicate functions (cross-name Type-3, IDF-weighted cosine) ---
+
+--- duplicate methods (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate methods (cross-name, exact AST-normalized) ---
+
+--- duplicate methods (cross-name Type-3, IDF-weighted cosine) ---
+
+--- duplicate classes (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate interfaces (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate type aliases (cross-file, by name) ---
+
+--- decisions in functions (one decision, written in two places) ---
+DUPLICATE FUNCTION [INFO]: offers / refuse  [T=0.00, n=2, loc=7, args=1]  votes[2]: decides×2 members×2  # decide on 2 shared fact(s), 0.89 expected by chance; surprise 14.9 nats (null mean 0.8); p = 4.9e-5 under the bipartite configuration model, Benjamini–Hochberg cut 5.1e-5 at FDR 0.05 over 990 pairs;   · @app.models.Status.OPEN = _.status;   · ? _.paid
+  py/app/catalog.py:4
+  py/app/orders.py:12
+
+
+--- decisions in methods (one decision, written in two places) ---
+
+--- decision families in functions (one decision, written in many places) ---
+
+--- decision families in methods (one decision, written in many places) ---
+# summary: 0 ERROR, 1 WARNING groups
