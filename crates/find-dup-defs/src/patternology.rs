@@ -3426,7 +3426,8 @@ mod tests {
         let asy = "AsyncFunctionDef('_fn', arguments([], [arg('_v0', Name('S'))]), [Expr(Constant('a]b')), Return(Name('_v0'))], [], None)";
         assert_eq!(py_parse_function_body(asy), function_body(&parse_term(asy)));
         // Non-FunctionDef → empty, just like `function_body`.
-        assert!(py_parse_function_body("Module([Pass])").is_empty());
+        let not_a_function = py_parse_function_body("Module([Pass])");
+        assert!(not_a_function.is_empty(), "a non-FunctionDef has no body to parse, got: {not_a_function:?}");
     }
 
     #[test]

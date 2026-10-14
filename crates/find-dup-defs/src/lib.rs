@@ -1470,7 +1470,11 @@ mod type3_tests {
             def("from_refresh", "def from_refresh(p: Refresh) -> int | None:\n    v = p.get('uid')\n    if isinstance(v, int):\n        return v\n    return None\n"),
         ];
         corpus(&mut defs);
-        assert!(defs[0].analysis.as_ref().map(|a| &a.xname_canonical) == defs[1].analysis.as_ref().map(|a| &a.xname_canonical));
+        assert_eq!(
+            defs[0].analysis.as_ref().map(|a| &a.xname_canonical),
+            defs[1].analysis.as_ref().map(|a| &a.xname_canonical),
+            "the two canonicals agree"
+        );
         assert!(pairs(&defs).is_empty(), "equal canonicals are the cross-name pass's finding");
     }
 
@@ -1511,6 +1515,6 @@ mod type3_tests {
             def("rows_b", "def rows_b(self) -> list[tuple[Row, ...]]:\n    return self.items\n"),
         ];
         corpus(&mut defs);
-        assert!(pairs(&defs).is_empty());
+        assert!(pairs(&defs).is_empty(), "one interface over two different steps is not one definition written twice");
     }
 }

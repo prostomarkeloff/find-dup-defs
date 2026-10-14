@@ -2829,7 +2829,8 @@ mod tests {
             "node tags are grammar, the quoted identifier is the name"
         );
         // A quoted run that is not identifier-shaped is a message, whichever dialect wrote it.
-        assert!(names("Str('failed to reach {}')", Vocab::SExpr).is_empty());
+        let message = names("Str('failed to reach {}')", Vocab::SExpr);
+        assert!(message.is_empty(), "a message is not a name: {message:?}");
     }
 
     fn graph(edges: &[(u32, u32)]) -> HashMap<u32, HashSet<u32>> {
@@ -2895,7 +2896,7 @@ mod tests {
     fn two_definitions_sharing_nothing_are_not_a_finding() {
         let a = def("a", "one.py", &body(&[("_v1 = alpha(_v0)", 1), ("return _v1", 1)]), &[]);
         let b = def("b", "two.py", &body(&[("_v1 = beta(_v0)", 1), ("raise Boom", 1)]), &[]);
-        assert!(pass_converge(&[a, b], 0, super::SEED_CAP).is_empty());
+        assert!(pass_converge(&[a, b], 0, super::SEED_CAP).is_empty(), "no shared statement, no shared subject: nothing to diverge from");
     }
 
     #[test]
@@ -2943,6 +2944,6 @@ mod tests {
     #[test]
     fn a_definition_does_not_diverge_from_itself() {
         let a = def("a", "one.py", &body(&[("_v1 = f(_v0)", 1), ("_v1 = f(_v0)", 1), ("return _v1", 1)]), &[]);
-        assert!(pass_converge(&[a], 0, super::SEED_CAP).is_empty());
+        assert!(pass_converge(&[a], 0, super::SEED_CAP).is_empty(), "a repeated statement inside one body is not a pair");
     }
 }

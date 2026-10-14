@@ -723,9 +723,9 @@ mod tests {
         let file: Arc<str> = Arc::from("<test>");
         let defs = scan_source(src, &file, &ScanOpts::default());
         let h = defs.iter().find(|d| d.name == "h").expect("h");
-        assert!(h.facets.reaches.is_empty());
+        assert!(h.facets.reaches.is_empty(), "nothing imported, yet it reaches: {:?}", h.facets.reaches);
         // Empty reach is not empty facets: the stream is still there.
-        assert!(!h.facets.statements.is_empty());
+        assert!(!h.facets.statements.is_empty(), "an empty reach must not empty the statement stream");
     }
 
     #[test]

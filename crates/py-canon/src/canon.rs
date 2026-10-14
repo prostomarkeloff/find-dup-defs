@@ -2881,7 +2881,8 @@ mod import_tests {
 
     #[test]
     fn star_binds_no_name_to_attribute_a_use_to() {
-        assert!(pairs("from a.b import *\n").is_empty());
+        let bound = pairs("from a.b import *\n");
+        assert!(bound.is_empty(), "a star import binds no name, got: {bound:?}");
     }
 
     #[test]
@@ -2896,7 +2897,8 @@ mod import_tests {
 
     #[test]
     fn unparsable_source_yields_nothing_rather_than_panicking() {
-        assert!(pairs("def (:\n").is_empty());
+        let bound = pairs("def (:\n");
+        assert!(bound.is_empty(), "unparsable source binds nothing, got: {bound:?}");
     }
 }
 

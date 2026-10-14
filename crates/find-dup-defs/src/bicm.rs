@@ -354,7 +354,7 @@ impl Surprise {
                 break;
             }
         }
-        let mut theta = 0.5 * (lo + hi);
+        let mut theta = lo.midpoint(hi);
         for _ in 0..200 {
             let (_, k1, k2) = self.cgf(theta);
             // Converged is checked before stepping: at the root a Newton step lands on the bracket
@@ -368,7 +368,7 @@ impl Surprise {
                 hi = theta;
             }
             let newton = theta - (k1 - w) / k2;
-            theta = if newton > lo && newton < hi && k2 > 0.0 { newton } else { 0.5 * (lo + hi) };
+            theta = if newton > lo && newton < hi && k2 > 0.0 { newton } else { lo.midpoint(hi) };
         }
         theta
     }
@@ -402,7 +402,7 @@ impl Surprise {
             }
         }
         for _ in 0..100 {
-            let mid = 0.5 * (lo + hi);
+            let mid = lo.midpoint(hi);
             if self.tail_at(mid).0 > alpha {
                 lo = mid;
             } else {

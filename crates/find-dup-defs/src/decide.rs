@@ -833,13 +833,15 @@ mod tests {
             callable("one", &[], &[], vec![call("@app.helper", &[(None, "@app.cfg.on")])], &[]),
             callable("two", &[], &[], vec![call("@app.helper", &[(None, "@app.cfg.off")])], &[]),
         ];
-        assert!(atoms_of(&differ, true, "helper").is_empty());
+        let inferred = atoms_of(&differ, true, "helper");
+        assert!(inferred.is_empty(), "callers disagree on the argument, yet it inferred: {inferred:?}");
         let escapes = vec![
             callable("helper", &["? $flag"], &["flag"], Vec::new(), &[]),
             callable("one", &[], &[], vec![call("@app.helper", &[(None, "@app.cfg.on")])], &[]),
             callable("registry", &[], &[], Vec::new(), &["@app.helper"]),
         ];
-        assert!(atoms_of(&escapes, true, "helper").is_empty());
+        let inferred = atoms_of(&escapes, true, "helper");
+        assert!(inferred.is_empty(), "the callable escapes into a registry, yet it inferred: {inferred:?}");
     }
 
     #[test]
@@ -865,7 +867,7 @@ mod tests {
         // `offer` does not test the fact nearly every definition tests, so the five rare facts it
         // shares with `refuse` are, by count, not far from what the null expects any pair to share —
         // the rarity that makes them evidence is exactly what a count throws away.
-        assert!(pass_decisions(&corpus(), &[], &opts(Statistic::Count)).is_empty());
+        assert!(pass_decisions(&corpus(), &[], &opts(Statistic::Count)).is_empty(), "by count the rare facts are not evidence");
     }
 
     #[test]
@@ -875,7 +877,7 @@ mod tests {
         for f in &mut already {
             f.pass = "type-3";
         }
-        assert!(pass_decisions(&defs, &already, &opts(Statistic::Surprise)).is_empty());
+        assert!(pass_decisions(&defs, &already, &opts(Statistic::Surprise)).is_empty(), "a pair the body pass already holds is not reported twice");
     }
 
     #[test]
