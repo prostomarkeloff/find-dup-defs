@@ -47,6 +47,10 @@ pub enum CanonDialect {
     /// The Rust frontend's `syn`-derived structural dump (`Func`/`Block`/`Let`/`Method`/… tags) —
     /// the patternology engine has a `RustDialect` for it.
     Rust,
+    /// The Go frontend's tree-sitter-derived structural dump. It speaks the Rust dump's tags wherever
+    /// the construct is the same one (`Func`/`Block`/`Let`/`Method`/…) and adds Go's own
+    /// (`Switch`/`Select`/`Defer`/`Composite`/…), so the s-expr readers take it as they take Rust's.
+    Go,
     /// The TypeScript frontend's `oxc`-derived structural dump (`Func`/`Block`/`Var`/`Call`/… tags)
     /// — the patternology engine has a `TsDialect` for it. (Also the catch-all for any future
     /// frontend whose canonical the dialect-specific passes don't yet recognize.)

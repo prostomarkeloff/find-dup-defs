@@ -23,6 +23,8 @@ py-canon = { path = "../py-canon", version = "0.6.0" }
 ts-canon = { path = "../ts-canon", version = "0.3.0" }
 # Rust frontend — same contract as `py-canon`/`ts-canon`, over the `syn` parser.
 rs-canon = { path = "../rs-canon", version = "0.3.0" }
+# Go frontend — same contract, over the tree-sitter Go grammar.
+go-canon = { path = "../go-canon", version = "0.1.0" }
 # exact difflib Ratcliff–Obershelp ratio + clustering + exact weighted-cosine similarity join
 # (simjoin) — https://crates.io/crates/difflib-fast
 difflib-fast = "0.4"
