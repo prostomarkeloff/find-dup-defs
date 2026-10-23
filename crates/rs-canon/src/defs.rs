@@ -86,6 +86,8 @@ fn def_range(source: &str, attrs: &[Attribute], span: proc_macro2::Span) -> (usi
 fn is_trivial_block(block: &Block) -> bool {
     block.stmts.iter().all(|s| match s {
         Stmt::Expr(e, _) => is_trivial_expr(e),
+        // `todo!();` is the stub `todo!()` is, with a semicolon.
+        Stmt::Macro(m) => is_trivial_macro(&m.mac),
         _ => false,
     })
 }
@@ -93,6 +95,9 @@ fn is_trivial_block(block: &Block) -> bool {
 fn is_trivial_expr(e: &Expr) -> bool {
     match e {
         Expr::Lit(_) => true,
+        // `match *self {}` — the body a trait method gets on an uninhabited type (`Infallible`, an
+        // empty enum): there is no value to run it on, the `unreachable!()` the type system writes.
+        Expr::Match(m) => m.arms.is_empty(),
         // A bare path (`x`, `self`, `None`) — single segment, no leading `::`.
         Expr::Path(p) => p.qself.is_none() && p.path.segments.len() == 1 && p.path.leading_colon.is_none(),
         Expr::Macro(m) => is_trivial_macro(&m.mac),
@@ -125,6 +130,19 @@ fn type_name(ty: &Type) -> String {
         Type::Reference(r) => type_name(&r.elem),
         _ => "<ty>".to_owned(),
     }
+}
+
+/// True when an attribute hands the function to something that calls it — a test harness, a runtime,
+/// a router — so the calls the corpus shows are not all the calls there are.
+fn registered(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|a| {
+        let name = a.path().segments.last().map(|s| s.ident.to_string()).unwrap_or_default();
+        !matches!(
+            name.as_str(),
+            "doc" | "inline" | "allow" | "warn" | "deny" | "forbid" | "expect" | "cfg" | "cfg_attr" | "must_use"
+                | "cold" | "track_caller" | "deprecated" | "skip" | "automatically_derived"
+        )
+    })
 }
 
 fn qualify(prefix: &str, name: &str) -> String {
@@ -189,6 +207,30 @@ fn reached_paths(block: &syn::Block, imports: &HashMap<String, Arc<str>>) -> Vec
     out
 }
 
+/// One callable as the decisions pass reads it (see [`crate::decides`]), with its identity: what the
+/// corpus's calls name it by. `prefix` is the inline module it stands in, `self_ty` what `Self`
+/// names; `open` — reached by calls the corpus cannot show.
+#[allow(clippy::too_many_arguments)] // each is a different fact about the one definition
+fn decided(
+    canon: &mut DefCanon,
+    scope: &crate::decides::FileScope,
+    prefix: &str,
+    name: &str,
+    sig: &Signature,
+    block: &Block,
+    self_ty: Option<&str>,
+    open: bool,
+) {
+    let read = crate::decides::decides(sig, block, scope, &scope.here(prefix), self_ty, open);
+    let facets = &mut canon.facets;
+    facets.decides = read.atoms;
+    facets.identity = Some(scope.identity(name));
+    facets.params = read.params;
+    facets.calls = read.calls;
+    facets.mentions = read.mentions;
+    facets.loose_keywords = read.loose;
+}
+
 /// One builder so every push site stays uniform.
 struct Builder<'a> {
     source: &'a str,
@@ -200,6 +242,8 @@ struct Builder<'a> {
     lenses: Vec<dup_defs_core::lens::Lens>,
     /// Names the file itself introduced — what every lens erases before it looks.
     file_names: std::collections::HashSet<String>,
+    /// What the file's names stand for, as the decisions pass writes them.
+    decides: crate::decides::FileScope,
     out: &'a mut Vec<Def>,
 }
 
@@ -278,10 +322,12 @@ fn walk_item(item: &Item, prefix: &str, b: &mut Builder) {
                     crate::lenses::callable_facts(&f.sig, &f.block, &f.attrs, &b.file_names, scope);
                 b.push_lens(&qualify(prefix, &f.sig.ident.to_string()), &f.attrs, f.span(), &facts);
             }
-            let canon = DefCanon::callable(analyze_item_fn(f), &f.block, &b.imports);
+            let name = qualify(prefix, &f.sig.ident.to_string());
+            let mut canon = DefCanon::callable(analyze_item_fn(f), &f.block, &b.imports);
+            decided(&mut canon, &b.decides, prefix, &name, &f.sig, &f.block, None, registered(&f.attrs));
             b.push(
                 &FUNCTIONS,
-                qualify(prefix, &f.sig.ident.to_string()),
+                name,
                 &f.attrs,
                 f.span(),
                 count_args(&f.sig),
@@ -293,7 +339,16 @@ fn walk_item(item: &Item, prefix: &str, b: &mut Builder) {
                 let facts = crate::lenses::struct_facts(s, &b.file_names);
                 b.push_lens(&qualify(prefix, &s.ident.to_string()), &s.attrs, s.span(), &facts);
             }
-            b.push(&CLASSES, qualify(prefix, &s.ident.to_string()), &s.attrs, s.span(), 0, DefCanon::body(Some(struct_canon(s))));
+            let name = qualify(prefix, &s.ident.to_string());
+            let mut canon = DefCanon::body(Some(struct_canon(s)));
+            // A struct is a record: its literal is a constructor, called with every field by name.
+            canon.facets.identity = Some(b.decides.identity(&name));
+            if prefix.is_empty() {
+                if let Some(fields) = b.decides.record(&s.ident.to_string()) {
+                    canon.facets.params = fields.iter().map(|(f, _)| Arc::from(f.as_str())).collect();
+                }
+            }
+            b.push(&CLASSES, name, &s.attrs, s.span(), 0, canon);
         }
         Item::Enum(e) => {
             if !b.lenses.is_empty() {
@@ -320,11 +375,14 @@ fn walk_item(item: &Item, prefix: &str, b: &mut Builder) {
                             crate::lenses::callable_facts(&tf.sig, body, &tf.attrs, &b.file_names, scope);
                         b.push_lens(&format!("{owner}::{}", tf.sig.ident), &tf.attrs, tf.span(), &facts);
                     }
-                    let canon =
+                    let name = format!("{owner}::{}", tf.sig.ident);
+                    let mut canon =
                         DefCanon::callable(analyze_trait_fn(tf).expect("has a default body"), body, &b.imports);
+                    // A trait's method is called through the trait, by whatever holds an implementor.
+                    decided(&mut canon, &b.decides, prefix, &name, &tf.sig, body, None, true);
                     b.push(
                         &METHODS,
-                        format!("{owner}::{}", tf.sig.ident),
+                        name,
                         &tf.attrs,
                         tf.span(),
                         count_args(&tf.sig),
@@ -334,7 +392,8 @@ fn walk_item(item: &Item, prefix: &str, b: &mut Builder) {
             }
         }
         Item::Impl(im) => {
-            let owner = qualify(prefix, &type_name(&im.self_ty));
+            let self_ty = type_name(&im.self_ty);
+            let owner = qualify(prefix, &self_ty);
             for ii in &im.items {
                 if let ImplItem::Fn(f) = ii {
                     if is_trivial_block(&f.block) {
@@ -346,10 +405,13 @@ fn walk_item(item: &Item, prefix: &str, b: &mut Builder) {
                             crate::lenses::callable_facts(&f.sig, &f.block, &f.attrs, &b.file_names, scope);
                         b.push_lens(&format!("{owner}::{}", f.sig.ident), &f.attrs, f.span(), &facts);
                     }
-                    let canon = DefCanon::callable(analyze_impl_fn(f), &f.block, &b.imports);
+                    let name = format!("{owner}::{}", f.sig.ident);
+                    let mut canon = DefCanon::callable(analyze_impl_fn(f), &f.block, &b.imports);
+                    let open = im.trait_.is_some() || registered(&f.attrs);
+                    decided(&mut canon, &b.decides, prefix, &name, &f.sig, &f.block, Some(&self_ty), open);
                     b.push(
                         &METHODS,
-                        format!("{owner}::{}", f.sig.ident),
+                        name,
                         &f.attrs,
                         f.span(),
                         count_args(&f.sig),
@@ -397,6 +459,7 @@ pub fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec<Def> {
         imports,
         lenses,
         file_names: file_names.unwrap_or_default(),
+        decides: crate::decides::FileScope::new(file, &ast),
         out: &mut out,
     };
     walk_items(&ast.items, "", &mut b);
@@ -486,11 +549,39 @@ mod tests {
         let d = defs.iter().find(|d| d.name == "f").expect("f");
         let depths: Vec<u16> = d.facets.statements.iter().map(|s| s.depth).collect();
         // Header at 0, body at 1, and the call inside the loop at 2. Rust's control flow is
-        // expressions, so this is exactly the structure `type3_lines` cannot show: there the whole
-        // `for` — loop and body together — is one line.
+        // expressions, so the walk descends into them rather than reading the whole `for` — loop
+        // and body together — as one line.
         assert_eq!(depths, vec![0, 1, 2, 1], "statements: {:?}", d.facets.statements);
         assert!(d.facets.statements[0].line.starts_with("Func("), "the head is the definition itself");
         assert!(d.facets.statements[1].line.starts_with("For("), "the loop contributes a header");
+    }
+
+    #[test]
+    fn the_type3_lines_are_the_stream_and_their_parts_are_units() {
+        // An edit inside a loop costs the statement it touched, not the loop; and the header leads,
+        // because the Type-3 pass reads every function's first line as its interface.
+        // Written in its normal form (`0 < r.v`, not `r.v > 0`), so the lines and the stream agree.
+        let src = "fn f(rows: &[Row]) -> usize {\n    for r in rows {\n        if r.ok && 0 < r.v {\n            out.push(r.render(true));\n        }\n    }\n    0\n}\n";
+        let f: Arc<str> = Arc::from("t.rs");
+        let defs = scan_source(src, &f, &ScanOpts::default());
+        let d = defs.iter().find(|d| d.name == "f").expect("f");
+        let a = d.analysis.as_ref().expect("analysis");
+        let stream: Vec<&str> = d.facets.statements.iter().map(|s| s.line.as_str()).collect();
+        // The body is the stream's; the header is written the way the Python frontend writes its
+        // own, the types as slots and reported apart — while the stream keeps them as spelled.
+        assert_eq!(a.type3_lines[1..].iter().map(String::as_str).collect::<Vec<_>>(), stream[1..]);
+        assert_eq!(a.type3_lines[0], "fn _fn(_v0: TyRef('', TySlice(Ty(_T0, )))) -> Ty(_T1, )");
+        assert_eq!(a.type_refs, ["Row", "usize"]);
+        assert!(stream[0].contains("Ty('Row', )"), "{stream:?}");
+        let units_of = |line: u32| -> Vec<&str> {
+            a.type3_units.iter().filter(|(l, _)| *l == line).map(|(_, u)| u.as_str()).collect()
+        };
+        // The `if` header: the comparison and the field reads are parts; the whole test is the line.
+        let test_parts = units_of(2);
+        assert!(test_parts.iter().any(|u| u.starts_with("Bin(Int('0'), '<', Field(")), "{test_parts:?}");
+        assert!(!test_parts.iter().any(|u| u.contains("'&&'")), "the test itself is the line: {test_parts:?}");
+        // The push: the inner method call is a part of the push's own line.
+        assert!(units_of(3).iter().any(|u| u.starts_with("Method(Path('_v1'), 'render'")), "{:?}", units_of(3));
     }
 
     #[test]
@@ -665,5 +756,82 @@ fn real(x: i32) -> i32 { let y = x + 1; y * 2 }
             free.analysis.as_ref().map(|a| &a.xname_canonical),
             "method (receiver-stripped) should alpha-equal the free fn"
         );
+    }
+}
+
+#[cfg(test)]
+mod type_slot_tests {
+    use super::scan_source;
+    use dup_defs_core::{Analysis, ScanOpts};
+    use std::sync::Arc;
+
+    fn analysis(src: &str, name: &str) -> Analysis {
+        let f: Arc<str> = Arc::from("t.rs");
+        scan_source(src, &f, &ScanOpts::default())
+            .into_iter()
+            .find(|d| d.name == name)
+            .and_then(|d| d.analysis)
+            .expect(name)
+    }
+
+    #[test]
+    fn the_exact_canonical_keeps_types_the_near_copy_lines_slot_them() {
+        // A Rust type picks the code that runs, so the exact pass keeps `Token` and `Claims` apart;
+        // the near-copy lines read them as vocabulary, so the bodies agree line for line.
+        let a = analysis("fn f(p: Token) -> Option<u32> { let v = p.get(\"uid\"); v }\n", "f");
+        let b = analysis("fn g(q: Claims) -> Option<u32> { let v = q.get(\"uid\"); v }\n", "g");
+        assert_ne!(a.xname_canonical, b.xname_canonical);
+        assert_eq!(a.type3_lines, b.type3_lines);
+        assert_eq!(a.type_refs, ["Token", "Option", "u32"]);
+    }
+
+    #[test]
+    fn a_declared_type_parameter_is_bound_not_vocabulary() {
+        let a = analysis("fn first<T: Clone>(items: &[T]) -> T { items[0].clone() }\n", "first");
+        assert_eq!(a.type_refs, Vec::<String>::new());
+        assert!(a.type3_lines[0].starts_with("fn _fn<_T0>("), "{:?}", a.type3_lines[0]);
+    }
+}
+
+#[cfg(test)]
+mod macro_tests {
+    use super::scan_source;
+    use dup_defs_core::ScanOpts;
+    use std::sync::Arc;
+
+    fn names(src: &str) -> Vec<String> {
+        let f: Arc<str> = Arc::from("t.rs");
+        scan_source(src, &f, &ScanOpts::default()).into_iter().map(|d| d.name).collect()
+    }
+
+    fn xname(src: &str, name: &str) -> String {
+        let f: Arc<str> = Arc::from("t.rs");
+        scan_source(src, &f, &ScanOpts::default())
+            .into_iter()
+            .find(|d| d.name == name)
+            .and_then(|d| d.analysis)
+            .map(|a| a.xname_canonical)
+            .expect(name)
+    }
+
+    #[test]
+    fn a_macro_shows_its_arguments() {
+        // Two tests that build different values and assert different things were one canonical
+        // while a macro was its path alone.
+        let a = "fn t1() { let v = Lang(vec![\"fr\".parse().unwrap()]); assert_eq!(v.ranked(), vec![1]); }\n";
+        let b = "fn t2() { let v = Lang(vec![\"de\".parse().unwrap(), \"en\".parse().unwrap()]); assert!(v.ranked().is_empty()); }\n";
+        assert_ne!(xname(a, "t1"), xname(b, "t2"));
+        assert!(xname(a, "t1").contains("Macro('vec', [Method("), "{}", xname(a, "t1"));
+        // A body that is not a list of expressions stays opaque, as it was.
+        let repeat = "fn z(n: usize) -> Vec<u8> { let v = vec![0; n]; v }\n";
+        assert!(xname(repeat, "z").contains("Macro('vec')"), "{}", xname(repeat, "z"));
+    }
+
+    #[test]
+    fn an_empty_match_and_a_stub_statement_are_trivial() {
+        let src = "impl Body for Infallible {\n    fn size(&self) -> BodySize { match *self {} }\n    fn todo(&self) { todo!(); }\n    fn real(&self) -> u8 { self.0 + 1 }\n}\n";
+        let found = names(src);
+        assert!(!found.iter().any(|n| n.ends_with("::size") || n.ends_with("::todo")), "{found:?}");
+        assert!(found.iter().any(|n| n.ends_with("::real")), "{found:?}");
     }
 }

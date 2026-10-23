@@ -103,12 +103,11 @@ pub struct Statement {
 pub struct Facets {
     /// Every statement of the definition, at every nesting level, in source order.
     ///
-    /// 🔴 Deliberately **not** [`Analysis::type3_lines`] with depths bolted on, though on one
-    /// frontend the two happen to coincide. Type-3 shingles are whatever unit that pass counts best
-    /// — Rust emits one line per *top-level* block statement, with a nested `if` inlined whole — and
-    /// tying the statement stream to them would either force a change in an established pass's
-    /// behaviour or leave the other languages with a stream that has no nesting to report.
-    /// Two consumers, two units, no coupling.
+    /// 🔴 Deliberately a field of its own rather than [`Analysis::type3_lines`] with depths bolted on,
+    /// though every frontend writes its Type-3 lines off this same walk. The two readers want
+    /// different things from one statement — the Python Type-3 lines turn the types an annotation
+    /// names into slots, while this stream keeps them as written, because converge parts two
+    /// definitions on the names they use, a type among them. Two consumers, two fields.
     ///
     /// Order and depth together are the point. Flattened, `for x in xs: / f() / g()` reads the same
     /// as the three statements where `g()` runs *after* the loop rather than inside it, and no

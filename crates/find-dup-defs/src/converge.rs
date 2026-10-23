@@ -45,6 +45,9 @@
 //! thing to gate a build on — the pass exists to be read, and a gate that fires on the tail of a
 //! ranking teaches people to ignore it.
 
+use std::cmp::Reverse;
+use std::collections::BTreeSet;
+
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use rayon::prelude::*;
@@ -62,8 +65,9 @@ pub const CONVERGE_SECTION_OFFSET: usize = 2000;
 pub const FAMILY_SECTION_OFFSET: usize = 3000;
 
 /// Below this a group is a pair, and a pair is what the rest of the pass reports. Three is where
-/// "these two" becomes "these all", which is the whole distinction the family rubric exists to draw.
-const MIN_FAMILY: usize = 3;
+/// "these two" becomes "these all", which is the whole distinction the family rubric exists to draw —
+/// the same line the decisions pass draws its families at.
+pub(crate) const MIN_FAMILY: usize = 3;
 
 /// What bounds the report: how many findings of each kind it prints, and how many places a shared
 /// statement may occur in before the pass calls it an idiom.
@@ -735,21 +739,22 @@ fn shape(defs: &[Def]) -> Option<Shaped<'_>> {
     units.dedup();
     let unit_of_occ: Vec<u32> =
         unit_occ.par_iter().map(|u| u32_of(units.binary_search(u).unwrap_or(0))).collect();
-    // One lexing per unit serves all three derivations. The names a KEY spells are the names the
-    // line spells in the source vocabulary and nothing in the s-expr one — normalizing rewrites
-    // slots only, and an s-expr key re-reads its unquoted identifiers as node tags — so they are
-    // read off the same tokens rather than off a re-lexed key.
+    // One lexing per unit serves all three derivations. The names a line spells are its name tokens
+    // in either vocabulary — bare identifiers in the source one, quoted ones in the s-expr one —
+    // read off the line's own tokens rather than off a re-lexed key.
+    //
+    // 🔴 The s-expr vocabulary used to spell no names here. Every rarity a name has comes from these
+    // counts, so on a tree with no source-vocabulary line at all — any pure Rust or TypeScript tree —
+    // the corpus held zero names, every name weighed `rarity(1, 1)`, which is nothing, and every fork
+    // "parted on nothing named". The pass returned no finding on any such tree; it only worked where
+    // Python lines lent the corpus a name total. The anti-unifier already read quoted identifiers as
+    // names, so the forks were always named this way — the corpus now counts the same names.
     let derived: Vec<(String, String, Vec<&str>)> = units
         .par_iter()
         .map(|&(id, vocab)| {
             let line = line_text[id as usize];
             let toks = tokens(line, vocab);
-            let names = match vocab {
-                Vocab::Source => {
-                    toks.iter().filter_map(|tok| if let Tok::Name(n) = tok { Some(*n) } else { None }).collect()
-                }
-                Vocab::SExpr => Vec::new(),
-            };
+            let names = toks.iter().filter_map(|tok| if let Tok::Name(n) = tok { Some(*n) } else { None }).collect();
             (slot_normalize(&toks, line.len()), skeleton(&toks, line.len()), names)
         })
         .collect();
@@ -2158,14 +2163,16 @@ struct Family {
 /// maximal clique rather than *the* largest one answers the question just as well.
 pub(crate) fn clique_cover(vertices: &[u32], edges: &HashMap<u32, HashSet<u32>>) -> Vec<Vec<u32>> {
     let mut unclaimed: HashSet<u32> = vertices.iter().copied().collect();
+    let mut degree: HashMap<u32, usize> = unclaimed
+        .iter()
+        .map(|&v| (v, edges.get(&v).map_or(0, |n| n.iter().filter(|u| unclaimed.contains(u)).count())))
+        .collect();
+    // Seeds by degree among the unclaimed, kept current as members are claimed. Ties break on the
+    // vertex itself, the smallest first: the seed decides the whole clique, and a seed chosen by the
+    // hasher is a family that changes between runs.
+    let mut seeds: BTreeSet<(usize, Reverse<u32>)> = degree.iter().map(|(&v, &d)| (d, Reverse(v))).collect();
     let mut out = Vec::new();
-    while !unclaimed.is_empty() {
-        let degree = |v: u32| edges.get(&v).map_or(0, |n| n.iter().filter(|u| unclaimed.contains(u)).count());
-        // Ties break on the vertex itself: the seed decides the whole clique, and a seed chosen by
-        // the hasher is a family that changes between runs.
-        let Some(&seed) = unclaimed.iter().max_by(|x, y| degree(**x).cmp(&degree(**y)).then(y.cmp(x))) else {
-            break;
-        };
+    while let Some((_, Reverse(seed))) = seeds.pop_last() {
         let mut clique = vec![seed];
         let mut candidates: Vec<u32> =
             edges.get(&seed).map_or_else(Vec::new, |n| n.iter().copied().filter(|u| unclaimed.contains(u)).collect());
@@ -2177,6 +2184,16 @@ pub(crate) fn clique_cover(vertices: &[u32], edges: &HashMap<u32, HashSet<u32>>)
         }
         for member in &clique {
             unclaimed.remove(member);
+            seeds.remove(&(degree[member], Reverse(*member)));
+        }
+        for member in &clique {
+            for &u in edges.get(member).into_iter().flatten() {
+                if let Some(d) = degree.get_mut(&u).filter(|_| unclaimed.contains(&u)) {
+                    seeds.remove(&(*d, Reverse(u)));
+                    *d -= 1;
+                    seeds.insert((*d, Reverse(u)));
+                }
+            }
         }
         out.push(clique);
     }
@@ -2831,6 +2848,43 @@ mod tests {
         // A quoted run that is not identifier-shaped is a message, whichever dialect wrote it.
         let message = names("Str('failed to reach {}')", Vocab::SExpr);
         assert!(message.is_empty(), "a message is not a name: {message:?}");
+    }
+
+    #[test]
+    fn a_tree_of_s_expr_bodies_alone_still_has_names() {
+        // 🔴 Every rarity a name has comes from the corpus's own name counts. Those used to be taken
+        // over source-vocabulary lines only, so a tree with none — any pure Rust or TypeScript tree —
+        // held no names, every fork weighed nothing, and the pass reported nothing at all. The same
+        // two bodies a mixed tree reported, alone, must still be reported.
+        let rust = |name: &str, call: &str| {
+            let mut d = def(
+                name,
+                &format!("{name}.rs"),
+                &[
+                    ("Func('_fn', Params(Param(Bind('_v0'))), , 'sync')", 0),
+                    ("Let(Bind('_v1'), Call(Path('open_session'), Path('_v0')))", 1),
+                    ("Let(Bind('_v2'), Call(Path('resolve_chat'), Ref('', Path('_v1')), Path('_v0')))", 1),
+                    (Box::leak(format!("ExprStmt(Call(Path('{call}'), Path('_v2')))").into_boxed_str()), 1),
+                    ("ExprStmt(Method(Path('_v1'), 'commit', ))", 1),
+                ],
+                &["crate.session.open_session"],
+            );
+            if let Some(a) = d.analysis.as_mut() {
+                a.canon_dialect = CanonDialect::Rust;
+            }
+            d
+        };
+        let mut defs = vec![rust("revoke_admins", "demote_all"), rust("expel_members", "kick_all")];
+        for i in 0..6 {
+            defs.push(rust(&format!("noise{i}"), &format!("unrelated_{i}")));
+            defs[2 + i].facets.statements.truncate(2);
+        }
+        let found = pass_converge(&defs, 0, super::SEED_CAP);
+        assert!(
+            found.iter().any(|f| f.pass == "converge" && f.name == "revoke_admins / expel_members"),
+            "a pure s-expr tree must still report its divergences: {:?}",
+            found.iter().map(|f| &f.name).collect::<Vec<_>>()
+        );
     }
 
     fn graph(edges: &[(u32, u32)]) -> HashMap<u32, HashSet<u32>> {

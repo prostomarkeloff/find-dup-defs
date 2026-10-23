@@ -5,9 +5,11 @@
 //! [`AnalyzedFn`] is the supporting analysis tuple.
 
 mod canon;
+mod decides;
 mod defs;
 mod frontend;
 mod lenses;
+mod normal;
 
 pub use canon::{analyze_functions, ast_canonical, ast_canonical_many, AnalyzedFn};
 pub use dup_defs_core::LineMap;

@@ -131,9 +131,10 @@ struct Cli {
     converge_top: usize,
     /// Run the decisions pass: **one decision written in several places** — definitions that test
     /// the same facts however differently they are written (one raises where another returns, one
-    /// filters a loop where another refuses a request). Off by default and always advisory. Its cut
-    /// is learned, not set: a pair is reported when it outweighs the strongest pair a scrambled copy
-    /// of the corpus produces. Works for every language whose frontend fills `Facets::decides`.
+    /// filters a loop where another refuses a request). Off by default and always advisory. A pair is
+    /// reported when it shares more facts than the bipartite configuration model expects of two
+    /// definitions its size, at a false-discovery rate of 5% over every pair of definitions
+    /// (`-D settings:decision-fdr=…`). Works for every language whose frontend fills `Facets::decides`.
     #[arg(long)]
     decisions: bool,
     /// Patternology structural-cosine detection floor (whole-function family edge when cosine ≥ this).

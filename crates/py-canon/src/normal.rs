@@ -53,7 +53,7 @@
 #![allow(clippy::doc_markdown)]
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ruff_python_ast::comparable::ComparableExpr;
 use ruff_python_ast::visitor::transformer::{self as transform, Transformer};
@@ -63,10 +63,8 @@ use ruff_python_ast::{
 };
 use ruff_text_size::TextRange;
 
-/// Rounds of the rewrite before it is cut off. Every rule either shrinks the tree or fixes an
-/// orientation that no rule undoes, so the fixed point comes in a handful of rounds; the bound only
-/// guards against a rule pair that would disagree.
-const MAX_ROUNDS: usize = 12;
+use dup_defs_core::normal::{Scope, MAX_ROUNDS};
+
 
 /// The normal form of a definition: a rewritten copy for a function, the node itself otherwise.
 ///
@@ -95,7 +93,7 @@ pub(crate) fn with_inlining(stmt: &Stmt) -> Stmt {
 fn function(func: &mut ast::StmtFunctionDef, inline: bool) {
     nest_elifs(&mut func.body);
     for _ in 0..MAX_ROUNDS {
-        let scope = Scope::of(func);
+        let scope = scope_of(func);
         let mut changed = block(&mut func.body, &scope, true, inline);
         changed |= expressions(&mut func.body, &scope);
         if !changed {
@@ -374,48 +372,21 @@ fn is_terminal(stmt: &Stmt) -> bool {
 // Scope facts: what the function binds and reads, counted once per round.
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
-struct Scope {
-    /// Names the function binds anywhere (parameters included).
-    locals: HashSet<String>,
-    reads: HashMap<String, usize>,
-    stores: HashMap<String, usize>,
-    /// Reads from inside a lambda, comprehension or nested definition — a closure may see a later
-    /// binding, so a temporary read there is not inlined.
-    nested_reads: HashSet<String>,
-    /// `global`, `nonlocal` and `del` names: nothing is assumed about them.
-    pinned: HashSet<String>,
-}
-
-impl Scope {
-    fn of(func: &ast::StmtFunctionDef) -> Self {
-        let mut scope = Scope::default();
-        let params = &func.parameters;
-        for p in params.posonlyargs.iter().chain(&params.args).chain(&params.kwonlyargs) {
-            scope.bind(p.parameter.name.id.as_str());
-        }
-        for p in params.vararg.iter().chain(&params.kwarg) {
-            scope.bind(p.name.id.as_str());
-        }
-        let mut walker = ScopeWalk { scope: &mut scope, depth: 0 };
-        for stmt in &func.body {
-            walker.visit_stmt(stmt);
-        }
-        scope
+/// What the function binds and reads — the shared [`Scope`] counts, filled by this language's walk.
+fn scope_of(func: &ast::StmtFunctionDef) -> Scope {
+    let mut scope = Scope::default();
+    let params = &func.parameters;
+    for p in params.posonlyargs.iter().chain(&params.args).chain(&params.kwonlyargs) {
+        scope.bind(p.parameter.name.id.as_str());
     }
-
-    fn bind(&mut self, id: &str) {
-        self.locals.insert(id.to_owned());
-        *self.stores.entry(id.to_owned()).or_insert(0) += 1;
+    for p in params.vararg.iter().chain(&params.kwarg) {
+        scope.bind(p.name.id.as_str());
     }
-
-    fn reads(&self, id: &str) -> usize {
-        self.reads.get(id).copied().unwrap_or(0)
+    let mut walker = ScopeWalk { scope: &mut scope, depth: 0 };
+    for stmt in &func.body {
+        walker.visit_stmt(stmt);
     }
-
-    fn stores(&self, id: &str) -> usize {
-        self.stores.get(id).copied().unwrap_or(0)
-    }
+    scope
 }
 
 struct ScopeWalk<'s> {
@@ -465,12 +436,7 @@ impl<'a> Visitor<'a> for ScopeWalk<'_> {
     fn visit_expr(&mut self, expr: &'a Expr) {
         match expr {
             Expr::Name(n) => match n.ctx {
-                ExprContext::Load => {
-                    *self.scope.reads.entry(n.id.as_str().to_owned()).or_insert(0) += 1;
-                    if self.depth > 0 {
-                        self.scope.nested_reads.insert(n.id.as_str().to_owned());
-                    }
-                }
+                ExprContext::Load => self.scope.read(n.id.as_str(), self.depth > 0),
                 ExprContext::Store => self.scope.bind(n.id.as_str()),
                 ExprContext::Del | ExprContext::Invalid => {
                     self.scope.pinned.insert(n.id.as_str().to_owned());

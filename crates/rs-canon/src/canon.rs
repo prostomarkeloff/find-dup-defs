@@ -23,14 +23,17 @@
     clippy::needless_pass_by_value // emitter helpers take owned Vec<String> to consume one allocation
 )]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
-use dup_defs_core::Statement;
+use dup_defs_core::uses::{site_ctx, Construct, Site, Within};
+use dup_defs_core::{Statement, UNFILED};
 
+use syn::punctuated::Punctuated;
 use syn::{
-    BinOp, Block, Expr, FnArg, Generics, ImplItemFn, ItemEnum, ItemFn, ItemStruct, ItemTrait,
-    ItemUnion, Lit, Member, Pat, ReturnType, Signature, Stmt, TraitItem, TraitItemFn, Type, UnOp,
+    BinOp, Block, Expr, FnArg, Generics, ImplItem, ImplItemFn, Item, ItemEnum, ItemFn, ItemStruct, ItemTrait,
+    ItemUnion, Lit, Member, Pat, ReturnType, Signature, Stmt, Token, TraitItem, TraitItemFn, Type, UnOp,
 };
 
 /// `(cluster_canonical, xname_canonical, type3_lines, node_count)` — the analysis tuple the scan
@@ -195,11 +198,109 @@ struct Dump<'a> {
     blanked: bool,
     /// Node-emit count — the cross-name "substance" gate.
     count: usize,
+    /// `Some` while writing the Type-3 lines: every sub-expression worth a unit of its own, rendered
+    /// as it appears inside its line, with that line's index — [`AnalyzedFn::type3_units`].
+    units: Option<Vec<(u32, String)>>,
+    /// The index of the line being written, which the units it yields are filed under.
+    unit_line: u32,
+    /// How many expressions enclose the one being written: `0` for a statement's own expression.
+    expr_depth: u32,
+    /// `Some` while writing the Type-3 lines: type reference → `_T{n}`. `None` writes types as
+    /// spelled — every other canonical. See [`Dump::type_ref`] for why only those lines slot them.
+    tmap: Option<HashMap<String, u32>>,
+    /// Every type reference turned into a slot, in order of appearance — [`AnalyzedFn::type_refs`].
+    type_refs: Vec<String>,
+    /// Type parameters the definition declares: slotted like any type, but bound here, so not
+    /// vocabulary it shares with anything.
+    declared_types: HashSet<String>,
+    /// Use-site mode: the definition whose use is being written. A path headed by its name becomes
+    /// the anchor `_t0`, and its own surface — what the path goes on to name (`Anchor::new`), the
+    /// fields a literal of it sets — comes back marked `#name#` for the profile to number.
+    anchor: Option<&'a str>,
+    /// Hunt mode: the names that count as anchors. Every one the walk meets is kept in `hunted`.
+    known: Option<&'a HashSet<&'a str>>,
+    hunted: Vec<String>,
+    /// Hunt mode: the methods called (`.name`), for the co-occurrence channel of the `use` lens.
+    calls: BTreeSet<String>,
 }
 
 impl<'a> Dump<'a> {
     fn new(locals: Option<&'a HashSet<String>>) -> Self {
-        Self { locals, map: HashMap::new(), blanked: false, count: 0 }
+        Self {
+            locals,
+            map: HashMap::new(),
+            blanked: false,
+            count: 0,
+            units: None,
+            unit_line: 0,
+            expr_depth: 0,
+            tmap: None,
+            type_refs: Vec::new(),
+            declared_types: HashSet::new(),
+            anchor: None,
+            known: None,
+            hunted: Vec::new(),
+            calls: BTreeSet::new(),
+        }
+    }
+
+    /// A dump that notes which of `known` a line mentions, and the methods it calls.
+    fn hunting(locals: &'a HashSet<String>, known: &'a HashSet<&'a str>) -> Self {
+        Self { known: Some(known), tmap: Some(HashMap::new()), ..Self::new(Some(locals)) }
+    }
+
+    /// A dump that writes a line as a use site of `anchor`.
+    fn anchoring(locals: &'a HashSet<String>, anchor: &'a str) -> Self {
+        Self { anchor: Some(anchor), tmap: Some(HashMap::new()), ..Self::new(Some(locals)) }
+    }
+
+    /// A path naming a definition: in use-site mode, the anchor `_t0` with whatever follows it
+    /// marked as its surface (`_t0::#new#`); noted when its head is hunted for; as written
+    /// otherwise.
+    fn named_path(&mut self, path: &str) -> String {
+        let (head, rest) = path.split_once("::").map_or((path, None), |(head, rest)| (head, Some(rest)));
+        if let Some(known) = self.known {
+            if known.contains(head) && !self.hunted.iter().any(|h| h == head) {
+                self.hunted.push(head.to_owned());
+            }
+        }
+        if self.anchor != Some(head) {
+            return path.to_owned();
+        }
+        match rest {
+            None => "_t0".to_owned(),
+            Some(rest) => {
+                let marked: Vec<String> = rest.split("::").map(|segment| format!("#{segment}#")).collect();
+                format!("_t0::{}", marked.join("::"))
+            }
+        }
+    }
+
+    /// Whether a path is headed by the anchor.
+    fn on_anchor(&self, path: &str) -> bool {
+        self.anchor.is_some_and(|anchor| path.split("::").next() == Some(anchor))
+    }
+
+    /// A type's name: its `_T{n}` slot while writing the Type-3 lines (reported apart unless the
+    /// definition declared it), as spelled otherwise.
+    ///
+    /// 🔴 Only the Type-3 lines slot types, unlike the Python and TypeScript frontends, whose exact
+    /// canonicals do too. Their annotations run nothing; a Rust type picks the code that runs — the
+    /// `impl` a method call resolves to, the `From` a `?` converts through — so two bodies differing
+    /// only in their types may not be one definition, and the exact pass keeps them apart. The
+    /// near-copy pass is a measure of how alike two bodies read, and there a type is vocabulary like
+    /// any other: shared, it weighs as shared; different, it costs only its own weight rather than
+    /// rewriting every line it appears on.
+    fn type_ref(&mut self, name: &str) -> String {
+        // The anchor keeps its own slot even in type position.
+        if self.named_path(name) == "_t0" {
+            return "_t0".to_owned();
+        }
+        let Some(tmap) = self.tmap.as_mut() else { return Self::lit(name) };
+        if !self.declared_types.contains(name) {
+            self.type_refs.push(name.to_owned());
+        }
+        dup_defs_core::type_slot(tmap, name)
     }
 
     fn rename(&mut self, name: &str) -> String {
@@ -282,6 +383,53 @@ impl<'a> Dump<'a> {
         self.list("Params", items)
     }
 
+    /// The header of the Type-3 lines: what the Python frontend's `def _fn(_v0: _T0) -> _T1:` line
+    /// says — the qualifiers that change what a call is, the parameters, their types, the return
+    /// type — and nothing else. The receiver is dropped, as everywhere.
+    ///
+    /// 🔴 Not the `Func(…)` node the stream opens with. The pass reads every function's first line
+    /// as context and weighs it like any other; written as an s-expr, the header spells the parse
+    /// tree's grammar — `Params`, `Param`, `Bind`, `TyRef`, three flags — which only headers spell,
+    /// so every one of those tokens was rare, and the header outweighed the body of every short
+    /// function: two one-liners with one signature scored as copies whatever their bodies did.
+    fn compact_header(&mut self, sig: &Signature) -> String {
+        let mut out = String::new();
+        for (on, word) in [(sig.constness.is_some(), "const "), (sig.asyncness.is_some(), "async "), (sig.unsafety.is_some(), "unsafe ")] {
+            if on {
+                out.push_str(word);
+            }
+        }
+        out.push_str("fn _fn");
+        let declared: Vec<String> = sig
+            .generics
+            .type_params()
+            .map(|p| {
+                let name = p.ident.to_string();
+                self.declared_types.insert(name.clone());
+                self.type_ref(&name)
+            })
+            .collect();
+        if !declared.is_empty() {
+            let _ = write!(out, "<{}>", declared.join(", "));
+        }
+        let mut params: Vec<String> = Vec::with_capacity(sig.inputs.len());
+        for input in &sig.inputs {
+            let FnArg::Typed(pt) = input else { continue };
+            let pat = match pt.pat.as_ref() {
+                Pat::Ident(id) if id.subpat.is_none() => self.rename(&id.ident.to_string()),
+                other => self.pat(other),
+            };
+            let ty = self.ty(&pt.ty);
+            params.push(format!("{pat}: {ty}"));
+        }
+        let _ = write!(out, "({})", params.join(", "));
+        if let ReturnType::Type(_, ty) = &sig.output {
+            let ty = self.ty(ty);
+            let _ = write!(out, " -> {ty}");
+        }
+        out
+    }
+
     fn ret_type(&mut self, output: &ReturnType) -> String {
         match output {
             ReturnType::Default => String::new(),
@@ -315,20 +463,37 @@ impl<'a> Dump<'a> {
                 }
             }
             Stmt::Item(_) => self.node("NestedItem", &[]),
-            Stmt::Macro(m) => {
-                let path = path_str(&m.mac.path);
-                self.node("MacroStmt", &[Self::lit(&path)])
-            }
+            Stmt::Macro(m) => self.macro_call("MacroStmt", &m.mac),
         }
     }
 
     // ────── expressions ──────
 
+    /// An expression — and, when units are being collected, kept as one if it is a proper part of
+    /// its line: the statement's own expression is the line, already a unit, and counting it again
+    /// would double the weight of exactly the text an edit changes. A wrapper (parentheses, a
+    /// borrow) is not a level of its own; what it wraps is the part.
     fn expr(&mut self, expr: &Expr) -> String {
+        if is_wrapper(expr) {
+            return self.expr_inner(expr);
+        }
+        self.expr_depth += 1;
+        let out = self.expr_inner(expr);
+        self.expr_depth -= 1;
+        if self.expr_depth > 0 && is_unit(expr) {
+            if let Some(units) = self.units.as_mut() {
+                units.push((self.unit_line, out.clone()));
+            }
+        }
+        out
+    }
+
+    fn expr_inner(&mut self, expr: &Expr) -> String {
         match expr {
             Expr::Path(p) => {
                 let s = path_str(&p.path);
-                let renamed = self.rename(&s);
+                let named = self.named_path(&s);
+                let renamed = if named == s { self.rename(&s) } else { named };
                 self.node("Path", &[Self::lit(&renamed)])
             }
             Expr::Lit(l) => self.lit_expr(&l.lit),
@@ -353,11 +518,31 @@ impl<'a> Dump<'a> {
                 self.node("Call", &[f, joined])
             }
             Expr::MethodCall(m) => {
+                if self.known.is_some() {
+                    self.calls.insert(format!(".{}", m.method));
+                }
                 let recv = self.expr(&m.receiver);
                 let method = m.method.to_string();
                 let args: Vec<String> = m.args.iter().map(|a| self.expr(a)).collect();
                 let joined = args.join(", ");
-                self.node("Method", &[recv, Self::lit(&method), joined])
+                // The turbofish picks the code that runs — `parse::<u32>()` and `parse::<f64>()` are
+                // two calls — and names the types a call is about (`query::<Order>()`). A trailing
+                // field, present only when written, so a call without one reads as it always did.
+                match &m.turbofish {
+                    Some(tf) => {
+                        let types: Vec<String> = tf
+                            .args
+                            .iter()
+                            .filter_map(|a| match a {
+                                syn::GenericArgument::Type(t) => Some(self.ty(t)),
+                                _ => None,
+                            })
+                            .collect();
+                        let turbofish = self.list("Turbofish", types);
+                        self.node("Method", &[recv, Self::lit(&method), joined, turbofish])
+                    }
+                    None => self.node("Method", &[recv, Self::lit(&method), joined]),
+                }
             }
             Expr::Field(f) => {
                 let base = self.expr(&f.base);
@@ -478,6 +663,8 @@ impl<'a> Dump<'a> {
             }
             Expr::Struct(s) => {
                 let path = path_str(&s.path);
+                let on_anchor = self.on_anchor(&path);
+                let path = self.named_path(&path);
                 let fields: Vec<String> = s
                     .fields
                     .iter()
@@ -486,6 +673,7 @@ impl<'a> Dump<'a> {
                             Member::Named(id) => id.to_string(),
                             Member::Unnamed(idx) => idx.index.to_string(),
                         };
+                        let member = if on_anchor { format!("#{member}#") } else { member };
                         let v = self.expr(&f.expr);
                         self.node("FieldVal", &[Self::lit(&member), v])
                     })
@@ -500,11 +688,28 @@ impl<'a> Dump<'a> {
                 let body = self.expr(&c.body);
                 self.node("Closure", &[ps, body])
             }
-            Expr::Macro(m) => {
-                let path = path_str(&m.mac.path);
-                self.node("Macro", &[Self::lit(&path)])
-            }
+            Expr::Macro(m) => self.macro_call("Macro", &m.mac),
             other => self.node(&format!("Unknown_{}", expr_kind(other)), &[]),
+        }
+    }
+
+    /// A macro invocation: its path, and — when its tokens read as a comma-separated list of
+    /// expressions — the arguments, rendered like any call's.
+    ///
+    /// 🔴 Not the path alone. `vec![…]`, `assert_eq!(…)`, `format!(…)`, `write!(…)` hold most of
+    /// what a Rust test or formatter says, and rendered as `Macro('vec')` two tests that build
+    /// different values and assert different things were one canonical: on actix-web a pair of
+    /// unrelated header tests scored 0.99 as near-copies. Python has no macros; its calls show their
+    /// arguments, and these are calls in all but syntax. A body that does not parse as expressions
+    /// (`vec![x; n]`, a DSL) stays opaque, as it was.
+    fn macro_call(&mut self, tag: &str, mac: &syn::Macro) -> String {
+        let path = Self::lit(&path_str(&mac.path));
+        match mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) {
+            Ok(args) => {
+                let args: Vec<String> = args.iter().map(|a| self.expr(a)).collect();
+                self.node(tag, &[path, format!("[{}]", args.join(", "))])
+            }
+            Err(_) => self.node(tag, &[path]),
         }
     }
 
@@ -536,6 +741,7 @@ impl<'a> Dump<'a> {
             Pat::Lit(l) => self.lit_expr(&l.lit),
             Pat::Path(p) => {
                 let s = path_str(&p.path);
+                let s = self.named_path(&s);
                 self.node("PatPath", &[Self::lit(&s)])
             }
             Pat::Reference(r) => {
@@ -548,12 +754,14 @@ impl<'a> Dump<'a> {
             }
             Pat::TupleStruct(ts) => {
                 let path = path_str(&ts.path);
+                let path = self.named_path(&path);
                 let items: Vec<String> = ts.elems.iter().map(|p| self.pat(p)).collect();
                 let joined = items.join(", ");
                 self.node("PatTupleStruct", &[Self::lit(&path), joined])
             }
             Pat::Struct(s) => {
                 let path = path_str(&s.path);
+                let path = self.named_path(&path);
                 let fields: Vec<String> = s
                     .fields
                     .iter()
@@ -593,9 +801,11 @@ impl<'a> Dump<'a> {
     fn ty(&mut self, ty: &Type) -> String {
         match ty {
             Type::Path(p) => {
-                // Last segment + its generic args, structurally; type names are not renamed.
+                // Last segment + its generic args, structurally; type names are not renamed but in
+                // the Type-3 lines, where they are slots.
                 let Some(seg) = p.path.segments.last() else { return self.node("Ty", &[]) };
-                let name = seg.ident.to_string();
+                let name =
+                    if self.tmap.is_some() { self.type_ref(&path_str(&p.path)) } else { Self::lit(&seg.ident.to_string()) };
                 let args = match &seg.arguments {
                     syn::PathArguments::AngleBracketed(ab) => {
                         let items: Vec<String> = ab
@@ -610,7 +820,7 @@ impl<'a> Dump<'a> {
                     }
                     _ => String::new(),
                 };
-                self.node("Ty", &[Self::lit(&name), args])
+                self.node("Ty", &[name, args])
             }
             Type::Reference(r) => {
                 let inner = self.ty(&r.elem);
@@ -644,6 +854,48 @@ impl<'a> Dump<'a> {
         }
     }
 
+}
+
+/// Whether an expression is a Type-3 unit of its own: a node with structure — a call, a field
+/// chain, an operator application, a closure, a block-valued construct, a macro call, a non-empty
+/// literal aggregate — not a bare path or a literal, which carry no agreement by themselves. The
+/// same rule as the Python frontend's.
+fn is_unit(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(_)
+        | Expr::Macro(_)
+        | Expr::MethodCall(_)
+        | Expr::Field(_)
+        | Expr::Index(_)
+        | Expr::Binary(_)
+        | Expr::Unary(_)
+        | Expr::Assign(_)
+        | Expr::If(_)
+        | Expr::Match(_)
+        | Expr::Let(_)
+        | Expr::Closure(_)
+        | Expr::Await(_)
+        | Expr::Try(_)
+        | Expr::Cast(_)
+        | Expr::Range(_)
+        | Expr::Repeat(_)
+        | Expr::Block(_)
+        | Expr::Async(_)
+        | Expr::Unsafe(_)
+        | Expr::TryBlock(_)
+        | Expr::ForLoop(_)
+        | Expr::While(_)
+        | Expr::Loop(_) => true,
+        Expr::Struct(s) => !s.fields.is_empty(),
+        Expr::Tuple(t) => !t.elems.is_empty(),
+        Expr::Array(a) => !a.elems.is_empty(),
+        _ => false,
+    }
+}
+
+/// Syntax around an expression that is not a part of its own: what it wraps is the part.
+fn is_wrapper(expr: &Expr) -> bool {
+    matches!(expr, Expr::Paren(_) | Expr::Group(_) | Expr::Reference(_))
 }
 
 /// Path → `::`-joined segment idents. The engine renames the whole string in xname mode when it
@@ -813,19 +1065,6 @@ pub fn trait_canon(item: &ItemTrait) -> String {
 
 // ───────────────────────────── callable analysis ─────────────────────────────
 
-/// Per-statement renamed lines for the Type-3 pass (one logical line per body statement),
-/// emitted with a fresh `Dump` per line so numbering stays per-line (order-invariant cosine).
-fn type3_lines(block: &Block, locals: &HashSet<String>) -> Vec<String> {
-    block
-        .stmts
-        .iter()
-        .map(|s| {
-            let mut d = Dump::new(Some(locals));
-            d.stmt(s)
-        })
-        .collect()
-}
-
 /// `(cluster_canonical, xname_canonical, type3_lines, node_count)` for a callable from its
 /// signature + body. `name` is the def's own name (blanked to `_fn` in the xname canonical).
 fn analyze(name: &str, sig: &Signature, body: &Block) -> AnalyzedFn {
@@ -833,26 +1072,50 @@ fn analyze(name: &str, sig: &Signature, body: &Block) -> AnalyzedFn {
         let mut d = Dump::new(None);
         d.func(name, sig, Some(body), true)
     };
-    let mut collect = Collect::default();
-    collect.add_inputs(sig);
-    collect.visit_block(body);
-    let locals = collect.bound;
+    let locals_of = |block: &Block| {
+        let mut collect = Collect::default();
+        collect.add_inputs(sig);
+        collect.visit_block(block);
+        collect.bound
+    };
+    // The statement stream keeps the body as written: converge reads it to say where two definitions
+    // stop agreeing, and a rewritten line would point the reader at code that is not there.
+    let statements = statement_stream(name, sig, body, &locals_of(body));
 
-    let mut xd = Dump::new(Some(&locals));
-    let xname = xd.func(name, sig, Some(body), true);
+    // The name-agnostic canonicals are taken from the normal form (`normal.rs`): what the exact and
+    // Type-3 passes compare is the meaning the rules reach, not the spelling. The Type-3 lines come
+    // from the form that keeps every statement, the exact canonical from the one that also inlines
+    // single-use temporaries.
+    let statement_form = crate::normal::normal_form(sig, body, false);
+    let (type3_lines, type3_units, type_refs) = type3_walk(sig, &statement_form, &locals_of(&statement_form));
+
+    let exact_form = crate::normal::with_inlining(sig, &statement_form);
+    let exact_locals = locals_of(&exact_form);
+    let mut xd = Dump::new(Some(&exact_locals));
+    let xname = xd.func(name, sig, Some(&exact_form), true);
     let size = xd.count;
+    AnalyzedFn { cluster_canonical: cluster, xname_canonical: xname, type3_lines, type_refs, type3_units, statements, size }
+}
 
-    let lines = type3_lines(body, &locals);
-    let statements = statement_stream(name, sig, body, &locals);
-    AnalyzedFn {
-        cluster_canonical: cluster,
-        xname_canonical: xname,
-        type3_lines: lines,
-        type_refs: Vec::new(),
-        type3_units: Vec::new(),
-        statements,
-        size,
-    }
+/// The Type-3 lines, their parts ([`AnalyzedFn::type3_units`]) and the types they name
+/// ([`AnalyzedFn::type_refs`]): the statement-stream walk again, with the types as slots and the
+/// header written the way the Python frontend writes it ([`Dump::compact_header`]).
+///
+/// The pass compares statements at every depth — an edit inside an `if` costs the statement it
+/// touched, not the `if` — and every statement's sub-expressions are where two edited lines still
+/// agree. The header comes first because the pass reads every function's first line as its
+/// interface: context, not a step.
+fn type3_walk(sig: &Signature, body: &Block, locals: &HashSet<String>) -> (Vec<String>, Vec<(u32, String)>, Vec<String>) {
+    let mut dump = Dump::new(Some(locals));
+    dump.tmap = Some(HashMap::new());
+    dump.units = Some(Vec::new());
+    dump.unit_line = UNFILED;
+    let head = dump.compact_header(sig);
+    let mut walk = StreamWalk { dump: &mut dump, out: Vec::new() };
+    walk.push(0, head);
+    walk.block(body, 1);
+    let lines = walk.out.into_iter().map(|s| s.line).collect();
+    (lines, dump.units.unwrap_or_default(), dump.type_refs)
 }
 
 /// The body canonicalized with every name the **file** introduced erased — the widest rung of the
@@ -895,11 +1158,6 @@ pub fn analyze_trait_fn(f: &TraitItemFn) -> Option<AnalyzedFn> {
 /// One line per statement at **every** nesting level, in source order — the engine's
 /// [`Facets::statements`](dup_defs_core::Facets::statements).
 ///
-/// Deliberately a second traversal rather than a re-use of [`type3_lines`]. Those are one line per
-/// *top-level* block statement, with a nested `if` inlined whole into its parent's line: right for
-/// an order-invariant cosine, useless for a pass that asks where two definitions stopped agreeing,
-/// since everything interesting is buried inside one string. This walks in.
-///
 /// Rust has no statement-level `if`: control flow is expressions, so the walk descends into the
 /// expression forms that carry a block. A compound construct contributes a **header** line naming
 /// what it tests (`If(cond)`, `Match(scrutinee)`, `For(pat, iter)`) with its body elided, and the
@@ -907,19 +1165,20 @@ pub fn analyze_trait_fn(f: &TraitItemFn) -> Option<AnalyzedFn> {
 /// streams are comparable rather than merely both present.
 ///
 /// One `Dump` for the whole definition, so a local carries the same `_v{n}` across every line it
-/// appears on. `type3_lines` uses a fresh `Dump` per line on purpose (order-invariance); here the
-/// order *is* the signal, and a slot that means something different on each line would destroy it.
-#[must_use]
-pub fn statement_stream(name: &str, sig: &Signature, body: &Block, locals: &HashSet<String>) -> Vec<Statement> {
+/// appears on: here the order *is* the signal, and a slot that means something different on each
+/// line would destroy it.
+fn statement_stream(name: &str, sig: &Signature, body: &Block, locals: &HashSet<String>) -> Vec<Statement> {
     let mut dump = Dump::new(Some(locals));
     // The definition's own header opens the stream at depth 0 and the body starts at depth 1 — the
     // contract every frontend agrees on, so a consumer cannot mistake a missing header for a
     // definition that opens with a statement.
     let head = dump.func(name, sig, None, true);
-    let mut walk = StreamWalk { dump: &mut dump, out: vec![Statement { line: head, depth: 0 }] };
+    let mut walk = StreamWalk { dump: &mut dump, out: Vec::new() };
+    walk.push(0, head);
     walk.block(body, 1);
     walk.out
 }
+
 
 struct StreamWalk<'a, 'b> {
     dump: &'b mut Dump<'a>,
@@ -927,7 +1186,15 @@ struct StreamWalk<'a, 'b> {
 }
 
 impl StreamWalk<'_, '_> {
+    /// A line is rendered whole before it is pushed, and nothing else is pushed in between, so the
+    /// units still unfiled when it arrives are exactly its own.
     fn push(&mut self, depth: u16, line: String) {
+        let at = u32::try_from(self.out.len()).unwrap_or(UNFILED - 1);
+        if let Some(units) = self.dump.units.as_mut() {
+            for unit in units.iter_mut().rev().take_while(|u| u.0 == UNFILED) {
+                unit.0 = at;
+            }
+        }
         self.out.push(Statement { line, depth });
     }
 
@@ -1051,6 +1318,219 @@ fn opens_a_block(expr: &Expr) -> bool {
     )
 }
 
+// ───────────────────────────── use sites ─────────────────────────────
+
+/// Every use site in one source — the Rust half of the `use` lens ([`dup_defs_core::uses`]): each
+/// statement that mentions a known name, written with that name as the anchor. A site is the
+/// statement's own line — a block-carrying construct's header (`If(cond)`, `Match(scrutinee)`, a
+/// match arm's pattern), not its body, whose statements are sites of their own — as the statement
+/// stream writes it, and inside a function its locals rename as they do there. A closure stays part
+/// of the statement it is written in, as a Python lambda does.
+pub(crate) fn collect_sites(source: &str, _path: &str, known: &HashSet<&str>) -> Vec<Site> {
+    let Ok(file) = syn::parse_file(source) else { return Vec::new() };
+    let mut walk = UseWalk { known, out: Vec::new() };
+    walk.items(&file.items);
+    walk.out
+}
+
+struct UseWalk<'k> {
+    known: &'k HashSet<&'k str>,
+    out: Vec<Site>,
+}
+
+impl UseWalk<'_> {
+    /// One site per known name `render` mentions, each written with that name as the anchor.
+    fn site<F>(&mut self, locals: &HashSet<String>, ctx: &'static str, neighbours: &[String], render: F)
+    where
+        F: Fn(&mut Dump<'_>) -> Option<String>,
+    {
+        let mut hunt = Dump::hunting(locals, self.known);
+        if render(&mut hunt).is_none() {
+            return;
+        }
+        for name in hunt.hunted {
+            let mut anchored = Dump::anchoring(locals, &name);
+            if let Some(canon) = render(&mut anchored) {
+                self.out.push(Site { name, canon, ctx, cooc: neighbours.to_vec() });
+            }
+        }
+    }
+
+    /// A module's items: the bodies of its functions and methods, and the values of its constants.
+    /// A type's own declaration — what it derives, the fields it declares, what it implements — is
+    /// a declaration, not a use.
+    fn items(&mut self, items: &[Item]) {
+        let empty = HashSet::new();
+        for item in items {
+            match item {
+                Item::Fn(f) => self.function(&f.sig, &f.block),
+                Item::Impl(i) => {
+                    for inner in &i.items {
+                        match inner {
+                            ImplItem::Fn(f) => self.function(&f.sig, &f.block),
+                            ImplItem::Const(c) => self.site(&empty, "plain", &[], |d| {
+                                let value = d.expr(&c.expr);
+                                Some(d.node("Const", &[value]))
+                            }),
+                            _ => {}
+                        }
+                    }
+                }
+                Item::Trait(t) => {
+                    for inner in &t.items {
+                        if let TraitItem::Fn(f) = inner {
+                            if let Some(body) = &f.default {
+                                self.function(&f.sig, body);
+                            }
+                        }
+                    }
+                }
+                Item::Const(c) => self.site(&empty, "plain", &[], |d| {
+                    let value = d.expr(&c.expr);
+                    Some(d.node("Const", &[value]))
+                }),
+                Item::Static(st) => self.site(&empty, "plain", &[], |d| {
+                    let value = d.expr(&st.expr);
+                    Some(d.node("Static", &[value]))
+                }),
+                Item::Mod(m) => {
+                    if let Some((_, inner)) = &m.content {
+                        self.items(inner);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A function: its signature is a site when it names a known type, its body is walked under its
+    /// own locals.
+    fn function(&mut self, sig: &Signature, body: &Block) {
+        let mut collect = Collect::default();
+        collect.add_inputs(sig);
+        collect.visit_block(body);
+        let locals = collect.bound;
+        self.site(&locals, "plain", &[], |d| Some(d.compact_header(sig)));
+        self.block(body, &locals, (false, false));
+    }
+
+    /// A block's statements, each with the methods called beside it — the co-occurrence channel.
+    /// `within` is `(in_try, in_loop)`.
+    fn block(&mut self, block: &Block, locals: &HashSet<String>, within: (bool, bool)) {
+        let mut hunt = Dump::hunting(locals, self.known);
+        for stmt in &block.stmts {
+            let _ = use_line(&mut hunt, stmt);
+        }
+        let neighbours: Vec<String> = hunt.calls.into_iter().collect();
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Item(item) => self.items(std::slice::from_ref(item)),
+                Stmt::Expr(expr, _) if opens_a_block(expr) => self.control(expr, locals, within, &neighbours),
+                _ => {
+                    let ctx = site_ctx(Construct::Plain, Within { in_try: within.0, in_loop: within.1 });
+                    self.site(locals, ctx, &neighbours, |d| use_line(d, stmt));
+                }
+            }
+        }
+    }
+
+    /// A block-carrying construct: its header is a site, its body is walked.
+    fn control(&mut self, expr: &Expr, locals: &HashSet<String>, within: (bool, bool), neighbours: &[String]) {
+        let (in_try, in_loop) = within;
+        let guard = site_ctx(Construct::Guard, Within { in_try, in_loop });
+        let looped = site_ctx(Construct::Loop, Within { in_try, in_loop });
+        match expr {
+            Expr::If(n) => {
+                self.site(locals, guard, neighbours, |d| {
+                    let cond = d.expr(&n.cond);
+                    Some(d.node("If", &[cond]))
+                });
+                self.block(&n.then_branch, locals, within);
+                if let Some((_, alt)) = &n.else_branch {
+                    self.arm_body(alt, locals, within, neighbours);
+                }
+            }
+            Expr::Match(n) => {
+                self.site(locals, guard, neighbours, |d| {
+                    let scrutinee = d.expr(&n.expr);
+                    Some(d.node("Match", &[scrutinee]))
+                });
+                for arm in &n.arms {
+                    self.site(locals, guard, neighbours, |d| {
+                        let pat = d.pat(&arm.pat);
+                        let guard = arm.guard.as_ref().map_or_else(String::new, |(_, g)| d.expr(g));
+                        Some(d.node("Arm", &[pat, guard]))
+                    });
+                    self.arm_body(&arm.body, locals, within, neighbours);
+                }
+            }
+            Expr::While(n) => {
+                self.site(locals, looped, neighbours, |d| {
+                    let cond = d.expr(&n.cond);
+                    Some(d.node("While", &[cond]))
+                });
+                self.block(&n.body, locals, (in_try, true));
+            }
+            Expr::ForLoop(n) => {
+                self.site(locals, looped, neighbours, |d| {
+                    let pat = d.pat(&n.pat);
+                    let iter = d.expr(&n.expr);
+                    Some(d.node("For", &[pat, iter]))
+                });
+                self.block(&n.body, locals, (in_try, true));
+            }
+            Expr::Loop(n) => self.block(&n.body, locals, (in_try, true)),
+            Expr::TryBlock(n) => self.block(&n.block, locals, (true, in_loop)),
+            Expr::Block(n) => self.block(&n.block, locals, within),
+            Expr::Unsafe(n) => self.block(&n.block, locals, within),
+            Expr::Async(n) => self.block(&n.block, locals, within),
+            other => {
+                let ctx = site_ctx(Construct::Plain, Within { in_try, in_loop });
+                self.site(locals, ctx, neighbours, |d| Some(d.expr(other)));
+            }
+        }
+    }
+
+    /// An `else` branch or a match arm's body: a construct is walked, a value is a site.
+    fn arm_body(&mut self, expr: &Expr, locals: &HashSet<String>, within: (bool, bool), neighbours: &[String]) {
+        if opens_a_block(expr) {
+            self.control(expr, locals, within, neighbours);
+        } else {
+            let ctx = site_ctx(Construct::Plain, Within { in_try: within.0, in_loop: within.1 });
+            self.site(locals, ctx, neighbours, |d| Some(d.expr(expr)));
+        }
+    }
+}
+
+/// A statement's own line, as a use site sees it: a block-carrying construct's header, any other
+/// statement whole — `None` for a nested item, whose insides are walked.
+fn use_line(d: &mut Dump<'_>, stmt: &Stmt) -> Option<String> {
+    match stmt {
+        Stmt::Item(_) => None,
+        Stmt::Expr(expr, _) if opens_a_block(expr) => Some(match expr {
+            Expr::If(n) => {
+                let cond = d.expr(&n.cond);
+                d.node("If", &[cond])
+            }
+            Expr::Match(n) => {
+                let scrutinee = d.expr(&n.expr);
+                d.node("Match", &[scrutinee])
+            }
+            Expr::While(n) => {
+                let cond = d.expr(&n.cond);
+                d.node("While", &[cond])
+            }
+            Expr::ForLoop(n) => {
+                let pat = d.pat(&n.pat);
+                let iter = d.expr(&n.expr);
+                d.node("For", &[pat, iter])
+            }
+            _ => return None,
+        }),
+        other => Some(d.stmt(other)),
+    }
+}
+
 // ───────────────────────────── reach ─────────────────────────────
 
 /// What each name a file's `use` items bind stands for, as the engine's dotted path.
@@ -1122,4 +1602,50 @@ pub fn used_names(block: &Block) -> HashSet<String> {
     let mut names = Names::default();
     syn::visit::Visit::visit_block(&mut names, block);
     names.seen
+}
+
+#[cfg(test)]
+mod use_tests {
+    use super::collect_sites;
+    use crate::defs::scan_source;
+    use dup_defs_core::uses::use_facts;
+    use dup_defs_core::ScanOpts;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    #[test]
+    fn a_site_is_the_construct_header_not_its_body() {
+        let src = "fn f(db: &Db) {\n    for row in db.query::<Tbl>() {\n        other(Unrelated);\n    }\n    if let Some(t) = Tbl::find(1) { t.touch(); }\n}\n";
+        let known: HashSet<&str> = ["Tbl"].into_iter().collect();
+        let sites = collect_sites(src, "t.rs", &known);
+        let canons: Vec<&str> = sites.iter().map(|s| s.canon.as_str()).collect();
+        assert!(canons.iter().any(|c| c.starts_with("If(LetExpr(") && c.contains("_t0::#find#")), "{canons:?}");
+        assert!(canons.iter().all(|c| !c.contains("other")), "a body is a site of its own: {canons:?}");
+    }
+
+    /// The `use` lens's load-bearing claim, in Rust: two definitions whose bodies share nothing,
+    /// handled identically, produce the same use-site facts. A Rust type's surface is what its path
+    /// names — the associated functions it is reached through, the fields a literal of it sets.
+    #[test]
+    fn divergent_bodies_with_identical_handling_share_their_use_facts() {
+        let a = concat!(
+            "pub struct ImageCache { key: String, blob: Vec<u8>, dead_at: u64 }\n",
+            "pub fn put_image(s: &mut Session, k: String, v: Vec<u8>) { s.add(ImageCache { key: k, blob: v, dead_at: soon() }); }\n",
+            "pub fn get_image(s: &Session, k: &str) -> Option<Row> { s.find(ImageCache::by_key(k)) }\n",
+            "pub fn reap_images(s: &mut Session) { s.delete(ImageCache::older_than(now())); }\n",
+        );
+        let b = concat!(
+            "pub struct PromptStore { payload: Json }\n",
+            "pub fn put_prompt(s: &mut Session, k: String, v: Json) { s.add(PromptStore { fingerprint: k, payload: v, expires: soon() }); }\n",
+            "pub fn get_prompt(s: &Session, k: &str) -> Option<Row> { s.find(PromptStore::by_fingerprint(k)) }\n",
+            "pub fn reap_prompts(s: &mut Session) { s.delete(PromptStore::expired_before(now())); }\n",
+        );
+        let (fa, fb): (Arc<str>, Arc<str>) = (Arc::from("a.rs"), Arc::from("b.rs"));
+        let opts = ScanOpts::default();
+        let mut defs = scan_source(a, &fa, &opts);
+        defs.extend(scan_source(b, &fb, &opts));
+        let facts = use_facts(&[(a, "a.rs", 1), (b, "b.rs", 1)], &defs, collect_sites);
+        let get = |n: &str| facts.get(n).unwrap_or_else(|| panic!("no use facts for {n}: {facts:?}")).clone();
+        assert_eq!(get("ImageCache"), get("PromptStore"), "identical handling ⇒ identical use facts");
+    }
 }

@@ -183,10 +183,12 @@ to brute force), then single-linkages the survivors.
 
 Two refinements keep those shapes honest:
 
-- **Types are names too.** A Python annotation does nothing at runtime, so the alpha-renamed
-  canonical turns every type reference in an annotation into a `_T{n}` slot. The renaming is
-  consistent, not an erasure, so `f(a: X, b: X)` and `f(a: X, b: Y)` still differ. A call inside an
-  annotation (`Annotated[T, Depends(f)]`) is a value read at runtime, so it stays as written.
+- **Types are names too.** A Python or TypeScript annotation does nothing at runtime, so the
+  alpha-renamed canonical turns every type reference in an annotation into a `_T{n}` slot. The
+  renaming is consistent, not an erasure, so `f(a: X, b: X)` and `f(a: X, b: Y)` still differ. A call
+  inside an annotation (`Annotated[T, Depends(f)]`) is a value read at runtime, so it stays as
+  written. A Rust type is not inert — it picks the trait implementation that runs — so Rust's exact
+  canonical keeps types as written and only its Type-3 lines slot them.
 - **A Type-3 unit depends on itself alone.** Slots are renumbered within each line, so one added
   parameter no longer rewrites every later line. The types an annotation names ride as units of
   their own: a shared type still counts, and a different one costs only its own weight. Type-3
@@ -199,17 +201,25 @@ Type-3 pairs went +172 / −30. In a hand-labelled sample, 57 of 61 added pairs 
 
 Two more take the comparison from how a definition is written to what it does:
 
-- **A normal form first.** Every Python function is rewritten to one representative of its
-  equivalence class under a fixed set of oriented rules before the name-agnostic canonicals are
-  taken: negation normal form, a fixed orientation for comparisons and for the branches of an
-  `if`, guard form instead of nesting, `if`/`else` statements in place of conditional expressions,
-  `return a or b` in place of the ladder that spells it, a comprehension in place of the loop that
-  accumulates one, `a, b = x, y` split, `x += e` expanded, `match` on values as the ladder it
-  abbreviates, dead statements dropped — and, for the exact pass only, a temporary named and used
-  once replaced by its value. The rules are the elementary case of equality saturation: no search,
-  one direction each, applied to a fixed point. The Type-3 pass reads the form that keeps every
-  statement, because its unit is the statement and folding two short ones into one long one costs
-  it real near-copies (measured: a fifth of a labelled set).
+- **A normal form first.** Every function — Python, TypeScript or Rust — is rewritten to one
+  representative of its equivalence class under a fixed set of oriented rules before the
+  name-agnostic canonicals are taken: negation normal form, a fixed orientation for comparisons and
+  for the branches of an `if`, guard form instead of nesting, `if`/`else` statements in place of
+  conditional expressions, `return a or b` in place of the ladder that spells it, a comprehension in
+  place of the loop that accumulates one, `a, b = x, y` split, `x += e` expanded, `match` on values
+  as the ladder it abbreviates, dead statements dropped — and, for the exact pass only, a temporary
+  named and used once replaced by its value. The rules are the elementary case of equality
+  saturation: no search, one direction each, applied to a fixed point. The Type-3 pass reads the form
+  that keeps every statement, because its unit is the statement and folding two short ones into one
+  long one costs it real near-copies (measured: a fifth of a labelled set).
+
+  Each language reads the rules in its own grammar. In TypeScript every branch and loop body is a
+  block (`if (c) return x;` is `if (c) { return x; }`), a `switch` that never falls through is its
+  ladder, and the comprehension is `xs.filter(…).map(…)`. In Rust a body's tail value is what it
+  returns, so `if c { a } else { b }` and `if c { return a; } b` are one form; a name a macro's
+  tokens mention (`format!("{x}")` included) pins its binding; and a loop that pushes is left as
+  written — the iterator chain that replaces it differs from it in an element type only one side
+  writes.
 - **Statements agree in part.** Type-3 scores a pair by the *soft cosine* of its line vectors
   (Sidorov et al. 2014): two lines contribute by the Jaccard of their parts — the line and every
   sub-expression inside it — so a token changed deep in a long statement costs the parts it sits
@@ -346,15 +356,19 @@ groups. On `rustc/tests/ui` (20 425 files, with `fn main` × 12 678): `gpu=off` 
 
 Ten production TypeScript repos (vscode, the TS compiler, vue, angular, svelte, nest, astro,
 prisma, next.js, excalidraw; ≈6M SLOC), with `--calibrate`, the inferred directives, and the
-balanced thickness cut — **raw ERROR count drops 94% on average**:
+balanced thickness cut — **raw ERROR count drops 90% on average**:
 
 | repo | LOC | raw ERROR | after | %cut | top remaining cluster |
 |---|---:|---:|---:|---:|---|
-| microsoft/vscode | 3.1M | 5428 | 174 | 97% | `registerCLIChatCommands` 771 LOC |
-| microsoft/TypeScript | 265k | 1840 | 9 | 100% | `NavigationBarItem` interface |
-| vercel/next.js | 756k | 489 | 26 | 95% | `defaultLoader` 115 LOC |
-| angular/angular | 1.0M | 627 | 54 | 91% | `conditionalCreate/conditionalBranchCreate` |
-| prisma/prisma | 222k | 322 | 68 | 79% | `fieldToColumnType` 95 LOC × 3 adapters |
+| microsoft/vscode | 3.1M | 6347 | 989 | 84% | `registerCLIChatCommands` 771 LOC |
+| microsoft/TypeScript | 265k | 2105 | 13 | 99% | `createFourslashVfs/createFromFileSystem` 34 LOC |
+| vercel/next.js | 756k | 761 | 75 | 90% | `defaultLoader` 115 LOC |
+| angular/angular | 1.0M | 752 | 68 | 91% | `SECURITY_SCHEMA` 99 LOC |
+| prisma/prisma | 222k | 337 | 71 | 79% | `Model` 377 LOC |
+
+Class methods take part in every pass since 0.15.0, which raised both columns. 644 of vscode's 989 are
+the Copilot extension's vendored copy of the editor's base library (`extensions/copilot/src/util/vs/`)
+— duplication by design, one `suppress` directive away.
 
 Twenty-eight large Python repos (≈8M SLOC), auto-applied directives, **67% average cut**:
 
@@ -791,19 +805,30 @@ In a tree where the guard and the filter sit among forty definitions deciding on
 (the committed `decisions` test fixture):
 
 ```console
-$ find-dup-defs ./tests/fixtures/decisions --decisions
+$ find-dup-defs ./tests/fixtures/decisions --decisions --show-info
 --- decisions in functions (one decision, written in two places) ---
-DUPLICATE FUNCTION [INFO]: offers / refuse  [T=0.00, n=2, loc=7, args=1]  votes[2]: decides×2 members×2
-  # decide on 2 shared fact(s), 0.89 expected by chance; surprise 14.9 nats (null mean 0.8);
-  # p = 4.9e-5 under the bipartite configuration model, Benjamini–Hochberg cut 5.1e-5 at FDR 0.05 over 990 pairs
+DUPLICATE FUNCTION [INFO]: offers / refuse  [T=0.04, n=2, loc=7, args=1]  votes[2]: decides×2 members×2
+  # decide on 2 shared fact(s), 0.81 expected by chance; surprise 14.9 nats (null mean 0.8);
+  # p = 6.0e-5 under the bipartite configuration model, Benjamini–Hochberg cut 9.3e-5 at FDR 0.05 over 1081 pairs
   #   · @app.models.Status.OPEN = _.status
   #   · ? _.paid
   py/app/catalog.py:4
   py/app/orders.py:12
+
+DUPLICATE FUNCTION [INFO]: open_orders / count_open  [T=0.04, n=2, loc=8, args=2]  votes[2]: decides×2 members×2
+  # decide on 2 shared fact(s), 0.81 expected by chance; surprise 14.9 nats (null mean 0.8);
+  # p = 6.0e-5 under the bipartite configuration model, Benjamini–Hochberg cut 9.3e-5 at FDR 0.05 over 1081 pairs
+  #   · 0 < @app.models.Order.total
+  #   · @app.models.Order.status = @app.models.Status.OPEN
+  py/app/repo.py:6
+  py/app/repo.py:16
 ```
 
-Two facts, rare in this tree, shared by two small definitions: just past the cut over 990 pairs, which
-is what `T=0.00` says. A decision written twice in a real tree usually shares more.
+Two facts, rare in this tree, shared by two small definitions: just past the cut over 1081 pairs, which
+is what `T=0.04` says. A decision written twice in a real tree usually shares more. The second pair is
+the same kind of rule written as a query filter twice — open, non-empty orders; both also filter by the
+shop, and that is not among the facts they share, because a column filtered by a key the caller chose
+is not a fact (below).
 
 <details>
 <summary><b>The facts</b> — what is read off a definition, and why each rule is the language's, not the tool's</summary>
@@ -817,12 +842,39 @@ for a test and its negation.
   operand of `and`/`or` only when the whole is tested — `x or 0` is a default, not a test); `match`
   patterns; `isinstance`/`issubclass` as membership in a type; `bool(x)` as the truth of `x`;
   `x in (a, b)` on a literal as `x == a or x == b`.
+- **In TypeScript** the same, in its spellings: `===` and `==` and their negations are one relation;
+  `typeof x === 'string'`, `instanceof`, `in`, `Array.isArray`, `.includes` and `.has` are membership
+  (`[a, b].includes(x)` the equalities it abbreviates); `Boolean(x)` is the truth of `x`; a `switch`
+  compares its subject with each case; the predicate handed to `filter` / `find` / `some` / `every` is
+  a test; `null` and `undefined` are one absence. Not tests: the left of `??` (a default — read as a
+  fact, every `options.limit ?? 10` in a tree joined every other one) and the bound of a counting
+  `for` (Python's `for i in range(n)` spelled out).
+- **In Rust** a pattern is the comparison it abbreviates, wherever it stands — a `match` arm,
+  `if let`, `let … else`, `matches!`: a unit variant or a constant is equality, a variant with a
+  payload or a struct pattern is membership with its fields tested in turn, a range the two orders
+  that bound it. `assert!` is a truth position, `assert_eq!` an equality, `.contains` membership.
+  Absence and failure are one fact each however spelled: `Some(_)`, `.is_some()`, `.is_none()` and
+  `== None` all read `None = x`, the atom Python's `x is None` writes; `Ok(_)`, `Err(_)`, `.is_ok()`
+  and `.is_err()` all read `x in @Err`. `while let Some(x) = …` is iteration, and `?` hands an error
+  back rather than deciding on it.
 - **What a term is:** a name the definition binds is a hole (its spelling is the writer's); an imported
   name is the path it was imported from; a name the module defines is a local path, named the way the
-  rest of the tree imports that module — learned from the imports the corpus wrote, not from a list of
-  source roots; an attribute read off a hole is the attribute (`_.status`); a call is its callee and the
-  constants it was handed. A local assigned exactly once to a value the text fixes is that value; read
-  bare, one assigned once to a call is that computation.
+  rest of the tree imports that module — under the source root the corpus's own imports attest, not
+  one from a list, so a module nothing imports is named like its neighbours; an attribute read off a
+  hole is the attribute (`_.status`); a call is its callee and the constants it was handed. A local
+  assigned exactly once to a value the text fixes is that value; read bare, one assigned once to a
+  call is that computation. A TypeScript relative import is named by the module it resolves to. A
+  Rust path is crate-qualified as written — `crate::`, `self::`, `super::` and `Self` resolved where
+  they stand, a file under a package's `src/` named by its place there under the package directory's
+  name — so `use actix_web::…` in one crate and the definition in another meet as one path.
+- **What is not a fact:** a filter. `Order.shop_id == shop_id` selects rows by a key the caller chose,
+  `Order.id == Line.order_id` joins two tables, `Post.date < since` bounds a range — each compares an
+  attribute of a class (a column, in a query) with a value the text does not fix, and says nothing about
+  the rows but that they were selected, which every query on one table has in common. An attribute of
+  a class is a fact against a value (a literal, a constant — a path written in capitals — or a call) or
+  against another attribute of the same class (`Task.attempts < Task.max_attempts`). A field read off a
+  value is not held to this: `a.id == b.id` and `latest.revision == revision` relate two records, and
+  whether they agree is the decision.
 
 Two choices are modelling rather than semantics, applied uniformly: `is` and `==` are one relation, and
 so are the four order comparisons.
@@ -849,7 +901,10 @@ projection. Which pairs are more than chance is the question of validated projec
   dependent p-values; pairs sharing a definition are neither proven to be.
 
 Each class pair's critical value at the rate is computed once, and the join keeps only the pairs that
-could clear it — exact, since the Benjamini–Hochberg threshold never exceeds the rate.
+could clear it — exact, since the Benjamini–Hochberg threshold never exceeds the rate. The step-up
+rejects nothing above `R·α/m`, and `R` is at most the number of pairs reaching that level, so the level
+is narrowed to its fixed point before any tail is computed: a saddlepoint tail is paid for a few
+thousand pairs instead of millions, and the threshold over them is the threshold over all.
 </details>
 
 <details>
@@ -866,7 +921,10 @@ could clear it — exact, since the Benjamini–Hochberg threshold never exceeds
 
 Nothing is inferred for a function or class read as a value anywhere (handed on, queried, validated),
 decorated, or called once with `*args`/`**kwargs`; nor for a field name that a keyword to an unnamed
-callee or an attribute assignment could write past the constructor. These guards catch what the text
+callee or an attribute assignment could write past the constructor. In Rust a struct is a record — its
+literal is the constructor, called with every field by name, and `..base` leaves it open — and a trait
+method or a function an attribute registers (`#[get("/")]`, `#[tokio::main]`) is called from outside the
+corpus, so nothing is inferred for its parameters. These guards catch what the text
 shows — not reflection, dispatch by string, or callers outside the scanned tree. That is why it is off by
 default: true of an application, mostly false of a library. A finding that leans on it says so next to the
 fact that needed it.
@@ -897,13 +955,25 @@ inlined across calls — reuse is not duplication), a field derived by a conditi
 or a predicate of a single fact pasted into a long function, which no statistic over twenty million pairs
 can call significant.
 
+The rule that a filter is not a fact (above) was measured after the fact on the same tree: it took 279
+definitions out of the population — those deciding on nothing but key filters — and with them 141 of
+675 pair findings and 42 of 113 families, repository functions sharing a table's key columns or a join;
+55 findings appeared, most of them the families the surviving pairs regrouped into, and 18 of the 20
+strongest findings are the same before and after.
+
 Tried and measured as an alternative: the same facts as an eleventh [lens](#lenses). Voting with the
 other ten it recovers none of the pass's pairs — a rule written twice disagrees by construction on
 control, failures and effects; alone, under the Type-3 cosine, it recovers a quarter, and most of what it
 adds is single-linkage chaining.
 
-The pass runs in about 0.3 s on that tree. `FDD_DUMP_DECIDES=<path>` writes every definition's facts as
+The pass runs in about 0.1 s on that tree. `FDD_DUMP_DECIDES=<path>` writes every definition's facts as
 JSON lines, the input the labels were made against.
+
+On TypeScript and Rust, sampled the same way: on vscode (≈66k definitions that test anything, ≈2·10⁹
+pairs) the pass reports ≈31k findings in 2.9 s, and a random 30 read 19 relevant; on actix-web it reports
+166 in 26 ms, and a random 25 read 18, eleven of them tests asserting the same things. Every false one
+in the Rust sample is two methods that each match over all of one enum's variants — dispatch, which the
+pass reads as a decision both make (see [Limitations](#limitations)).
 </details>
 
 ## For agents
@@ -939,7 +1009,7 @@ Five crates, layered so the engine never depends on a language:
                   ▲                 contract, the kind vocabulary, the alpha-rename, the lens
         ┌────┬────┼────┬────┐       machinery and the dotted-path form.  No deps.
       py-   rs-   ts-  find-dup-defs
-     canon canon canon  (engine + CLI: the 3 passes + patternology + converge +
+     canon canon canon  (engine + CLI: the 3 passes + patternology + converge + decisions +
         └────┴────┴───────▲          severity + directives + calibration + reports)
                           │
                     the engine depends on the contract and on each frontend,
@@ -950,7 +1020,8 @@ Five crates, layered so the engine never depends on a language:
 names a language. [`dup-defs-core`](crates/dup-defs-core) is everything both sides share: the
 contract (`Def`, `Facets`, `KindSpec`, `Analysis`, the `Frontend` trait), and the pieces the
 frontends would otherwise each keep a copy of — the kind vocabulary, `alpha_rename`, `count_loc`,
-the lens vocabulary and stitching, the dotted-path form and its prefix walk.
+the lens vocabulary and stitching, the `use` lens's site logic, the dotted-path form and its prefix
+walk, the decision-atom grammar and the facts record, the normal form's round bound and name counts.
 [`py-canon`](crates/py-canon), [`ts-canon`](crates/ts-canon) and [`rs-canon`](crates/rs-canon) are
 the frontends (Ruff, oxc, syn).
 
@@ -960,14 +1031,16 @@ impl if it wants patternology — and no engine changes.
 <details>
 <summary><b>What a frontend must answer</b>, and why one boundary was removed</summary>
 
-Beyond the body canonical, `Facets` asks for two things, and both are empty when a frontend does not
-report them — every pass reading them is self-gating, so a language lights up the moment its
-frontend fills them in, with no engine edit and no list of supported languages anywhere:
+Beyond the body canonical, `Facets` asks for more, and each field is empty when a frontend does not
+report it — every pass reading them is self-gating, so a language lights up the moment its frontend
+fills them in, with no engine edit and no list of supported languages anywhere:
 
 | facet | what | why it cannot be derived later |
 |---|---|---|
 | `statements` | every statement at every nesting level, header first at depth 0 | flattened, `for x in xs: / f() / g()` is indistinguishable from the three statements where `g()` runs *after* the loop — only the walk that produced them knows |
 | `reaches` | the dotted path each imported name it uses stands for, separator normalized to `.` | the corpus's own declaration of what a definition is *about*; two functions written independently about one entity share no line and often not one name |
+| `decides` | every proposition the definition tests, as atoms in the shared grammar | which expressions are propositions — a truth position, a pattern, a membership spelled as a call — is the language's to say |
+| `identity`, `params`, `calls`, `mentions`, `loose_keywords` | what calls name the definition by, its parameters, the calls it makes with each argument's term, the paths it reads as values, the field names it writes past a constructor | the closed-world reading resolves a parameter or a record field across files, and only the frontend knows a binding from a value |
 
 The contract used to be its own crate with a `find-dup-defs-canon` between it and the frontends, so
 the engine would not pull in frontend implementation. The perspective passes ended that: the engine
@@ -1056,22 +1129,24 @@ The honest ledger:
 
 - **Languages.** Python, TypeScript and Rust today. A new language is a `<lang>-canon` sibling
   crate.
-- **Rust patternology** is the youngest of the three: `rs-canon` splices statement bodies as node
-  children rather than lists, so long-body alignment is prefix-only, and macro internals are
-  opaque.
-- **TypeScript patternology** sees top-level `function` declarations and arrow / function-expression
-  `const`s. Class methods don't participate — their slice doesn't re-parse as a standalone
-  function, so they carry no patternology canonical. The duplicate passes still cover them.
-- **The `use` lens is Python-only** — it needs the tree-wide mention index that `py-canon` builds.
-  The other nine read the definition's own tree and run on all three frontends.
+- **Rust macros** are read when their arguments are comma-separated expressions (`vec![a, b]`,
+  `assert_eq!(x, y)`, `format!(…)`); one that takes anything else (`vec![0; n]`, a DSL) is opaque
+  to every pass.
 - **`use` assembles by name** with no import resolution, which holds while top-level names are
   effectively unique (measured: 2435 distinct across 2444 classes in one production tree) and
   degrades on trees where one name covers hundreds of definitions — the case `--max-name-group`
   exists for.
 - **Type-4 clones** (same logic, different syntax) in general are out of scope — program equivalence is
   undecidable. The [decisions](#decisions) pass reaches one decidable slice of them: two definitions that
-  test the same facts, whatever form the tests take. It is Python-only for now; the atom grammar is
-  shared, so another frontend lights it up by filling `Facets::decides`.
+  test the same facts, whatever form the tests take.
+- **Dispatch reads as a decision.** Two methods that each `match` over every variant of one enum share
+  every variant test, and the decisions pass reports them — in Rust, where a trait implementation over
+  an enum is the commonest shape there is, that is most of its false findings. Telling an exhaustive
+  dispatch from a decision written twice would drop the real ones too (two functions that both decide
+  on `Status::Open` and `Status::Closed`), so it is left to the reader.
+- **Rust crate names** are read from the package directory (`actix-web` is `actix_web`, the name
+  `cargo new` gives it). A package whose manifest renames its crate keeps its own paths consistent, but
+  a sibling crate's `use` of it no longer meets them.
 - **Token-level sub-expression duplication** is out of scope too; pair with jscpd or PMD CPD if you
   need it.
 - **The thickness constants** were tuned on the benchmark corpora above. Your codebase may want
