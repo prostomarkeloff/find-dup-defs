@@ -800,21 +800,25 @@ impl<'a> Dump<'a> {
         self.node("Call", &[callee, args])
     }
 
-    /// A composite literal's elements. A key that is a bare name is a field name and stays as
-    /// spelled; any other key is an expression.
+    /// A composite literal's elements. A key that is a bare name is a struct field: `FieldVal('name',
+    /// v)`, the Rust frontend's struct-literal field, its name kept as spelled. Any other key is an
+    /// expression — a map's — and the element is `KV(key, v)`. The two differ in what a varying key
+    /// means: another field is another member (reflection), another map key is just another value.
     fn elements(&mut self, body: Node<'_>) -> String {
         let items: Vec<String> = kids(body)
             .into_iter()
             .map(|el| match el.kind() {
                 "keyed_element" => {
-                    let key = field(el, "key").map_or_else(String::new, |k| {
-                        match kids(k).first().filter(|i| i.kind() == "identifier") {
-                            Some(name) => Self::lit(self.text(*name)),
-                            None => self.element(k),
-                        }
-                    });
+                    let key = field(el, "key");
+                    let name = key.and_then(|k| kids(k).into_iter().next()).filter(|i| i.kind() == "identifier");
+                    // The key is written before the value, so a local in it is numbered in source order.
+                    let (tag, key) = match (name, key) {
+                        (Some(name), _) => ("FieldVal", Self::lit(self.text(name))),
+                        (None, Some(k)) => ("KV", self.element(k)),
+                        (None, None) => ("KV", String::new()),
+                    };
                     let value = field(el, "value").map_or_else(String::new, |v| self.element(v));
-                    self.node("KV", &[key, value])
+                    self.node(tag, &[key, value])
                 }
                 _ => self.element(el),
             })

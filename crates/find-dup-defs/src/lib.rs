@@ -1020,9 +1020,11 @@ pub fn pass_patternology(defs: &[Def], theta: f64, support_min: usize, gpu: GpuM
     let py = patternology::PyDialect;
     let rs = patternology::RustDialect;
     let ts = patternology::TsDialect;
+    let go = patternology::GoDialect;
     let (mut py_canons, mut py_def_of): (Vec<String>, Vec<usize>) = (Vec::new(), Vec::new());
     let (mut rs_canons, mut rs_def_of): (Vec<String>, Vec<usize>) = (Vec::new(), Vec::new());
     let (mut ts_canons, mut ts_def_of): (Vec<String>, Vec<usize>) = (Vec::new(), Vec::new());
+    let (mut go_canons, mut go_def_of): (Vec<String>, Vec<usize>) = (Vec::new(), Vec::new());
     for (i, d) in defs.iter().enumerate() {
         if !d.kind.fn_like {
             continue;
@@ -1032,6 +1034,7 @@ pub fn pass_patternology(defs: &[Def], theta: f64, support_min: usize, gpu: GpuM
             CanonDialect::CPythonAst => (&mut py_canons, &mut py_def_of),
             CanonDialect::Rust => (&mut rs_canons, &mut rs_def_of),
             CanonDialect::Other => (&mut ts_canons, &mut ts_def_of), // the TypeScript frontend
+            CanonDialect::Go => (&mut go_canons, &mut go_def_of),
             // `CanonDialect` is `#[non_exhaustive]`: a future dialect without an engine impl is
             // skipped rather than mis-walked.
             _ => continue,
@@ -1096,10 +1099,11 @@ pub fn pass_patternology(defs: &[Def], theta: f64, support_min: usize, gpu: GpuM
 
     // Run the engine once per dialect group and merge. The whole-vs-sub subset filter is per group
     // (cluster indices are group-local), applied before mapping through that group's `def_of`.
-    let groups: [PatGroup; 3] = [
+    let groups: [PatGroup; 4] = [
         (&py, "py", &py_canons, &py_def_of),
         (&rs, "rs", &rs_canons, &rs_def_of),
         (&ts, "ts", &ts_canons, &ts_def_of),
+        (&go, "go", &go_canons, &go_def_of),
     ];
     let mut findings: Vec<Finding> = Vec::new();
     for (dialect, tag, canons, def_of) in groups {
