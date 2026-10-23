@@ -10,9 +10,11 @@
 //! frontend in `find-dup-defs-canon`.
 
 mod canon;
+mod decides;
 mod defs;
 mod frontend;
 mod lenses;
+mod normal;
 
 pub use canon::AnalyzedFn;
 pub use frontend::{Rust, CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};

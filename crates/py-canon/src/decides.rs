@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use dup_defs_core::decide;
+use dup_defs_core::decide::{self, DecisionFacts};
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{self as ast, BoolOp, CmpOp, Expr, Parameters, Pattern, Singleton, Stmt, UnaryOp};
 
@@ -484,20 +484,9 @@ impl Atoms<'_> {
         }
     }
 
-    /// A chain of fields read off a value of `class`: each hop whose class the module knows moves to
-    /// it, and the last known hop is the typed field, with whatever was read past it.
+    /// A chain of fields read off a value of `class`, hopping through the classes the module knows.
     fn typed(&self, class: &str, rest: &[&str]) -> String {
-        let mut current = class.to_owned();
-        for (i, attr) in rest.iter().enumerate() {
-            if i + 1 == rest.len() {
-                return decide::typed_field(&current, attr, &[]);
-            }
-            match self.scope.field_class(&current, attr) {
-                Some(next) => current = next,
-                None => return decide::typed_field(&current, attr, &rest[i + 1..]),
-            }
-        }
-        decide::field(rest)
+        decide::typed_chain(class, rest, |current, attr| self.scope.field_class(current, attr))
     }
 
     /// A constant's attributes: a path grows by them; any other constant has none a text could read,
@@ -783,17 +772,6 @@ impl<'a> Visitor<'a> for Atoms<'_> {
         }
         visitor::walk_comprehension(self, comprehension);
     }
-}
-
-/// What one definition tells the decisions pass: the atoms it decides on (sorted, deduplicated), the
-/// parameters calls fill, the calls it makes and the paths it reads as values.
-#[derive(Default)]
-pub(crate) struct DecisionFacts {
-    pub(crate) atoms: Vec<Arc<str>>,
-    pub(crate) params: Vec<Arc<str>>,
-    pub(crate) calls: Vec<decide::CallSite>,
-    pub(crate) mentions: Vec<Arc<str>>,
-    pub(crate) loose: Vec<Arc<str>>,
 }
 
 /// Calls and value reads, by the same identities the atoms are written in.

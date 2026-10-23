@@ -310,7 +310,7 @@ checksum = "fd8e701084c37e7ef62d3f9e453b618130cbc0ef3573847785952a3ac3f746bf"
 
 [[package]]
 name = "dup-defs-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "rayon",
 ]
@@ -335,7 +335,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "find-dup-defs"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "clap",
  "difflib-fast",
@@ -768,6 +768,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxc_ast_visit"
+version = "0.133.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "976e4c8e1874fd007c4e9a729ac0975e15cbc6b715b620cbb9616b73a30828be"
+dependencies = [
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_span",
+ "oxc_syntax",
+]
+
+[[package]]
 name = "oxc_data_structures"
 version = "0.133.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1027,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "py-canon"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "dup-defs-core",
  "littrs-ruff-python-ast",
@@ -1127,10 +1139,11 @@ checksum = "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f"
 
 [[package]]
 name = "rs-canon"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "dup-defs-core",
  "proc-macro2",
+ "quote",
  "rayon",
  "syn",
  "walkdir",
@@ -1308,11 +1321,12 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "ts-canon"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "dup-defs-core",
  "oxc_allocator",
  "oxc_ast",
+ "oxc_ast_visit",
  "oxc_parser",
  "oxc_span",
  "oxc_syntax",

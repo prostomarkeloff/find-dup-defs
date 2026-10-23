@@ -22,6 +22,18 @@
 //! reason the order relations fold into one: `a < b` and `b <= a` are each other's negation, and
 //! `a > b` is `b < a` written backwards.
 //!
+//! ## A filter is not a fact
+//!
+//! `Order.shop_id == shop_id` selects rows by a key the caller chose, `Order.id == Line.order_id` joins
+//! two tables, `Post.date < since` bounds a range. Each compares an **attribute of a class** — a column,
+//! in a query — with a value the text does not fix, and says nothing about the rows but that they were
+//! selected; it is what every query on one table has in common. An attribute of a class is a fact only
+//! against a **value** — a literal, a constant (a path written in capitals, the convention every
+//! language the tool reads shares), a call, whose result the callee fixes — or against another
+//! attribute of the same class (`Task.attempts < Task.max_attempts`); anything else is a filter and is
+//! dropped ([`is_fact`]). A field read off a value is not held to this: `a.id == b.id` and
+//! `latest.revision == revision` relate two records, and whether they agree is the decision.
+//!
 //! A term is an identity or a [`HOLE`]:
 //!
 //! - **hole** — a value the definition computed or was handed: a local, a parameter. Its name is the
@@ -101,6 +113,23 @@ pub fn typed_field(class: &str, field: &str, rest: &[&str]) -> String {
     out
 }
 
+/// A chain of fields read off a value of `class`: each hop whose class `field_class` knows moves to it,
+/// and the last known hop is the typed field, with whatever was read past it.
+#[must_use]
+pub fn typed_chain(class: &str, rest: &[&str], field_class: impl Fn(&str, &str) -> Option<String>) -> String {
+    let mut current = class.to_owned();
+    for (i, attr) in rest.iter().enumerate() {
+        if i + 1 == rest.len() {
+            return typed_field(&current, attr, &[]);
+        }
+        match field_class(&current, attr) {
+            Some(next) => current = next,
+            None => return typed_field(&current, attr, &rest[i + 1..]),
+        }
+    }
+    field(rest)
+}
+
 /// Replace every typed field in `text` by what `resolve(class, field)` says it holds, or by the
 /// receiver-erased `_.field` when it says nothing. Quoted literals are skipped.
 #[must_use]
@@ -168,6 +197,29 @@ pub struct CallSite {
     pub open: bool,
 }
 
+/// What one definition tells the decisions pass: the atoms it decides on (sorted, deduplicated), the
+/// parameters calls fill, the calls it makes, the paths it reads as values, and the field names it
+/// writes other than through a constructor the corpus can name.
+#[derive(Default)]
+pub struct DecisionFacts {
+    pub atoms: Vec<Arc<str>>,
+    pub params: Vec<Arc<str>>,
+    pub calls: Vec<CallSite>,
+    pub mentions: Vec<Arc<str>>,
+    pub loose: Vec<Arc<str>>,
+}
+
+/// A number as it reads, whole numbers without a fraction — `1` and `1.0` are one constant.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn number(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 1e15 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
+}
+
 /// A name resolved to the dotted path it stands for.
 #[must_use]
 pub fn path(dotted: &str) -> String {
@@ -231,6 +283,85 @@ pub fn container(mut members: Vec<String>) -> String {
 pub fn has_identity(term: &str) -> bool {
     term.split(['(', ')', '{', '}', ',', ' '])
         .any(|piece| !piece.is_empty() && piece != HOLE && !is_operator(piece))
+}
+
+/// True when a path names a constant, by the two conventions every language the tool reads shares:
+/// a segment written in capitals (`@app.Status.OPEN`, `@app.LIMIT`, `@app.Kind.OPEN.value`), or a
+/// capitalized member of a capitalized name — an enum's variant as Rust and TypeScript write it
+/// (`Status::Open`, `Status.Open`). A type's fields and methods are lower-case in all three
+/// languages, so any other path names a thing — an attribute, a class, a function.
+///
+/// 🔴 The second convention is not a nicety. Read as an attribute, `x.status == Status::Open` was a
+/// column compared with a value the text does not fix — a filter, dropped — so the commonest
+/// decision a Rust or TypeScript function makes was invisible to the pass.
+fn names_constant(path: &str) -> bool {
+    let capitalized = |segment: &str| segment.chars().next().is_some_and(char::is_uppercase);
+    let mut previous: Option<&str> = None;
+    for segment in path.split(['.', LOCAL_SPLIT]) {
+        let mut letters = segment.chars().filter(|c| c.is_alphabetic()).peekable();
+        if letters.peek().is_some() && letters.all(char::is_uppercase) {
+            return true;
+        }
+        if previous.is_some_and(capitalized) && capitalized(segment) {
+            return true;
+        }
+        previous = Some(segment);
+    }
+    false
+}
+
+/// A path to an attribute of a class — a column, in a query — rather than to a constant or a call;
+/// see [`names_constant`].
+fn names_attribute(term: &str) -> bool {
+    term.starts_with('@') && !term.contains('(') && !names_constant(term)
+}
+
+/// The class an attribute path belongs to: the path up to its last segment.
+fn owner(path: &str) -> &str {
+    path.rsplit_once('.').map_or(path, |(owner, _)| owner)
+}
+
+/// True when `attribute` compared to `other` is a filter: an attribute of a class against a value the
+/// text does not fix — a hole, a field of some value, an attribute of another class.
+fn filters(attribute: &str, other: &str) -> bool {
+    names_attribute(attribute) && !is_value(other) && !(names_attribute(other) && owner(attribute) == owner(other))
+}
+
+/// True when the term fixes a value: a literal, a container written out, a call or an expression
+/// (the text fixes what was computed, if not the result), or a path to a constant.
+#[must_use]
+pub fn is_value(term: &str) -> bool {
+    let term = term.trim_start_matches(['-', '+', '~']);
+    if term.starts_with(['"', '{']) || term.starts_with("b\"") || term.ends_with(')') {
+        return true;
+    }
+    if term.starts_with(|c: char| c.is_ascii_digit()) || matches!(term, "None" | "True" | "False" | "...") {
+        return true;
+    }
+    term.starts_with('@') && names_constant(term)
+}
+
+/// Whether an atom states a fact, or only filters.
+///
+/// A fact fixes something about what it tests: `_.status = @app.Status.OPEN`, `None = _.consumed_at`,
+/// `0 < _.remaining`, `@app.db.Order.status = @app.Status.OPEN`. An attribute of a class compared with
+/// what the text does not fix — a key (`Order.id == key`), a caller's field (`Order.id == row.id`),
+/// another class's attribute (`Order.id == Line.order_id`), a bound (`Post.date < since`) — selects
+/// rows and decides nothing about them; it is what every query on one table shares, and it is not a
+/// fact. Two attributes of one class compared (`Task.attempts < Task.max_attempts`) are. Fields read
+/// off values are not columns: `a.id == b.id` and `latest.revision == revision` relate two records,
+/// and whether they agree is the decision, so they stay. An atom with no identity at all is not a fact
+/// either.
+#[must_use]
+pub fn is_fact(atom: &str) -> bool {
+    let (rel, terms) = parts(atom);
+    if !terms.iter().any(|t| has_identity(t)) {
+        return false;
+    }
+    match (rel, terms.as_slice()) {
+        ("=" | "<", [a, b]) => !(filters(a, b) || filters(b, a)),
+        _ => true,
+    }
 }
 
 /// Replace every parameter token in `text` by what `resolve` says the parameter holds, or by the
@@ -470,6 +601,42 @@ mod tests {
         assert!(truth(&field(&["ready"])).is_some());
         assert!(!has_identity("{_, _}"));
         assert!(has_identity(&call("@app.check", Vec::new())));
+    }
+
+    #[test]
+    fn a_filter_is_not_a_fact_and_a_record_match_is() {
+        use super::{is_fact, is_value};
+        let shop = path("app.db.Order.shop_id");
+        // A column against a key, a caller's field, another table's column or a bound: rows selected,
+        // nothing decided.
+        assert!(!is_fact(&equal(&shop, HOLE).unwrap_or_default()));
+        assert!(!is_fact(&equal(&shop, &field(&["shop_id"])).unwrap_or_default()));
+        assert!(!is_fact(&equal(&shop, &path("app.db.Line.order_id")).unwrap_or_default()));
+        assert!(!is_fact(&order(&path("app.db.Order.placed_at"), HOLE).unwrap_or_default()));
+        // Against a value, or another column of its own table, the column decides.
+        assert!(is_fact(&equal(&shop, &path("app.Status.OPEN")).unwrap_or_default()));
+        assert!(is_fact(&equal(&path("app.db.Order.status"), &literal("open")).unwrap_or_default()));
+        assert!(is_fact(&equal(&shop, &call("@app.current_shop", Vec::new())).unwrap_or_default()));
+        assert!(is_fact(&order(&path("app.db.Task.attempts"), &path("app.db.Task.max_attempts")).unwrap_or_default()));
+        // Fields of records are not columns: whether two records agree is the decision.
+        assert!(is_fact(&equal(&field(&["id"]), &field(&["id"])).unwrap_or_default()));
+        assert!(is_fact(&equal(&field(&["revision"]), HOLE).unwrap_or_default()));
+        assert!(is_fact(&order(&field(&["expires_at"]), HOLE).unwrap_or_default()));
+        assert!(is_fact(&member(&field(&["id"]), HOLE).unwrap_or_default()));
+        assert!(is_value(&path("app.Kind.OPEN.value")) && is_value("-1") && is_value("{@app.K.A, @app.K.B}"));
+        assert!(!is_value(&path("app.db.Order")) && !is_value(&field(&["status"])));
+    }
+
+    #[test]
+    fn an_enum_variant_is_a_value_however_it_is_cased() {
+        use super::{is_fact, is_value};
+        // `Status::Open` and `Status.Open` — a capitalized member of a capitalized name — fix a value as
+        // `Status.OPEN` does, so a field compared with one decides rather than filters.
+        assert!(is_value(&path("crate.models.Status.Open")));
+        assert!(is_fact(&equal(&field(&["status"]), &path("crate.models.Status.Open")).unwrap_or_default()));
+        // A type's fields and methods are lower-case: `Order.status` is still a column.
+        assert!(!is_value(&path("app.db.Order.status")));
+        assert!(!is_value(&path("app.db.Order")));
     }
 
     #[test]

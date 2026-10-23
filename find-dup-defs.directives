@@ -55,3 +55,35 @@ de-escalate:<methods>StreamWalk::push@*canon/src/canon.rs=thin per-crate accumul
 # same reason as `KINDS` above.
 de-escalate:<constants>KINDS_WITH_LENSES@*canon/src/frontend.rs=per-frontend kind subset, not duplication
 de-escalate:<methods>*::kinds@*canon/src/frontend.rs=Frontend trait impl, per-frontend kind list
+
+# Per-frontend tests beyond the `tests` module — the same contract asserted of each frontend's own
+# output, parallel by design.
+de-escalate:<functions>*_tests::*@*canon/src/*=per-frontend contract tests, parallel by design
+
+# One analysis entry per syn item type: `ItemFn` and `ImplItemFn` are different types with one
+# signature-and-body shape, and the API takes each as it is.
+de-escalate:<functions>analyze_item_fn@*canon/src/canon.rs=per-syn-item-type entry point
+
+# The Type-3 walk and the `use` lens's site walk — the statement walk again, over each language's own
+# Dump; and the Dump's thin per-crate constructors and unit wrapper.
+de-escalate:<functions>type3_walk@*canon/src/canon.rs=per-language statement walker, different node types
+de-escalate:<classes>UseWalk@*canon/src/canon.rs=per-language site walker, different node types
+de-escalate:<methods>UseWalk::site@*canon/src/canon.rs=per-language site walker over its own Dump
+de-escalate:<methods>Dump::{expr,anchoring,hunting}@*canon/src/canon.rs=thin per-crate Dump method
+
+# The normal forms. Each frontend rewrites a body over its own parser AST, so the rule walks — which
+# names a body reads, whether an expression can have effects, the substitution that inlines a
+# temporary, the operands of a `&&` chain — have one shape and three node types. What they share (the
+# round bound, the name counts) is `dup_defs_core::normal`'s.
+de-escalate:<functions>{has_effects,names_read,reads_of,names_read_count,operands}@*canon/src/normal.rs=per-language walk over its own AST
+de-escalate:<classes>{ScopeWalk,Subst}@*canon/src/normal.rs=per-language visitor over its own AST
+
+# The decisions frontends. One reading of propositions, three ASTs: the term a name stands for follows
+# each language's own binding rules, and the visitors that collect bindings, calls and reads walk its
+# own nodes. The atom grammar, the facts record and the typed-field chain are `dup_defs_core::decide`'s.
+de-escalate:<methods>Atoms::named@*canon/src/decides.rs=per-language binding rules
+de-escalate:<methods>Atoms::{push,typed}@*canon/src/decides.rs=thin per-crate forwarder
+de-escalate:<methods>FileScope::module@*canon/src/decides.rs=thin per-crate getter
+de-escalate:<methods>Locals::*@*canon/src/decides.rs=per-language binding counter over its own AST
+de-escalate:<classes>Refs@*canon/src/decides.rs=per-language visitor over its own AST
+de-escalate:<classes>FileNames@*canon/src/defs.rs=per-language pair of the file's name tables

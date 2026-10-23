@@ -19,9 +19,13 @@
 --- duplicate type aliases (cross-file, by name) ---
 
 --- decisions in functions (one decision, written in two places) ---
-DUPLICATE FUNCTION [INFO]: offers / refuse  [T=0.00, n=2, loc=7, args=1]  votes[2]: decides×2 members×2  # decide on 2 shared fact(s), 0.89 expected by chance; surprise 14.9 nats (null mean 0.8); p = 4.9e-5 under the bipartite configuration model, Benjamini–Hochberg cut 5.1e-5 at FDR 0.05 over 990 pairs;   · @app.models.Status.OPEN = _.status;   · ? _.paid
+DUPLICATE FUNCTION [INFO]: offers / refuse  [T=0.04, n=2, loc=7, args=1]  votes[2]: decides×2 members×2  # decide on 2 shared fact(s), 0.81 expected by chance; surprise 14.9 nats (null mean 0.8); p = 6.0e-5 under the bipartite configuration model, Benjamini–Hochberg cut 9.3e-5 at FDR 0.05 over 1081 pairs;   · @app.models.Status.OPEN = _.status;   · ? _.paid
   py/app/catalog.py:4
   py/app/orders.py:12
+
+DUPLICATE FUNCTION [INFO]: open_orders / count_open  [T=0.04, n=2, loc=8, args=2]  votes[2]: decides×2 members×2  # decide on 2 shared fact(s), 0.81 expected by chance; surprise 14.9 nats (null mean 0.8); p = 6.0e-5 under the bipartite configuration model, Benjamini–Hochberg cut 9.3e-5 at FDR 0.05 over 1081 pairs;   · 0 < @app.models.Order.total;   · @app.models.Order.status = @app.models.Status.OPEN
+  py/app/repo.py:6
+  py/app/repo.py:16
 
 
 --- decisions in methods (one decision, written in two places) ---
@@ -29,4 +33,4 @@ DUPLICATE FUNCTION [INFO]: offers / refuse  [T=0.00, n=2, loc=7, args=1]  votes[
 --- decision families in functions (one decision, written in many places) ---
 
 --- decision families in methods (one decision, written in many places) ---
-# summary: 0 ERROR, 1 WARNING groups
+# summary: 0 ERROR, 2 WARNING groups

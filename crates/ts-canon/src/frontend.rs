@@ -39,16 +39,19 @@ impl Frontend for TypeScript {
     fn kinds(&self, opts: &ScanOpts) -> &'static [&'static KindSpec] {
         if opts.wants("lenses") { KINDS_WITH_LENSES } else { KINDS }
     }
+    /// The `use` lens counts a name's mentions across the whole set, so in lens mode this frontend
+    /// takes every file — and reads each content once, see `scan_with_uses`.
+    fn scans_across_files(&self, opts: &ScanOpts) -> bool {
+        opts.wants("lenses")
+    }
     fn scan(&self, files: &[Arc<str>], opts: &ScanOpts) -> Vec<Def> {
-        let mut defs: Vec<Def> = files
+        if opts.wants("lenses") {
+            return dup_defs_core::uses::scan_with_uses(files, |src, f| scan_source(src, f, opts), crate::canon::collect_sites);
+        }
+        files
             .par_iter()
             .flat_map(|f| fs::read_to_string(&**f).map_or_else(|_| Vec::new(), |src| scan_source(&src, f, opts)))
-            .collect();
-        if opts.wants("lenses") {
-            // Scoring is corpus-relative, so it happens once every file has been read.
-            dup_defs_core::lens::score_lens_defs(&mut defs);
-        }
-        defs
+            .collect()
     }
 }
 

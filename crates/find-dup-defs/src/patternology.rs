@@ -270,6 +270,7 @@ fn tfidf_rows(seqs: &[Vec<u32>], idf: &[f64]) -> (Vec<Vec<(u32, f64)>>, Vec<f64>
 }
 
 pub(crate) fn pattern_families(
+    dialect: &dyn Dialect,
     xname_canonicals: &[String],
     theta: f64,
     concurrency: Concurrency,
@@ -406,7 +407,7 @@ pub(crate) fn pattern_families(
                             min_sim = min_sim.min(c);
                         }
                     }
-                    let term = fold_lgg(&members, xname_canonicals);
+                    let term = fold_lgg(dialect, &members, xname_canonicals);
                     Some(PatternFamily { members, min_sim, term })
                 })
                 .collect::<Vec<_>>()
@@ -432,7 +433,7 @@ pub(crate) fn whole_fn_helpers(
     cfg: &ExtractCfg,
     concurrency: Concurrency,
 ) -> Vec<HelperCandidate> {
-    pattern_families(xname_canonicals, theta, concurrency)
+    pattern_families(d, xname_canonicals, theta, concurrency)
         .into_iter()
         .filter_map(|fam| {
             let shape = extractable(d, &fam.term, cfg)?;
@@ -629,7 +630,7 @@ pub(crate) fn subblock_helpers(
             let block = Term::List(bodies[f][s..e].to_vec());
             acc = Some(match acc {
                 None => block,
-                Some(a) => lgg(&a, &block),
+                Some(a) => lgg(d, &a, &block),
             });
         }
         let term = Term::Node(STMT_BLOCK_TAG.to_owned(), vec![acc.unwrap_or(Term::Hole)]);
@@ -872,18 +873,25 @@ fn py_parse_function_body(canon: &str) -> Vec<Term> {
 /// not just substitution, to recover an instance) — it is the least *common-subsequence* skeleton,
 /// which is what a readable structural template wants. The anti-unifier of a *set* is the left fold
 /// of this over the members; a position survives only if it aligns across EVERY member.
-fn lgg(a: &Term, b: &Term) -> Term {
+fn lgg(dialect: &dyn Dialect, a: &Term, b: &Term) -> Term {
     match (a, b) {
+        // A node that splices a sequence aligns its children as a list does.
+        (Term::Node(ta, ca), Term::Node(tb, cb)) if ta == tb && ca.len() != cb.len() && dialect.is_sequence(ta) => {
+            match lgg_list(dialect, ca, cb) {
+                Term::List(aligned) => Term::Node(ta.clone(), aligned),
+                other => other,
+            }
+        }
         (Term::Node(ta, ca), Term::Node(tb, cb)) if base_tag(ta) == base_tag(tb) => {
             let n = ca.len().min(cb.len());
             // `AsyncFunctionDef`/`AsyncFor`/`AsyncWith` share field order with their sync twins, so a
             // sync/async mirror (the botocore↔aiobotocore type-5 case) unifies: keep the tag when
             // both agree, else drop to the sync base (asyncness becomes the variation point).
             let tag = if ta == tb { ta.clone() } else { base_tag(ta).to_owned() };
-            Term::Node(tag, (0..n).map(|i| lgg(&ca[i], &cb[i])).collect())
+            Term::Node(tag, (0..n).map(|i| lgg(dialect, &ca[i], &cb[i])).collect())
         }
-        (Term::List(ca), Term::List(cb)) => lgg_list(ca, cb),
-        (Term::Atom(x), Term::Atom(y)) if x == y => Term::Atom(x.clone()),
+        (Term::List(ca), Term::List(cb)) => lgg_list(dialect, ca, cb),
+        (Term::Atom(left), Term::Atom(right)) if left == right => Term::Atom(left.clone()),
         _ => Term::Hole,
     }
 }
@@ -947,13 +955,13 @@ fn lcs_align(ca: &[Term], cb: &[Term]) -> Vec<(usize, usize)> {
 /// Differing length → LCS-align and anti-unify matched pairs, collapsing each run of unmatched
 /// (inserted/deleted) elements into a single hole, so `[A, B, C]` vs `[A, C]` → `[A, ?, C]` rather
 /// than `?`. Oversized lists fall back to a prefix zip + one trailing hole.
-fn lgg_list(ca: &[Term], cb: &[Term]) -> Term {
+fn lgg_list(d: &dyn Dialect, ca: &[Term], cb: &[Term]) -> Term {
     if ca.len() == cb.len() {
-        return Term::List(ca.iter().zip(cb).map(|(x, y)| lgg(x, y)).collect());
+        return Term::List(ca.iter().zip(cb).map(|(x, y)| lgg(d, x, y)).collect());
     }
     if ca.len().saturating_mul(cb.len()) > LIST_ALIGN_MAX_CELLS {
         let n = ca.len().min(cb.len());
-        let mut v: Vec<Term> = (0..n).map(|i| lgg(&ca[i], &cb[i])).collect();
+        let mut v: Vec<Term> = (0..n).map(|i| lgg(d, &ca[i], &cb[i])).collect();
         v.push(Term::Hole); // unaligned remainder
         return Term::List(v);
     }
@@ -964,7 +972,7 @@ fn lgg_list(ca: &[Term], cb: &[Term]) -> Term {
         if i > pi || j > pj {
             out.push(Term::Hole); // a run of inserted/deleted elements
         }
-        out.push(lgg(&ca[i], &cb[j]));
+        out.push(lgg(d, &ca[i], &cb[j]));
         pi = i + 1;
         pj = j + 1;
     }
@@ -1038,13 +1046,13 @@ fn signature(term: &Term) -> String {
 /// Fold [`lgg`] over a family's parsed canonicals → the anti-unification term (holes at the
 /// positions members disagree). Separated from rendering so the same generalization feeds both the
 /// readable pseudo-source note ([`py`]) and the tree-form tests.
-fn fold_lgg(members: &[usize], canons: &[String]) -> Term {
+fn fold_lgg(d: &dyn Dialect, members: &[usize], canons: &[String]) -> Term {
     let mut acc: Option<Term> = None;
     for &m in members {
         let t = parse_term(&canons[m]);
         acc = Some(match acc {
             None => t,
-            Some(a) => lgg(&a, &t),
+            Some(a) => lgg(d, &a, &t),
         });
     }
     acc.unwrap_or(Term::Hole)
@@ -1132,6 +1140,14 @@ pub(crate) trait Dialect: Sync {
     /// Render a folded term as one line of readable pseudo-source (holes → `?`), bounded by `budget`,
     /// falling back to the raw `Tag(child, …)` form for tags it has no rule for.
     fn render(&self, t: &Term, out: &mut String, budget: &mut usize);
+
+    /// Whether a node of this tag holds a sequence — statements, parameters, elements — spliced as its
+    /// children rather than wrapped in a `[…]` list. Such children are aligned the way a list's are
+    /// ([`lgg_list`]), not field by field: one statement inserted in the middle of a body is one hole,
+    /// not every statement after it. Python's dump wraps every sequence in a list, so it has none.
+    fn is_sequence(&self, _tag: &str) -> bool {
+        false
+    }
 }
 
 /// The Python (`CPython ast.dump`) dialect — the original and, until the Rust dialect lands, only
@@ -1190,6 +1206,13 @@ impl Dialect for RustDialect {
     fn render(&self, t: &Term, out: &mut String, budget: &mut usize) {
         rs_render(t, out, budget);
     }
+
+    fn is_sequence(&self, tag: &str) -> bool {
+        matches!(
+            tag,
+            "Block" | "Params" | "Tuple" | "Array" | "Named" | "PatOr" | "PatSlice" | "PatTuple" | "Turbofish" | "TyTuple"
+        )
+    }
 }
 
 /// Parse only the body of a Rust `Func(name, Params, ret, 'flags', Block(stmts…))` — skip the four
@@ -1218,8 +1241,9 @@ fn rs_parse_function_body(canon: &str) -> Vec<Term> {
 
 // ── Rust pseudo-source renderer ──────────────────────────────────────────────
 
-/// Comma-join node children `ch[from..]` via [`rs_render`].
-fn rs_seq(ch: &[Term], from: usize, out: &mut String, b: &mut usize) {
+/// Comma-join node children `ch[from..]`, each through a dialect's `render` ([`rs_render`],
+/// [`ts_render`]).
+fn seq(ch: &[Term], from: usize, out: &mut String, b: &mut usize, render: fn(&Term, &mut String, &mut usize)) {
     for (i, c) in ch.iter().enumerate().skip(from) {
         if i > from {
             out.push_str(", ");
@@ -1228,7 +1252,7 @@ fn rs_seq(ch: &[Term], from: usize, out: &mut String, b: &mut usize) {
             out.push('…');
             return;
         }
-        rs_render(c, out, b);
+        render(c, out, b);
     }
 }
 
@@ -1286,7 +1310,7 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             out.push('(');
             if let Some(Term::Node(pt, pch)) = ch.get(1) {
                 if pt == "Params" {
-                    rs_seq(pch, 0, out, b);
+                    seq(pch, 0, out, b, rs_render);
                 }
             }
             out.push(')');
@@ -1357,7 +1381,7 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
         "Call" => {
             rs_render(ch.first().unwrap_or(&Term::Hole), out, b);
             out.push('(');
-            rs_seq(ch, 1, out, b);
+            seq(ch, 1, out, b, rs_render);
             out.push(')');
         }
         "Method" => {
@@ -1365,7 +1389,7 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             out.push('.');
             out.push_str(&ident(ch.get(1)));
             out.push('(');
-            rs_seq(ch, 2, out, b);
+            seq(ch, 2, out, b, rs_render);
             out.push(')');
         }
         "Field" => {
@@ -1395,7 +1419,7 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             out.push_str("match ");
             rs_render(ch.first().unwrap_or(&Term::Hole), out, b);
             out.push_str(" { ");
-            rs_seq(ch, 1, out, b);
+            seq(ch, 1, out, b, rs_render);
             out.push_str(" }");
         }
         "Arm" => {
@@ -1478,12 +1502,12 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
         }
         "Tuple" | "PatTuple" | "TyTuple" => {
             out.push('(');
-            rs_seq(ch, 0, out, b);
+            seq(ch, 0, out, b, rs_render);
             out.push(')');
         }
         "Array" | "PatSlice" => {
             out.push('[');
-            rs_seq(ch, 0, out, b);
+            seq(ch, 0, out, b, rs_render);
             out.push(']');
         }
         "Range" => {
@@ -1496,7 +1520,7 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
         "StructLit" | "PatStruct" => {
             out.push_str(&ident(ch.first()));
             out.push_str(" { ");
-            rs_seq(ch, 1, out, b);
+            seq(ch, 1, out, b, rs_render);
             out.push_str(" }");
         }
         "FieldVal" | "PatField" => {
@@ -1547,7 +1571,7 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
         "PatTupleStruct" => {
             out.push_str(&ident(ch.first()));
             out.push('(');
-            rs_seq(ch, 1, out, b);
+            seq(ch, 1, out, b, rs_render);
             out.push(')');
         }
         // Type-ascription pattern: `pat: ty`.
@@ -1586,7 +1610,7 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             out.push_str(tag);
             if !ch.is_empty() {
                 out.push('(');
-                rs_seq(ch, 0, out, b);
+                seq(ch, 0, out, b, rs_render);
                 out.push(')');
             }
         }
@@ -1601,8 +1625,8 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
 /// in a `[…]` `Term::List` — the exceptions are `Var`'s declarator list and the collection literals
 /// (`Arr`/`Obj`/`Tpl`/`Seq`), which ARE bracket lists. A function reaching patternology is either a
 /// `Func('_fn', Params, Block, …flags)` declaration or an arrow / function-expression bound to a
-/// `const`/`let` (`Var('const', [Decl(Bind, Arrow(…))])`); class methods don't reach here (their
-/// slice doesn't re-parse as a standalone function, so they analyze to `None`).
+/// `const`/`let` (`Var('const', [Decl(Bind, Arrow(…))])`); a class method arrives as the `Func` it
+/// would be, named `_fn`.
 ///
 /// One canon quirk drives the slot table: the `async=… gen=…[ expr=…]` flag string is emitted
 /// **unquoted**, so the parser reads it as a run of trailing `false`/`true` atoms (the `async`/`gen`
@@ -1629,10 +1653,11 @@ impl Dialect for TsDialect {
             ("Member" | "PrivateMember", 1)
             | ("ObjProp" | "Prop" | "Method" | "BindProp" | "TargetProp", 0) => Ctx::Selector,
             // Signature material — the fn name, the `async=… gen=…[ expr=…]` flag atoms (parsed as
-            // trailing `false`/`true`), and the type of an `x as T` / `x satisfies T` / `<T>x`.
-            // A `Decl`'s binding name (slot 0) is a synthetic `_fn` (blanked arrow-const) or a `_v…`
-            // placeholder — never shared logic, so it must not anchor the motif.
-            ("Func", 0 | 3 | 4) | ("Arrow", 2..=4) | ("Decl", 0) | ("TSAs" | "TSSat" | "TSAssert", 1) => {
+            // trailing `false`/`true`) and the `Ret(…)` / `TParams(…)` fields after them, a binding's
+            // annotation, and the type of an `x as T` / `x satisfies T` / `<T>x`. A `Decl`'s binding
+            // name (slot 0) is a synthetic `_fn` (blanked arrow-const) or a `_v…` placeholder — never
+            // shared logic, so it must not anchor the motif.
+            ("Func", 0 | 3..) | ("Arrow", 2..) | ("Decl", 0) | ("Annot" | "TSAs" | "TSSat" | "TSAssert", 1) => {
                 Ctx::Anno
             }
             _ => Ctx::Expr,
@@ -1645,6 +1670,25 @@ impl Dialect for TsDialect {
 
     fn render(&self, t: &Term, out: &mut String, budget: &mut usize) {
         ts_render(t, out, budget);
+    }
+
+    fn is_sequence(&self, tag: &str) -> bool {
+        matches!(
+            tag,
+            "Block"
+                | "Params"
+                | "Arr"
+                | "ArrTarget"
+                | "BindArr"
+                | "BindObj"
+                | "Obj"
+                | "ObjTarget"
+                | "Seq"
+                | "TParams"
+                | "TSInter"
+                | "TSUnion"
+                | "Tpl"
+        )
     }
 }
 
@@ -1683,20 +1727,6 @@ fn ts_parse_function_body(canon: &str) -> Vec<Term> {
 
 // ── TypeScript pseudo-source renderer ────────────────────────────────────────
 
-/// Comma-join node children `ch[from..]` via [`ts_render`].
-fn ts_seq(ch: &[Term], from: usize, out: &mut String, b: &mut usize) {
-    for (i, c) in ch.iter().enumerate().skip(from) {
-        if i > from {
-            out.push_str(", ");
-        }
-        if *b == 0 {
-            out.push('…');
-            return;
-        }
-        ts_render(c, out, b);
-    }
-}
-
 /// Render the elements of a bracket-list child (call/`new` args, `Arr`/`Obj` elements), each through
 /// [`ts_render`], comma-joined. A missing or non-list child contributes nothing.
 fn ts_list_inner(t: Option<&Term>, out: &mut String, b: &mut usize) {
@@ -1710,6 +1740,27 @@ fn ts_list_inner(t: Option<&Term>, out: &mut String, b: &mut usize) {
                 return;
             }
             ts_render(it, out, b);
+        }
+    }
+}
+
+/// Render a JSX element's children as markup: elements, fragments and text as themselves, any other
+/// expression in the `{…}` container it was written in.
+fn ts_jsx_children(children: &[Term], out: &mut String, b: &mut usize) {
+    for child in children {
+        if *b == 0 {
+            out.push('…');
+            return;
+        }
+        match child {
+            Term::Node(tag, _) if matches!(tag.as_str(), "JSX" | "JSXFragment" | "Text" | "SpreadChild") => {
+                ts_render(child, out, b);
+            }
+            other => {
+                out.push('{');
+                ts_render(other, out, b);
+                out.push('}');
+            }
         }
     }
 }
@@ -1741,7 +1792,7 @@ fn ts_stmt_child(t: Option<&Term>, out: &mut String, b: &mut usize) {
 /// hole, comma-joined (the surrounding parens are written by the caller).
 fn ts_params(t: Option<&Term>, out: &mut String, b: &mut usize) {
     match t {
-        Some(Term::Node(tag, ch)) if tag == "Params" => ts_seq(ch, 0, out, b),
+        Some(Term::Node(tag, ch)) if tag == "Params" => seq(ch, 0, out, b, ts_render),
         Some(other) => ts_render(other, out, b),
         None => {}
     }
@@ -1802,8 +1853,20 @@ fn ts_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
         // Parenthesized comma list — a parameter list or a sequence expression.
         "Params" | "Seq" => {
             out.push('(');
-            ts_seq(ch, 0, out, b);
+            seq(ch, 0, out, b, ts_render);
             out.push(')');
+        }
+        // A binding with its annotation, and a generic type applied to its arguments.
+        "Annot" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push_str(": ");
+            ts_render(ch.get(1).unwrap_or(&Term::Hole), out, b);
+        }
+        "TApp" => {
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push('<');
+            seq(ch, 1, out, b, ts_render);
+            out.push('>');
         }
         // A binding with an optional initializer — a `Param`'s default or a `Decl`'s init.
         "Param" | "Decl" => {
@@ -1819,7 +1882,7 @@ fn ts_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
         }
         // Name-position leaves — render the (renamed) identifier / literal value.
-        "Id" | "Bind" | "Num" | "Bool" | "BigInt" => out.push_str(&ident(ch.first())),
+        "Id" | "Bind" | "Num" | "Bool" | "BigInt" | "Text" => out.push_str(&ident(ch.first())),
         "This" => out.push_str("this"),
         "Super" => out.push_str("super"),
         "Null" => out.push_str("null"),
@@ -1986,7 +2049,7 @@ fn ts_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             out.push_str("switch (");
             ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
             out.push_str(") { ");
-            ts_seq(ch, 1, out, b);
+            seq(ch, 1, out, b, ts_render);
             out.push_str(" }");
         }
         "Case" => {
@@ -2094,13 +2157,13 @@ fn ts_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
         // Array literal / array-destructuring pattern.
         "Arr" | "BindArr" => {
             out.push('[');
-            ts_seq(ch, 0, out, b);
+            seq(ch, 0, out, b, ts_render);
             out.push(']');
         }
         // Object literal / object-destructuring pattern.
         "Obj" | "BindObj" => {
             out.push_str("{ ");
-            ts_seq(ch, 0, out, b);
+            seq(ch, 0, out, b, ts_render);
             out.push_str(" }");
         }
         // `key: value` object-literal entry / object-destructuring binding.
@@ -2134,12 +2197,55 @@ fn ts_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             out.push('>');
             ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
         }
+        // `JSX(tag, [attributes], [children])`: an element written back as markup.
         "JSX" => {
+            let tag = ident(ch.first());
             out.push('<');
-            out.push_str(&ident(ch.first()));
-            out.push_str(" />");
+            out.push_str(&tag);
+            if let Some(Term::List(attributes)) = ch.get(1) {
+                for attribute in attributes {
+                    out.push(' ');
+                    ts_render(attribute, out, b);
+                }
+            }
+            match ch.get(2) {
+                Some(Term::List(children)) if !children.is_empty() => {
+                    out.push('>');
+                    ts_jsx_children(children, out, b);
+                    out.push_str("</");
+                    out.push_str(&tag);
+                    out.push('>');
+                }
+                Some(Term::Hole) => {
+                    out.push_str(">?</");
+                    out.push_str(&tag);
+                    out.push('>');
+                }
+                _ => out.push_str(" />"),
+            }
         }
-        "JSXFragment" => out.push_str("<></>"),
+        "JSXFragment" => {
+            out.push_str("<>");
+            match ch.first() {
+                Some(Term::List(children)) => ts_jsx_children(children, out, b),
+                Some(Term::Hole) => out.push('?'),
+                _ => {}
+            }
+            out.push_str("</>");
+        }
+        "Attr" => {
+            out.push_str(&ident(ch.first()));
+            if let Some(value) = ch.get(1) {
+                out.push_str("={");
+                ts_render(value, out, b);
+                out.push('}');
+            }
+        }
+        "SpreadAttr" | "SpreadChild" => {
+            out.push_str("{...");
+            ts_render(ch.first().unwrap_or(&Term::Hole), out, b);
+            out.push('}');
+        }
         // Type-position structure that can ride along a `x as T` ascription or a local `type` decl.
         "TSTypeAlias" => {
             out.push_str("type ");
@@ -2172,7 +2278,7 @@ fn ts_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             out.push_str(tag);
             if !ch.is_empty() {
                 out.push('(');
-                ts_seq(ch, 0, out, b);
+                seq(ch, 0, out, b, ts_render);
                 out.push(')');
             }
         }
@@ -3208,7 +3314,7 @@ fn py_opt(t: Option<&Term>, out: &mut String, b: &mut usize) {
 /// (`HelperShape::body`); this stays as the direct test handle for the `py` renderer.
 #[cfg(test)]
 fn anti_unify(members: &[usize], canons: &[String]) -> String {
-    let term = fold_lgg(members, canons);
+    let term = fold_lgg(&PyDialect, members, canons);
     let mut out = String::new();
     let mut budget = LGG_NODE_BUDGET;
     py(&term, &mut out, &mut budget);
@@ -3254,7 +3360,7 @@ mod tests {
         // Two "create" shapes: build → add → return, with totally different names/literals.
         let a = "FunctionDef(name='_fn', body=[Assign(targets=[Name('_v0')], value=Call(func=Name('AuthRefreshToken'), args=[Constant('x')])), Expr(value=Call(func=Attribute(value=Name('session'), attr='add'))), Return(value=Name('_v0'))])".to_owned();
         let b = "FunctionDef(name='_fn', body=[Assign(targets=[Name('_v0')], value=Call(func=Name('Clientspace'), args=[Constant('y'), Constant('z')])), Expr(value=Call(func=Attribute(value=Name('db'), attr='add'))), Return(value=Name('_v0'))])".to_owned();
-        let fams = pattern_families(&[a, b], 0.7, Concurrency::Cpu);
+        let fams = pattern_families(&PyDialect, &[a, b], 0.7, Concurrency::Cpu);
         assert_eq!(fams.len(), 1, "the two create-shapes should form one family");
         assert_eq!(fams[0].members, vec![0, 1]);
         assert!(matches!(fams[0].term, Term::Node(..)), "family folds to a real skeleton term");
@@ -3269,7 +3375,7 @@ mod tests {
         let b = "FunctionDef(name='_fn', body=[Assign(targets=[Name('_v0')], value=Call(func=Name('Clientspace'), args=[Constant('y'), Constant('z')])), Expr(value=Call(func=Attribute(value=Name('db'), attr='add'))), Return(value=Name('_v0'))])";
         let mut tmpl = String::new();
         let mut budget = LGG_NODE_BUDGET;
-        render_term(&fold_lgg(&[0, 1], &[a.to_owned(), b.to_owned()]), &mut tmpl, &mut budget);
+        render_term(&fold_lgg(&PyDialect, &[0, 1], &[a.to_owned(), b.to_owned()]), &mut tmpl, &mut budget);
         // Shared skeleton survives…
         assert!(tmpl.starts_with("FunctionDef("), "got: {tmpl}");
         assert!(tmpl.contains("Return(Name('_v0'))"), "return shape kept: {tmpl}");
@@ -3346,6 +3452,24 @@ mod tests {
     }
 
     #[test]
+    fn a_spliced_body_aligns_like_a_list() {
+        // Rust and TypeScript splice a body's statements as `Block`'s children. One statement more in
+        // the middle is one hole; read field by field, everything after it would be.
+        let a = parse_term("Block(ExprStmt(Call(Path('log'))), ExprStmt(Call(Path('save'))), Tail(Path('_v0')))");
+        let b = parse_term("Block(ExprStmt(Call(Path('log'))), Tail(Path('_v0')))");
+        let aligned = lgg(&RustDialect, &a, &b);
+        let Term::Node(tag, children) = &aligned else { panic!("a block: {aligned:?}") };
+        assert_eq!(tag, "Block");
+        assert_eq!(children.len(), 3, "{aligned:?}");
+        assert_eq!(children[1], Term::Hole);
+        assert_eq!(children[2], parse_term("Tail(Path('_v0'))"), "the tail survives the insertion");
+        // Python's dump never splices, so its nodes stay fields: the prefix, and nothing past it.
+        let Term::Node(_, fields) = lgg(&PyDialect, &a, &b) else { panic!("a node") };
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[1], Term::Hole);
+    }
+
+    #[test]
     fn unparse_renders_list_tuple_without_double_brackets() {
         // List/Tuple/Set store elements in a single list child; rendering must not re-wrap it (the
         // `[]`→`[[]]` / `(a, b)`→`([a, b])` bug). Empty list → `[]`, tuple-target → `(a, b)`.
@@ -3375,7 +3499,7 @@ mod tests {
         // Same node, one shared child atom, one divergent → keep tag, keep shared, hole the rest.
         let a = parse_term("Call(Name('foo'), 'shared')");
         let b = parse_term("Call(Name('bar'), 'shared')");
-        let g = lgg(&a, &b);
+        let g = lgg(&PyDialect, &a, &b);
         let mut out = String::new();
         let mut budget = LGG_NODE_BUDGET;
         render_term(&g, &mut out, &mut budget);
@@ -3390,7 +3514,7 @@ mod tests {
         let b = parse_term("G([A(), C()])");
         let mut out = String::new();
         let mut budget = LGG_NODE_BUDGET;
-        render_term(&lgg(&a, &b), &mut out, &mut budget);
+        render_term(&lgg(&PyDialect, &a, &b), &mut out, &mut budget);
         assert_eq!(out, "G([A, ?, C])");
     }
 
@@ -3412,7 +3536,7 @@ mod tests {
         let b = parse_term("F('n', 'a')");
         let mut out = String::new();
         let mut budget = LGG_NODE_BUDGET;
-        render_term(&lgg(&a, &b), &mut out, &mut budget);
+        render_term(&lgg(&PyDialect, &a, &b), &mut out, &mut budget);
         assert_eq!(out, "F('n', 'a')");
     }
 
@@ -3486,7 +3610,7 @@ mod tests {
         // a clean helper: shared skeleton dominates, holes are all bindable params, no stmt-holes.
         let a = "FunctionDef('_fn', arguments([], []), [Assign([Name('_v0', Store)], Call(Name('AuthRefreshToken', Load), [Constant('x')], [])), Expr(Call(Attribute(Name('session', Load), 'add', Load), [Name('_v0', Load)], [])), Return(Name('_v0', Load))], [], None)";
         let b = "FunctionDef('_fn', arguments([], []), [Assign([Name('_v0', Store)], Call(Name('Clientspace', Load), [Constant('y')], [])), Expr(Call(Attribute(Name('session', Load), 'add', Load), [Name('_v0', Load)], [])), Return(Name('_v0', Load))], [], None)";
-        let term = fold_lgg(&[0, 1], &[a.to_owned(), b.to_owned()]);
+        let term = fold_lgg(&PyDialect, &[0, 1], &[a.to_owned(), b.to_owned()]);
         let shape = extractable(&PyDialect, &term, &ExtractCfg::default()).expect("create-shape is extractable");
         assert!(shape.params >= 1, "the holed model/constant become params: {shape:?}");
         assert!(shape.fixed >= 6, "skeleton is substantial: {shape:?}");
@@ -3500,7 +3624,7 @@ mod tests {
         // a whole statement in the body list → a leaky statement-hole → not a clean helper, dropped.
         let a = "FunctionDef('_fn', arguments([], []), [Expr(Call(Name('a', Load), [], [])), Assign([Name('_v0', Store)], Constant(1)), Return(Name('_v0', Load))], [], None)";
         let b = "FunctionDef('_fn', arguments([], []), [Expr(Call(Name('a', Load), [], [])), Raise(Call(Name('E', Load), [], [])), Return(Name('_v0', Load))], [], None)";
-        let term = fold_lgg(&[0, 1], &[a.to_owned(), b.to_owned()]);
+        let term = fold_lgg(&PyDialect, &[0, 1], &[a.to_owned(), b.to_owned()]);
         assert!(extractable(&PyDialect, &term, &ExtractCfg::default()).is_none(), "statement-hole must disqualify");
     }
 
@@ -3512,8 +3636,8 @@ mod tests {
         let mk = |lit: &str| format!("FunctionDef('_fn', arguments([], []), [Assign([Name('_v0', Store)], Call(Name('M', Load), [Constant('{lit}')], [])), Return(Name('_v0', Load))], [], None)");
         let c1 = [mk("a"), mk("b")];
         let c2 = [mk("p"), mk("q")];
-        let s1 = signature(&fold_lgg(&[0, 1], &c1));
-        let s2 = signature(&fold_lgg(&[0, 1], &c2));
+        let s1 = signature(&fold_lgg(&PyDialect, &[0, 1], &c1));
+        let s2 = signature(&fold_lgg(&PyDialect, &[0, 1], &c2));
         assert_eq!(s1, s2, "same idiom, different cohorts → same signature");
         assert!(s1.contains('?'), "the holed constant shows as ?: {s1}");
         assert!(s1.starts_with("FunctionDef("), "signature is the canonical tree form: {s1}");
@@ -3740,5 +3864,21 @@ mod tests {
         let cands =
             whole_fn_helpers(&TsDialect, &[fa, fb], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
         assert!(cands.is_empty(), "a varying member name must not extract, got: {cands:?}");
+    }
+
+    #[test]
+    fn ts_jsx_renders_back_as_markup() {
+        // Two components differing in one attribute value: the helper is the markup with that value
+        // holed, written back as markup rather than as the canonical's node tags.
+        let card = |class: &str| {
+            format!("Func('_fn', Params(Param(Bind('_v0'), )), Block(Return(JSX('section', [Attr('className', Str('{class}'))], [JSX('h1', [], [Member(Id('_v0'), 'title', '')]), Text('read more'), JSX('Link', [Attr('href', Member(Id('_v0'), 'url', ''))], [])]))), async=false gen=false)")
+        };
+        let cands =
+            whole_fn_helpers(&TsDialect, &[card("card"), card("panel")], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert_eq!(cands.len(), 1, "one helper: {cands:?}");
+        assert_eq!(
+            cands[0].body,
+            "function _fn(_v0) { return <section className={\"?\"}><h1>{_v0.title}</h1>read more<Link href={_v0.url} /></section> }",
+        );
     }
 }

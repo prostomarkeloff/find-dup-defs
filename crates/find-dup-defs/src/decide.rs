@@ -36,7 +36,9 @@
 //! A pair a body pass already clusters is a copy, and that pass reports it; this one exists for the
 //! pairs those passes cannot see. Facts are not inlined across calls: two definitions calling one
 //! predicate share that call, which is evidence they decide the same thing, while the predicate's own
-//! tests stay its own — reuse is not duplication.
+//! tests stay its own — reuse is not duplication. A column filtered by a key the caller chose, or
+//! joined to another table, is a filter, not a fact ([`decide::is_fact`]): what every query on one
+//! table has in common is not a decision, and the pass does not read it as one.
 //!
 //! Findings are advisory ([`Severity::Info`]), like converge's: the pass says where a decision lives
 //! twice, and whether that is one rule or two that look alike is a reading, not a gate.
@@ -59,8 +61,6 @@ pub const DECISION_SECTION_OFFSET: usize = 4000;
 /// Report-section offset for decision families.
 pub const DECISION_FAMILY_SECTION_OFFSET: usize = 5000;
 
-/// A family is more than a pair — the smallest group that is not one.
-const MIN_FAMILY: usize = 3;
 
 /// The statistic a pair is weighed by; the null is the same for both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -112,30 +112,51 @@ struct Corpus {
     inferred: Vec<HashSet<u32>>,
 }
 
-/// What the tree calls a module whose file path a frontend reported: the longest tail of that path
-/// some import in the corpus actually wrote. A file at `src/pkg/m.py` that the tree imports as
-/// `pkg.m` is `pkg.m`; one no import ever names keeps its path.
+/// What the tree calls a module whose file path a frontend reported.
+///
+/// A file at `src/pkg/m.py` is imported as `pkg.m`: the prefix the tree drops from the file path is
+/// its source root, and the corpus shows it — every module some import names absolutely attests the
+/// root its path sits under. A module nothing imports absolutely (a leaf of private helpers, one
+/// reached only relatively) is named under the root its neighbours attest, so its locals read
+/// `@pkg.m.X` and not as the path the file was found at, and two such modules with one file name
+/// stay apart. Roots are weighed by how many modules attest them, which keeps a relative import
+/// read as a top-level module from outvoting the tree. With nothing attested a path stays as it is.
 fn module_names(defs: &[Def]) -> impl Fn(&str) -> String {
     let attested: HashSet<String> = defs
         .iter()
         .flat_map(|d| d.facets.reaches.iter())
         .flat_map(|path| reach::prefixes(path).map(str::to_owned).collect::<Vec<_>>())
         .collect();
+    let modules: HashSet<String> = defs
+        .iter()
+        .filter_map(|d| d.facets.identity.as_deref())
+        .filter_map(|identity| decide::local_modules(identity).next().map(str::to_owned))
+        .collect();
+    let mut support: HashMap<String, usize> = HashMap::new();
+    for module in &modules {
+        let segments: Vec<&str> = module.split('.').collect();
+        if let Some(drop) = (0..segments.len()).find(|&drop| attested.contains(&segments[drop..].join("."))) {
+            *support.entry(segments[..drop].join(".")).or_insert(0) += 1;
+        }
+    }
     move |module: &str| {
         let segments: Vec<&str> = module.split('.').collect();
-        (0..segments.len())
-            .map(|drop| segments[drop..].join("."))
-            .find(|tail| attested.contains(tail))
-            .unwrap_or_else(|| module.to_owned())
+        // The best-attested root this path sits under, the longest among equals.
+        let root = (0..segments.len())
+            .filter_map(|cut| support.get(&segments[..cut].join(".")).map(|&n| (n, cut)))
+            .max();
+        match root {
+            Some((_, cut)) => segments[cut..].join("."),
+            None => module.to_owned(),
+        }
     }
 }
 
 /// Every definition's atoms with parameters resolved — to what the closed-world reading inferred, or
-/// to holes — and local paths named the way the tree names them. Atoms left without an identity are
-/// dropped, as the frontend would have dropped them. Alongside, per definition, the atoms that hold
-/// only through an inferred parameter.
-/// Each definition's atoms after resolution, and the ones among them that hold only through an
-/// inferred parameter or field.
+/// to holes — and local paths named the way the tree names them, keeping those that state a fact
+/// ([`decide::is_fact`]): resolved, an atom may have lost its identity to a hole, or turned out to
+/// filter rather than decide, as a column does against a key no caller fixes. Alongside, per
+/// definition, the atoms that hold only through an inferred parameter or field.
 struct Resolved {
     atoms: Vec<Vec<Arc<str>>>,
     via: Vec<HashSet<Arc<str>>>,
@@ -179,7 +200,7 @@ fn resolved_atoms(defs: &[Def], closed_world: bool) -> Resolved {
         let mut leaned: HashSet<Arc<str>> = HashSet::new();
         for atom in &def.facets.decides {
             let filled = decide::canonical(&fill(atom, i, &inference, &named));
-            if !decide::parts(&filled).1.iter().any(|t| has_identity(t)) {
+            if !decide::is_fact(&filled) {
                 continue;
             }
             let filled: Arc<str> = Arc::from(filled);
@@ -385,7 +406,15 @@ impl ClassNull {
     }
 }
 
-/// A pair that passed its class pair's critical value, with its p-value.
+/// A pair that passed its class pair's critical value at the rate.
+struct Overlap {
+    a: usize,
+    b: usize,
+    shared: usize,
+    surprise: f64,
+}
+
+/// An overlap the step-up could reject, with its p-value.
 struct Candidate {
     a: usize,
     b: usize,
@@ -400,14 +429,14 @@ struct Candidate {
 /// sharing a common fact: the cut is each class pair's critical value at the rate itself, which no
 /// rejected pair can be under — the Benjamini–Hochberg threshold never exceeds the rate.
 #[allow(clippy::cast_possible_truncation)] // member indices fit u32 by construction
-fn candidates(
+fn overlaps(
     c: &Corpus,
     model: &Bicm,
     nulls: &HashMap<(usize, usize), ClassNull>,
     row_of: &[usize],
     col_of: &[usize],
     statistic: Statistic,
-) -> Vec<Candidate> {
+) -> Vec<Overlap> {
     let n = c.facts.len();
     let mut index: Vec<Vec<u32>> = vec![Vec::new(); c.df.len()];
     for (m, list) in c.facts.iter().enumerate() {
@@ -416,7 +445,7 @@ fn candidates(
         }
     }
     let surprise_of = |r: usize, f: u32| -model.edge(r, col_of[f as usize]).ln();
-    let mut out: Vec<Candidate> = (0..n)
+    let mut out: Vec<Overlap> = (0..n)
         .into_par_iter()
         .map_init(
             || (vec![0u32; n], vec![0.0f64; n], Vec::<u32>::new()),
@@ -441,22 +470,68 @@ fn candidates(
                     let (shared, w) = (count[b_at] as usize, weight[b_at]);
                     count[b_at] = 0;
                     weight[b_at] = 0.0;
-                    let key = (ra.min(row_of[b_at]), ra.max(row_of[b_at]));
-                    let null = &nulls[&key];
-                    let p = match statistic {
-                        Statistic::Count if shared >= null.count_crit => null.count_tail(shared),
-                        Statistic::Surprise if w >= null.surprise_crit => null.surprise.tail(w),
-                        _ => continue,
+                    let null = &nulls[&class_pair(row_of, a, b_at)];
+                    let admitted = match statistic {
+                        Statistic::Count => shared >= null.count_crit,
+                        Statistic::Surprise => w >= null.surprise_crit,
                     };
-                    found.push(Candidate { a, b: b_at, shared, surprise: w, p });
+                    if admitted {
+                        found.push(Overlap { a, b: b_at, shared, surprise: w });
+                    }
                 }
                 found
             },
         )
         .flatten()
         .collect();
-    out.sort_unstable_by_key(|cand| (cand.a, cand.b));
+    out.sort_unstable_by_key(|o| (o.a, o.b));
     out
+}
+
+fn class_pair(row_of: &[usize], a: usize, b: usize) -> (usize, usize) {
+    (row_of[a].min(row_of[b]), row_of[a].max(row_of[b]))
+}
+
+/// The overlaps the step-up could reject, each with its p-value.
+///
+/// The step-up rejects no p-value above `R·α/m`, and `R` is at most the number of pairs that reach
+/// that level — so the level a pair must reach shrinks with the count reaching it, down to a fixed
+/// point. A saddlepoint tail is paid only past it (the critical value taken at twice the level, so a
+/// tail's last digits cannot hide a pair): the threshold over these is the threshold over all, since
+/// every p-value under it is among them. A count tail is a table lookup, paid for every overlap.
+#[allow(clippy::cast_precision_loss)] // a pair count, far below 2^52
+fn candidates(
+    overlaps: Vec<Overlap>,
+    nulls: &HashMap<(usize, usize), ClassNull>,
+    row_of: &[usize],
+    statistic: Statistic,
+    tests: f64,
+    alpha: f64,
+) -> Vec<Candidate> {
+    let mut kept = overlaps;
+    if statistic == Statistic::Surprise {
+        let mut level = alpha;
+        loop {
+            let next = kept.len() as f64 * alpha / tests;
+            if next >= level {
+                break;
+            }
+            level = next;
+            let crit: HashMap<(usize, usize), f64> =
+                nulls.par_iter().map(|(&key, null)| (key, null.surprise.critical(2.0 * level))).collect();
+            kept.retain(|o| o.surprise >= crit[&class_pair(row_of, o.a, o.b)]);
+        }
+    }
+    kept.into_par_iter()
+        .map(|o| {
+            let null = &nulls[&class_pair(row_of, o.a, o.b)];
+            let p = match statistic {
+                Statistic::Count => null.count_tail(o.shared),
+                Statistic::Surprise => null.surprise.tail(o.surprise),
+            };
+            Candidate { a: o.a, b: o.b, shared: o.shared, surprise: o.surprise, p }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -625,13 +700,15 @@ pub fn pass_decisions(defs: &[Def], already: &[Finding], opts: &DecisionOpts) ->
         .par_iter()
         .map(|&(a, b)| ((a, b), ClassNull::new(&model, a, b, opts.fdr, opts.statistic)))
         .collect();
-    let found = candidates(&c, &model, &nulls, &row_of, &col_of, opts.statistic);
+    let admitted = overlaps(&c, &model, &nulls, &row_of, &col_of, opts.statistic);
+    let admitted_count = admitted.len();
     let tests = n as f64 * (n as f64 - 1.0) / 2.0;
+    let found = candidates(admitted, &nulls, &row_of, opts.statistic, tests, opts.fdr);
     let p_values: Vec<f64> = found.iter().map(|cand| cand.p).collect();
     let threshold = bh_threshold(&p_values, tests, opts.fdr);
     if std::env::var_os("FDD_TIMING").is_some() {
         eprintln!(
-            "[decisions] members={n} facts={} row classes={} fit residual={:.1e} candidates={} BH threshold={threshold:?}",
+            "[decisions] members={n} facts={} row classes={} fit residual={:.1e} candidates={admitted_count} weighed={} BH threshold={threshold:?}",
             c.df.len(),
             model.row_classes(),
             model.residual,
@@ -646,14 +723,17 @@ pub fn pass_decisions(defs: &[Def], already: &[Finding], opts: &DecisionOpts) ->
     let threshold = rejected as f64 * opts.fdr / tests;
     let verdict = Verdict { opts, threshold, tests };
 
-    let copies: Vec<HashSet<(String, usize, usize)>> = already
-        .iter()
-        .filter(|f| matches!(f.pass, "name" | "cross-name" | "type-3"))
-        .map(|f| f.members.iter().cloned().collect())
-        .collect();
+    // The body-pass groups each member sits in: a pair is a copy when its two lists meet.
+    let mut groups_of: HashMap<(String, usize, usize), Vec<usize>> = HashMap::new();
+    for (group, f) in already.iter().filter(|f| matches!(f.pass, "name" | "cross-name" | "type-3")).enumerate() {
+        for key in &f.members {
+            groups_of.entry(key.clone()).or_default().push(group);
+        }
+    }
+    let groups_at = |m: usize| groups_of.get(&member(defs, c.at[m])).map_or(&[][..], Vec::as_slice);
     let is_copy = |a: usize, b: usize| {
-        let (ka, kb) = (member(defs, c.at[a]), member(defs, c.at[b]));
-        copies.iter().any(|group| group.contains(&ka) && group.contains(&kb))
+        let theirs = groups_at(b);
+        groups_at(a).iter().any(|g| theirs.contains(g))
     };
     let pairs: Vec<&Candidate> = found.iter().filter(|cand| cand.p <= observed && !is_copy(cand.a, cand.b)).collect();
 
@@ -672,7 +752,7 @@ pub fn pass_decisions(defs: &[Def], already: &[Finding], opts: &DecisionOpts) ->
     let mut in_family: HashMap<usize, usize> = HashMap::new();
     let mut out = Vec::new();
     for clique in crate::converge::clique_cover(&vertices, &edges) {
-        if clique.len() < MIN_FAMILY {
+        if clique.len() < crate::converge::MIN_FAMILY {
             continue;
         }
         let mut members: Vec<usize> = clique.iter().map(|&v| v as usize).collect();
@@ -852,6 +932,43 @@ mod tests {
             callable("entry", &[], &[], vec![call("@app.outer", &[(None, "@app.cfg.on")])], &[]),
         ];
         assert_eq!(atoms_of(&defs, true, "inner"), vec!["? @app.cfg.on"]);
+    }
+
+    #[test]
+    fn two_queries_on_one_table_share_its_keys_and_decide_on_nothing() {
+        // Two repository functions filtering one table by its keys and a date, joining its lines and
+        // keeping the open rows: the key filters, the bound and the join select rows and decide
+        // nothing, so one fact is left to share and the pair is no finding — written as five facts it
+        // would be, as `refuse / offer` is.
+        let query = [
+            "= @app.db.Order.shop_id _",
+            "= @app.db.Order.customer_id _",
+            "< @app.db.Order.placed_at _",
+            "= @app.db.Line.order_id @app.db.Order.id",
+            "= @app.db.Order.status @app.Status.OPEN",
+        ];
+        let mut defs = corpus();
+        defs.push(def("open_orders", "r.py", &query));
+        defs.push(def("count_open", "r.py", &query));
+        assert_eq!(atoms_of(&defs, false, "open_orders"), vec!["@app.Status.OPEN = @app.db.Order.status"]);
+        let names: Vec<String> = pass_decisions(&defs, &[], &opts(Statistic::Surprise)).iter().map(|f| f.name.clone()).collect();
+        assert_eq!(names, vec!["refuse / offer"]);
+    }
+
+    #[test]
+    fn a_module_nothing_imports_is_named_under_the_root_its_neighbours_attest() {
+        // Scanned at `src/app/…`: `app.models` is imported by that name, so `src` is the root the
+        // tree drops, and the helpers module nothing imports is named under it too.
+        let mut models = def("State", "src/app/models.py", &[]);
+        models.facets.identity = Some(Arc::from("@~src.app.models~State"));
+        let mut check = callable("check", &["= _.state @~src.app.models~State.OPEN"], &[], Vec::new(), &[]);
+        check.facets.identity = Some(Arc::from("@~src.app.rules~check"));
+        check.facets.reaches = vec![Arc::from("app.models")];
+        let mut helper = callable("helper", &["= _.kind @~src.app.helpers~KIND"], &[], Vec::new(), &[]);
+        helper.facets.identity = Some(Arc::from("@~src.app.helpers~helper"));
+        let defs = vec![models, check, helper];
+        assert_eq!(atoms_of(&defs, false, "check"), vec!["@app.models.State.OPEN = _.state"]);
+        assert_eq!(atoms_of(&defs, false, "helper"), vec!["@app.helpers.KIND = _.kind"]);
     }
 
     #[test]

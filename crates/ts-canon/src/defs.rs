@@ -2,11 +2,10 @@
 //! parallel + native, mirroring `py-canon::defs` over [`oxc_parser`].
 //!
 //! Walks each file's oxc AST **once** and lowers every definition straight to the engine's
-//! [`Def`], with its canonical strings precomputed. Unlike `py-canon`, the canonical is computed
-//! by re-parsing the def's source slice (TypeScript method slices and `.tsx`/JSX bodies parse
-//! differently as the in-file node vs. a standalone slice, so a node-based canon would diverge);
-//! for `fn_like` defs the cluster canonical is taken from the same single `analyze_functions`
-//! call, so a function costs one re-parse rather than two.
+//! [`Def`], with its canonical strings rendered off the definition's node in that tree — the file
+//! is parsed once and nothing is parsed again. (It used to re-parse each definition's source slice
+//! as a `.ts` program, which a method's slice is not and a `.tsx` body with JSX does not parse as;
+//! see [`CallableNode`].)
 //!
 //! Surfaces these top-level kinds (the frontend lowers each to the engine's `Def`):
 //!
@@ -47,7 +46,7 @@ use oxc_ast::ast::{
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType};
 
-use crate::canon::{analyze_functions, ast_canonical};
+use crate::canon::{analyze_node, callable_canonical, class_canonical, interface_canonical, CallableNode};
 use crate::frontend::{CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
 
 #[inline]
@@ -93,10 +92,17 @@ fn last_decorator_end(decorators: &[Decorator<'_>]) -> Option<usize> {
 /// for TS:
 ///
 /// * `None` (declaration-only signature: overload / ambient) or empty `{}`.
-/// * `return <Literal | this | Identifier | null | undefined>;` — trivial atom returns.
+/// * `return <Literal | this | Identifier | null | undefined | [] | {}>;` — trivial atom returns. An
+///   empty array or object is the collection-typed `null`: the null-object stub an interface's
+///   unused half is filled with, a hundred of them in one editor codebase.
 /// * `throw new <Identifier>(...)` for common "not implemented" / sentinel errors.
+/// * `super(<atoms>)` — a constructor that only hands its arguments on. TypeScript writes these for
+///   what the parameter list declares (`private readonly log: ILogService`, an injected service);
+///   the body does nothing, and with the body compared alone two hundred unrelated classes are one
+///   cluster.
 ///
-/// Falls through (still compared): `return this.x`, `return [this.x]`, `return foo()`.
+/// Falls through (still compared): `return this.x`, `return [this.x]`, `return foo()`,
+/// `super(); this.x = 1`.
 fn is_trivial_function_body(body: Option<&FunctionBody<'_>>) -> bool {
     let Some(body) = body else { return true };
     if body.statements.is_empty() {
@@ -105,18 +111,16 @@ fn is_trivial_function_body(body: Option<&FunctionBody<'_>>) -> bool {
     body.statements.iter().all(|s| match s {
         Statement::ReturnStatement(r) => match &r.argument {
             None => true,
-            Some(expr) => matches!(
-                expr,
-                Expression::NullLiteral(_)
-                    | Expression::BooleanLiteral(_)
-                    | Expression::NumericLiteral(_)
-                    | Expression::StringLiteral(_)
-                    | Expression::BigIntLiteral(_)
-                    | Expression::RegExpLiteral(_)
-                    | Expression::ThisExpression(_)
-                    | Expression::Identifier(_)
-            ),
+            Some(Expression::ArrayExpression(a)) => a.elements.is_empty(),
+            Some(Expression::ObjectExpression(o)) => o.properties.is_empty(),
+            Some(expr) => is_atom(expr),
         },
+        Statement::ExpressionStatement(e) => matches!(
+            &e.expression,
+            Expression::CallExpression(c)
+                if matches!(c.callee, Expression::Super(_))
+                    && c.arguments.iter().all(|a| a.as_expression().is_some_and(is_atom))
+        ),
         Statement::ThrowStatement(t) => matches!(
             &t.argument,
             Expression::NewExpression(n) if matches!(
@@ -132,21 +136,43 @@ fn is_trivial_function_body(body: Option<&FunctionBody<'_>>) -> bool {
     })
 }
 
-/// Precompute the canonical strings from a def's source slice. Non-body kinds (constants /
-/// type-aliases) carry no canonical — the engine clusters them on `text_orig`. For `fn_like`
-/// defs the cluster canonical is taken from the `analyze_functions` tuple (`.0`, identical to
-/// `ast_canonical`), so a function re-parses once instead of twice; class methods (whose slice
-/// doesn't re-parse as a standalone function) and non-callable body kinds fall back to
-/// `ast_canonical`.
-fn canon_for(kind: &KindSpec, text: &str) -> (Option<String>, Option<Analysis>, Vec<CoreStatement>) {
-    if !kind.body {
-        return (None, None, Vec::new());
+/// A literal, `this` or a bare name — an expression with no structure of its own.
+fn is_atom(expr: &Expression<'_>) -> bool {
+    matches!(
+        expr,
+        Expression::NullLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NumericLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BigIntLiteral(_)
+            | Expression::RegExpLiteral(_)
+            | Expression::ThisExpression(_)
+            | Expression::Identifier(_)
+    )
+}
+
+/// A definition's canonical strings, rendered off its node.
+struct Canon {
+    cluster: Option<String>,
+    analysis: Option<Analysis>,
+    statements: Vec<CoreStatement>,
+}
+
+impl Canon {
+    /// A raw-text kind (constants, type aliases): the engine clusters it on `text_orig`.
+    const TEXT: Canon = Canon { cluster: None, analysis: None, statements: Vec::new() };
+
+    /// A body kind that is not callable (a class, an interface).
+    fn body(cluster: String) -> Self {
+        Canon { cluster: Some(cluster), analysis: None, statements: Vec::new() }
     }
-    if kind.fn_like {
-        match analyze_functions(&[text.to_owned()]).into_iter().next().flatten() {
-            Some(a) => (
-                Some(a.cluster_canonical),
-                Some(Analysis {
+
+    /// A callable: the full analysis, or only its cluster canonical when it has no body.
+    fn callable(node: &CallableNode<'_, '_>) -> Self {
+        match analyze_node(node) {
+            Some(a) => Canon {
+                cluster: Some(a.cluster_canonical),
+                analysis: Some(Analysis {
                     xname_canonical: a.xname_canonical,
                     type3_lines: a.type3_lines,
                     type_refs: a.type_refs,
@@ -154,12 +180,10 @@ fn canon_for(kind: &KindSpec, text: &str) -> (Option<String>, Option<Analysis>, 
                     size: a.size,
                     canon_dialect: CanonDialect::Other,
                 }),
-                a.statements,
-            ),
-            None => (Some(ast_canonical(text)), None, Vec::new()),
+                statements: a.statements,
+            },
+            None => Canon::body(callable_canonical(node)),
         }
-    } else {
-        (Some(ast_canonical(text)), None, Vec::new())
     }
 }
 
@@ -199,10 +223,30 @@ impl LensCtx {
     }
 }
 
-/// Build a [`Def`] for the definition spanning `source[start..end]` (TypeScript has no receiver
-/// strip, so the canon input equals `text_orig`).
-// The parameters are the file's four constants plus this definition's four coordinates; bundling
-// either half into a struct would only move the same eight values behind a name that adds nothing.
+/// What the names of one file stand for — the import table the reached paths read and the scope the
+/// decisions read — built once per file and shared by its definitions.
+struct FileNames<'a> {
+    imports: &'a HashMap<String, Arc<str>>,
+    decides: &'a crate::decides::FileScope,
+}
+
+/// Fill in what the decisions pass reads off a callable ([`dup_defs_core::Facets::decides`] and the
+/// closed-world facts beside it), with the definition's own identity: what the corpus's calls name it
+/// by. `decorated` — see [`crate::decides::decides`].
+fn decided(def: &mut Def, names: &FileNames<'_>, params: &FormalParameters<'_>, body: &[Statement<'_>], decorated: bool) {
+    let facts = crate::decides::decides(params, body, names.decides, decorated);
+    def.facets.decides = facts.atoms;
+    def.facets.identity = Some(Arc::from(dup_defs_core::decide::local(names.decides.module(), &def.name)));
+    def.facets.params = facts.params;
+    def.facets.calls = facts.calls;
+    def.facets.mentions = facts.mentions;
+    def.facets.loose_keywords = facts.loose;
+}
+
+/// Build a [`Def`] for the definition spanning `source[start..end]`, with the canonical strings
+/// already rendered off its node.
+// The parameters are the file's four constants plus this definition's five coordinates; bundling
+// either half into a struct would only move the same nine values behind a name that adds nothing.
 #[allow(clippy::too_many_arguments)]
 fn build_def(
     kind: &'static KindSpec,
@@ -212,13 +256,14 @@ fn build_def(
     source: &str,
     (start, end): (usize, usize),
     args: usize,
-    imports: &HashMap<String, Arc<str>>,
+    names: &FileNames<'_>,
+    canon: Canon,
 ) -> Def {
     let text = source[start..end].to_owned();
     let loc = count_loc(&text);
     let (line, col) = lines.loc0(start);
-    let (cluster_canonical, analysis, statements) = canon_for(kind, &text);
-    let reaches = crate::canon::reached_paths(&statements, imports);
+    let Canon { cluster: cluster_canonical, analysis, statements } = canon;
+    let reaches = crate::canon::reached_paths(&statements, names.imports);
     Def {
         lang: "ts",
         kind,
@@ -283,13 +328,18 @@ fn emit_callable_lens(
 }
 
 /// `function foo(...) { ... }` — top-level. Returns `None` for trivial-body / anonymous fns.
-fn function_def(f: &Function<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, _ctx: &LensCtx) -> Option<Def> {
+fn function_def(f: &Function<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, _ctx: &LensCtx) -> Option<Def> {
     let id = f.id.as_ref()?;
     if is_trivial_function_body(f.body.as_deref()) {
         return None;
     }
     let (start, end) = (u(f.span.start), u(f.span.end));
-    Some(build_def(&FUNCTIONS, id.name.to_string(), file, lines, source, (start, end), count_args(&f.params), imports))
+    let canon = Canon::callable(&CallableNode::Function(f));
+    let mut def = build_def(&FUNCTIONS, id.name.to_string(), file, lines, source, (start, end), count_args(&f.params), names, canon);
+    if let Some(body) = &f.body {
+        decided(&mut def, names, &f.params, &body.statements, false);
+    }
+    Some(def)
 }
 
 /// The lens record for a top-level `function`, pushed next to its body def.
@@ -314,11 +364,11 @@ fn emit_function_lens(
 }
 
 /// A class declaration as a whole — `class Foo { ... }`, decorators excluded.
-fn class_def(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, _ctx: &LensCtx) -> Option<Def> {
+fn class_def(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, _ctx: &LensCtx) -> Option<Def> {
     let id = c.id.as_ref()?;
     let start = keyword_start(source, u(c.span.start), last_decorator_end(&c.decorators));
     let end = u(c.span.end);
-    Some(build_def(&CLASSES, id.name.to_string(), file, lines, source, (start, end), 0, imports))
+    Some(build_def(&CLASSES, id.name.to_string(), file, lines, source, (start, end), 0, names, Canon::body(class_canonical(c))))
 }
 
 /// The lens record for a class — what it declares and under what decorators.
@@ -354,15 +404,15 @@ fn emit_interface_lens(
 }
 
 /// `type X = ...`.
-fn type_alias_def(t: &TSTypeAliasDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, _ctx: &LensCtx) -> Option<Def> {
+fn type_alias_def(t: &TSTypeAliasDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, _ctx: &LensCtx) -> Option<Def> {
     let (start, end) = (u(t.span.start), u(t.span.end));
-    Some(build_def(&TYPE_ALIASES, t.id.name.to_string(), file, lines, source, (start, end), 0, imports))
+    Some(build_def(&TYPE_ALIASES, t.id.name.to_string(), file, lines, source, (start, end), 0, names, Canon::TEXT))
 }
 
 /// `interface X { ... }`.
-fn interface_def(i: &TSInterfaceDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, _ctx: &LensCtx) -> Option<Def> {
+fn interface_def(i: &TSInterfaceDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, _ctx: &LensCtx) -> Option<Def> {
     let (start, end) = (u(i.span.start), u(i.span.end));
-    Some(build_def(&INTERFACES, i.id.name.to_string(), file, lines, source, (start, end), 0, imports))
+    Some(build_def(&INTERFACES, i.id.name.to_string(), file, lines, source, (start, end), 0, names, Canon::body(interface_canonical(i))))
 }
 
 /// A `const`/`let`/`var` declaration may carry several declarators (`const a = 1, b = 2`).
@@ -370,7 +420,7 @@ fn interface_def(i: &TSInterfaceDeclaration<'_>, source: &str, lines: &LineMap, 
 /// - arrow / function-expression initializer ⇒ `functions` (dominant TS form).
 /// - `const NAME` with `UPPER_SNAKE_CASE` name + non-function initializer ⇒ `constants`.
 /// - destructuring patterns bind nothing nameable ⇒ skipped.
-fn variable_decls(v: &VariableDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, ctx: &LensCtx, out: &mut Vec<Def>) {
+fn variable_decls(v: &VariableDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, ctx: &LensCtx, out: &mut Vec<Def>) {
     let is_const = matches!(v.kind, VariableDeclarationKind::Const);
     for decl in &v.declarations {
         let BindingPattern::BindingIdentifier(id) = &decl.id else { continue };
@@ -395,7 +445,10 @@ fn variable_decls(v: &VariableDeclaration<'_>, source: &str, lines: &LineMap, fi
                     is_async: arrow.r#async,
                 };
                 emit_callable_lens(&name, &callable, &Site { source, lines, file, span: (start, end) }, ctx, out);
-                out.push(build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&arrow.params), imports));
+                let canon = Canon::callable(&CallableNode::Bound(v.kind, decl));
+                let mut def = build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&arrow.params), names, canon);
+                decided(&mut def, names, &arrow.params, &arrow.body.statements, false);
+                out.push(def);
             }
             Expression::FunctionExpression(fexpr) => {
                 if is_trivial_function_body(fexpr.body.as_deref()) {
@@ -413,12 +466,17 @@ fn variable_decls(v: &VariableDeclaration<'_>, source: &str, lines: &LineMap, fi
                     };
                     emit_callable_lens(&name, &callable, &Site { source, lines, file, span: (start, end) }, ctx, out);
                 }
-                out.push(build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&fexpr.params), imports));
+                let canon = Canon::callable(&CallableNode::Bound(v.kind, decl));
+                let mut def = build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&fexpr.params), names, canon);
+                if let Some(body) = &fexpr.body {
+                    decided(&mut def, names, &fexpr.params, &body.statements, false);
+                }
+                out.push(def);
             }
             _ if is_const && is_upper_snake(&name) => {
                 let start = u(decl.span.start);
                 let end = u(decl.span.end);
-                out.push(build_def(&CONSTANTS, name, file, lines, source, (start, end), 0, imports));
+                out.push(build_def(&CONSTANTS, name, file, lines, source, (start, end), 0, names, Canon::TEXT));
             }
             _ => {}
         }
@@ -450,7 +508,7 @@ fn property_key_name(key: &PropertyKey<'_>) -> String {
 // The file's four constants plus the class's own three; bundling either half behind a name would
 // only move the same values, and the file half already has one (`Site`) built per definition.
 #[allow(clippy::too_many_arguments)]
-fn class_method_defs(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, ctx: &LensCtx, parent_chain: &str, out: &mut Vec<Def>) {
+fn class_method_defs(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, ctx: &LensCtx, parent_chain: &str, out: &mut Vec<Def>) {
     let Some(class_id) = c.id.as_ref() else { return };
     let class_name = class_id.name.as_str();
     let parent = if parent_chain.is_empty() {
@@ -481,56 +539,61 @@ fn class_method_defs(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<st
                 };
                 emit_callable_lens(&name, &callable, &Site { source, lines, file, span: (start, end) }, ctx, out);
             }
-            out.push(build_def(&METHODS, name, file, lines, source, (start, end), args, imports));
+            let canon = Canon::callable(&CallableNode::Method(&key_name, &m.value));
+            let mut def = build_def(&METHODS, name, file, lines, source, (start, end), args, names, canon);
+            if let Some(body) = &m.value.body {
+                decided(&mut def, names, &m.value.params, &body.statements, !m.decorators.is_empty());
+            }
+            out.push(def);
         }
     }
 }
 
 // ─────────────────────────── per-statement dispatch ───────────────────────────
 
-fn process_top_stmt(stmt: &Statement<'_>, source: &str, lines: &LineMap, file: &Arc<str>, imports: &HashMap<String, Arc<str>>, ctx: &LensCtx, out: &mut Vec<Def>) {
+fn process_top_stmt(stmt: &Statement<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, ctx: &LensCtx, out: &mut Vec<Def>) {
     match stmt {
         Statement::FunctionDeclaration(f) => {
-            if let Some(def) = function_def(f, source, lines, file, imports, ctx) {
+            if let Some(def) = function_def(f, source, lines, file, names, ctx) {
                 out.push(def);
                 emit_function_lens(f, source, lines, file, ctx, out);
             }
         }
         Statement::ClassDeclaration(c) => {
-            if let Some(def) = class_def(c, source, lines, file, imports, ctx) {
+            if let Some(def) = class_def(c, source, lines, file, names, ctx) {
                 out.push(def);
                 emit_class_lens(c, source, lines, file, ctx, out);
             }
-            class_method_defs(c, source, lines, file, imports, ctx, "", out);
+            class_method_defs(c, source, lines, file, names, ctx, "", out);
         }
         Statement::TSTypeAliasDeclaration(t) => {
-            if let Some(def) = type_alias_def(t, source, lines, file, imports, ctx) {
+            if let Some(def) = type_alias_def(t, source, lines, file, names, ctx) {
                 out.push(def);
             }
         }
         Statement::TSInterfaceDeclaration(i) => {
-            if let Some(def) = interface_def(i, source, lines, file, imports, ctx) {
+            if let Some(def) = interface_def(i, source, lines, file, names, ctx) {
                 out.push(def);
                 emit_interface_lens(i, source, lines, file, ctx, out);
             }
         }
-        Statement::VariableDeclaration(v) => variable_decls(v, source, lines, file, imports, ctx, out),
+        Statement::VariableDeclaration(v) => variable_decls(v, source, lines, file, names, ctx, out),
         Statement::ExportNamedDeclaration(e) => {
             if let Some(decl) = &e.declaration {
-                process_declaration(decl, source, lines, file, imports, ctx, out);
+                process_declaration(decl, source, lines, file, names, ctx, out);
             }
         }
         Statement::ExportDefaultDeclaration(e) => match &e.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
-                if let Some(def) = function_def(f, source, lines, file, imports, ctx) {
+                if let Some(def) = function_def(f, source, lines, file, names, ctx) {
                     out.push(def);
                 }
             }
             ExportDefaultDeclarationKind::ClassDeclaration(c) => {
-                if let Some(def) = class_def(c, source, lines, file, imports, ctx) {
+                if let Some(def) = class_def(c, source, lines, file, names, ctx) {
                     out.push(def);
                 }
-                class_method_defs(c, source, lines, file, imports, ctx, "", out);
+                class_method_defs(c, source, lines, file, names, ctx, "", out);
             }
             _ => {}
         },
@@ -544,35 +607,35 @@ fn process_declaration(
     source: &str,
     lines: &LineMap,
     file: &Arc<str>,
-    imports: &HashMap<String, Arc<str>>, ctx: &LensCtx,
+    names: &FileNames<'_>, ctx: &LensCtx,
     out: &mut Vec<Def>,
 ) {
     match decl {
         Declaration::FunctionDeclaration(f) => {
-            if let Some(def) = function_def(f, source, lines, file, imports, ctx) {
+            if let Some(def) = function_def(f, source, lines, file, names, ctx) {
                 out.push(def);
                 emit_function_lens(f, source, lines, file, ctx, out);
             }
         }
         Declaration::ClassDeclaration(c) => {
-            if let Some(def) = class_def(c, source, lines, file, imports, ctx) {
+            if let Some(def) = class_def(c, source, lines, file, names, ctx) {
                 out.push(def);
                 emit_class_lens(c, source, lines, file, ctx, out);
             }
-            class_method_defs(c, source, lines, file, imports, ctx, "", out);
+            class_method_defs(c, source, lines, file, names, ctx, "", out);
         }
         Declaration::TSTypeAliasDeclaration(t) => {
-            if let Some(def) = type_alias_def(t, source, lines, file, imports, ctx) {
+            if let Some(def) = type_alias_def(t, source, lines, file, names, ctx) {
                 out.push(def);
             }
         }
         Declaration::TSInterfaceDeclaration(i) => {
-            if let Some(def) = interface_def(i, source, lines, file, imports, ctx) {
+            if let Some(def) = interface_def(i, source, lines, file, names, ctx) {
                 out.push(def);
                 emit_interface_lens(i, source, lines, file, ctx, out);
             }
         }
-        Declaration::VariableDeclaration(v) => variable_decls(v, source, lines, file, imports, ctx, out),
+        Declaration::VariableDeclaration(v) => variable_decls(v, source, lines, file, names, ctx, out),
         _ => {}
     }
 }
@@ -594,13 +657,15 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
     // The module's import table, resolved once: what each bound name stands for.
     let imports: HashMap<String, Arc<str>> =
         crate::canon::module_imports(&ret.program, file).into_iter().collect();
+    let scope = crate::decides::FileScope::new(file, &ret.program);
+    let names = FileNames { imports: &imports, decides: &scope };
     let lenses = dup_defs_core::lens::enabled_lenses(opts);
     // Every lens reads the module's own bound names, so they are collected once per file.
     let module_names =
         if lenses.is_empty() { HashSet::new() } else { crate::lenses::module_bound_names(&ret.program) };
     let ctx = LensCtx { lenses, module_names };
     for stmt in &ret.program.body {
-        process_top_stmt(stmt, source, &lines, file, &imports, &ctx, &mut defs);
+        process_top_stmt(stmt, source, &lines, file, &names, &ctx, &mut defs);
     }
     defs
 }
@@ -830,15 +895,23 @@ class A {
     getX() { return this._x + 1; }
     sources() { return [this._x]; }
     call() { return this.parent.fn(); }
+    async none(): Promise<T[]> { return []; }
+    bag() { return {}; }
+}
+class Injected extends Base {
+    constructor(@ILogService private readonly log: ILogService, name: string) { super(name, 1); }
+}
+class Wired extends Base {
+    constructor(@ILogService private readonly log: ILogService) { super(); this._register(log.onDidLog(() => {})); }
 }
 "#;
         let got = triples(src, "test.ts");
         let methods: Vec<&str> =
             got.iter().filter(|(k, _, _)| k == "methods").map(|(_, n, _)| n.as_str()).collect();
-        for skipped in ["A.isX", "A.name", "A.self", "A.nullish", "A.empty", "A.notImpl"] {
+        for skipped in ["A.isX", "A.name", "A.self", "A.nullish", "A.empty", "A.notImpl", "A.none", "A.bag", "Injected.constructor"] {
             assert!(!methods.contains(&skipped), "{skipped} should be skipped, got: {methods:?}");
         }
-        for kept in ["A.getX", "A.sources", "A.call"] {
+        for kept in ["A.getX", "A.sources", "A.call", "Wired.constructor"] {
             assert!(methods.contains(&kept), "{kept} should be kept, got: {methods:?}");
         }
     }
@@ -890,16 +963,73 @@ function factory() {
 
     #[test]
     fn node_kinds_and_canon_presence() {
-        // Body kinds carry a cluster canonical; raw-text kinds do not; callables carry analysis
-        // (methods analyze to None — their slice isn't a standalone function — which is fine).
-        let src = "export function f(x: number) { const y = x + 1; return y * 2; }\nexport const MAX_N = 7;\nexport interface I { a(): number; }\n";
+        // Body kinds carry a cluster canonical; raw-text kinds do not; callables — methods included —
+        // carry analysis.
+        let src = "export function f(x: number) { const y = x + 1; return y * 2; }\nexport const MAX_N = 7;\nexport interface I { a(): number; }\nclass C { m(x: number) { return x * 3 + 1; } }\n";
         let f: Arc<str> = Arc::from("t.ts");
         let defs = scan_source(src, &f, &ScanOpts::default());
         let func = defs.iter().find(|d| d.name == "f").expect("fn");
         assert!(func.cluster_canonical.is_some() && func.analysis.is_some());
+        let method = defs.iter().find(|d| d.name == "C.m").expect("method");
+        assert!(method.cluster_canonical.is_some() && method.analysis.is_some() && !method.facets.statements.is_empty());
         let iface = defs.iter().find(|d| d.name == "I").expect("iface");
         assert!(iface.cluster_canonical.is_some() && iface.analysis.is_none());
         let konst = defs.iter().find(|d| d.name == "MAX_N").expect("const");
         assert!(konst.cluster_canonical.is_none() && konst.analysis.is_none());
+    }
+
+    fn analyzed(src: &str, file: &str, name: &str) -> dup_defs_core::Def {
+        let f: Arc<str> = Arc::from(file);
+        scan_source(src, &f, &ScanOpts::default()).into_iter().find(|d| d.name == name).expect(name)
+    }
+
+    #[test]
+    fn a_method_is_canonicalized_as_the_function_it_would_be() {
+        // A method's slice (`load(x) { … }`) is not a program; it used to be re-parsed as one, fail,
+        // and keep its raw text for a canonical with no analysis — so a renamed copy of a method was
+        // invisible to the cross-name pass. Off the node it is the function it would be.
+        let a = "class A {\n  async load(items: It[]) {\n    let total = 0;\n    for (const it of items) { total += it.v; }\n    return total;\n  }\n}\n";
+        let b = "class B {\n  async compute(xs: It[]) {\n    let acc = 0;\n    for (const x of xs) { acc += x.v; }\n    return acc;\n  }\n}\n";
+        let free = "async function sum(rows: It[]) {\n  let s = 0;\n  for (const r of rows) { s += r.v; }\n  return s;\n}\n";
+        let (ma, mb) = (analyzed(a, "a.ts", "A.load"), analyzed(b, "b.ts", "B.compute"));
+        let xname = |d: &dup_defs_core::Def| d.analysis.as_ref().expect("analysis").xname_canonical.clone();
+        assert_eq!(xname(&ma), xname(&mb), "renamed method copies alpha-equate");
+        assert_eq!(xname(&ma), xname(&analyzed(free, "c.ts", "sum")), "a method matches the free function written alike");
+        assert!(ma.cluster_canonical.as_deref().is_some_and(|c| c.starts_with("Func('load'")), "{:?}", ma.cluster_canonical);
+    }
+
+    #[test]
+    fn jsx_in_a_tsx_file_is_canonicalized_not_kept_as_text() {
+        // Re-parsed as `.ts`, a JSX body reads as type assertions and fails; the file's own parse is
+        // JSX-aware, and the node is what is rendered.
+        let a = "export function Card(props: P) {\n  const t = props.title;\n  return <section><h1>{t}</h1></section>;\n}\n";
+        let b = "export const Panel = (p: P) => {\n  const h = p.title;\n  return <section><h1>{h}</h1></section>;\n};\n";
+        let (ca, cb) = (analyzed(a, "a.tsx", "Card"), analyzed(b, "b.tsx", "Panel"));
+        assert_ne!(ca.cluster_canonical.as_deref(), Some(ca.text_orig.as_str()), "a canonical, not the text");
+        let (xa, xb) = (ca.analysis.expect("Card analyzes"), cb.analysis.expect("Panel analyzes"));
+        assert_eq!(xa.type3_lines, xb.type3_lines, "same steps, renamed");
+    }
+
+    #[test]
+    fn markup_is_compared_not_just_the_tag() {
+        // Two layouts that both return `<html>`: one wraps its children, one carries a script and a
+        // theme. Read as the tag alone they were one canonical; read as markup they are two.
+        let thin = "export function RootLayout({ children }: P) {\n  return <html><body>{children}</body></html>;\n}\n";
+        let thick = "export function Root({ children }: P) {\n  return (\n    <html lang=\"en\" suppressHydrationWarning>\n      <head><script src=\"/theme.js\" /></head>\n      <body className=\"dark\">\n        {children}\n      </body>\n    </html>\n  );\n}\n";
+        let renamed = "export function Layout({ children }: P) {\n  return (\n    <html>\n      <body>{children}</body>\n    </html>\n  );\n}\n";
+        let xname = |src: &str, name: &str| analyzed(src, "app.tsx", name).analysis.expect("analysis").xname_canonical;
+        assert_ne!(xname(thin, "RootLayout"), xname(thick, "Root"), "different markup, different canonical");
+        // Whitespace between tags is layout, not content: the same markup indented differently and
+        // under another name is one canonical.
+        assert_eq!(xname(thin, "RootLayout"), xname(renamed, "Layout"));
+    }
+
+    #[test]
+    fn each_declarator_is_its_own_definition() {
+        // `const a = …, b = …` binds two callables; each is analyzed off its own declarator rather than
+        // off the first one in the statement.
+        let src = "const a = (x: number) => { return x + 1; }, b = (y: number) => { return y * 2; };\n";
+        let (da, db) = (analyzed(src, "t.ts", "a"), analyzed(src, "t.ts", "b"));
+        assert_ne!(da.analysis.expect("a").xname_canonical, db.analysis.expect("b").xname_canonical);
     }
 }
