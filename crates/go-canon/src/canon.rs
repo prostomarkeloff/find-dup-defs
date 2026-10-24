@@ -1,4 +1,4 @@
-//! Structural canonicalization of Go definitions over the tree-sitter syntax tree.
+//! Structural canonicalization of Go definitions, written from the owned tree ([`crate::ir`]).
 //!
 //! Mirrors the role `rs-canon::canon` plays for Rust: a compact, internally consistent **s-expr** per
 //! definition that `difflib-fast` compares for name-gated similarity, and that the cross-name pass
@@ -21,9 +21,12 @@
 //! A selector on an imported package (`logx.Errorf`) is a path, `Path('logx.Errorf')`; on any other
 //! value it is a field read or a method call. Go spells both `a.b`, and only the file's import table
 //! tells them apart.
+//!
+//! The canonicals are written from the owned tree rather than from tree-sitter's because the exact
+//! and Type-3 canonicals read the body's normal form ([`crate::normal`]), which rewrites it.
 #![allow(
-    clippy::too_many_lines, // the stmt/expr/type matches enumerate grammar kinds; splitting just scatters one shape
-    clippy::match_same_arms // distinct kinds intentionally share an emission for clarity
+    clippy::too_many_lines, // the stmt/expr/type matches enumerate the tree's shapes; splitting just scatters one
+    clippy::match_same_arms // distinct shapes intentionally share an emission for clarity
 )]
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -34,11 +37,16 @@ use dup_defs_core::uses::{site_ctx, Construct, Site, Within};
 use dup_defs_core::{AnalyzedFn, Statement, UNFILED};
 use tree_sitter::Node;
 
-use crate::tree::{field, fields, has_token, kids, statements, text, unquote};
+use crate::ir::{
+    lower_fields, lower_func, lower_iface, CommCase, Elem, Else, Expr, FieldDecl, ForHead, Func, IfaceItem, Jump,
+    ParamDecl, Results, Stmt, Target, Type,
+};
+use crate::tree::{field, fields, kids, text, unquote};
 
 // ───────────────────────────── the parts of a callable ─────────────────────────────
 
-/// A function or method, as the grammar splits it — the input every analysis below reads.
+/// A function or method, as the grammar splits it — what is lowered to a [`Func`], and what the
+/// lenses and the reach walk read directly.
 #[derive(Clone, Copy)]
 pub(crate) struct Callable<'t> {
     /// Whether it is a method — declared on a receiver, named or not.
@@ -73,84 +81,211 @@ impl Collect {
         }
     }
 
-    fn params(&mut self, list: Option<Node<'_>>, src: &str) {
-        let Some(list) = list else { return };
-        if list.kind() != "parameter_list" {
-            return; // an unnamed single result type binds nothing
-        }
-        for decl in kids(list) {
-            for name in fields(decl, "name") {
-                self.add(text(name, src));
+    fn params(&mut self, decls: &[ParamDecl]) {
+        for decl in decls {
+            for name in &decl.names {
+                self.add(name);
             }
         }
     }
 
-    fn binds(&mut self, list: Node<'_>, src: &str) {
-        for k in kids(list) {
-            if k.kind() == "identifier" {
-                self.add(text(k, src));
+    fn targets(&mut self, targets: &[Target]) {
+        for t in targets {
+            if let Target::Name(name) = t {
+                self.add(name);
             }
         }
     }
 
-    fn walk(&mut self, n: Node<'_>, src: &str) {
-        match n.kind() {
-            "short_var_declaration" => {
-                if let Some(left) = field(n, "left") {
-                    self.binds(left, src);
-                }
-                if let Some(right) = field(n, "right") {
-                    self.walk(right, src);
-                }
-            }
-            "var_spec" | "const_spec" => {
-                for name in fields(n, "name") {
-                    self.add(text(name, src));
-                }
-                if let Some(value) = field(n, "value") {
-                    self.walk(value, src);
+    fn stmts(&mut self, stmts: &[Stmt]) {
+        for s in stmts {
+            self.stmt(s);
+        }
+    }
+
+    fn stmt(&mut self, s: &Stmt) {
+        match s {
+            Stmt::Define { lhs, rhs } => {
+                self.targets(lhs);
+                for e in rhs {
+                    self.expr(e);
                 }
             }
-            "range_clause" | "receive_statement" => {
-                if has_token(n, ":=") {
-                    if let Some(left) = field(n, "left") {
-                        self.binds(left, src);
+            Stmt::Decl { specs, .. } => {
+                for spec in specs {
+                    for name in &spec.names {
+                        self.add(name);
+                    }
+                    spec.values.iter().for_each(|e| self.expr(e));
+                }
+            }
+            Stmt::Assign { lhs, rhs, .. } => {
+                lhs.iter().chain(rhs).for_each(|e| self.expr(e));
+            }
+            Stmt::IncDec { target, .. } | Stmt::Expr(target) | Stmt::Go(target) | Stmt::Defer(target) => self.expr(target),
+            Stmt::Send { ch, value } => {
+                self.expr(ch);
+                self.expr(value);
+            }
+            Stmt::Return(values) => values.iter().for_each(|e| self.expr(e)),
+            Stmt::If { init, cond, then, els } => {
+                if let Some(init) = init {
+                    self.stmt(init);
+                }
+                self.expr(cond);
+                self.stmts(then);
+                match els.as_deref() {
+                    Some(Else::Block(b)) => self.stmts(b),
+                    Some(Else::If(s)) => self.stmt(s),
+                    None => {}
+                }
+            }
+            Stmt::For { head, body } => {
+                match head {
+                    ForHead::Loop => {}
+                    ForHead::While(c) => self.expr(c),
+                    ForHead::Clause { init, cond, update } => {
+                        if let Some(i) = init {
+                            self.stmt(i);
+                        }
+                        if let Some(c) = cond {
+                            self.expr(c);
+                        }
+                        if let Some(u) = update {
+                            self.stmt(u);
+                        }
+                    }
+                    ForHead::Range { define, lhs, iter } => {
+                        if *define {
+                            if let Some(lhs) = lhs {
+                                self.targets(lhs);
+                            }
+                        }
+                        self.expr(iter);
                     }
                 }
-                if let Some(right) = field(n, "right") {
-                    self.walk(right, src);
+                self.stmts(body);
+            }
+            Stmt::Switch { init, value, cases } => {
+                if let Some(init) = init {
+                    self.stmt(init);
+                }
+                if let Some(v) = value {
+                    self.expr(v);
+                }
+                for case in cases {
+                    case.values.iter().flatten().for_each(|e| self.expr(e));
+                    self.stmts(&case.body);
                 }
             }
-            "type_switch_statement" => {
-                if let Some(alias) = field(n, "alias") {
-                    self.binds(alias, src);
+            Stmt::TypeSwitch { init, alias, value, cases } => {
+                if let Some(alias) = alias {
+                    self.targets(alias);
                 }
-                for k in kids(n) {
-                    self.walk(k, src);
+                if let Some(init) = init {
+                    self.stmt(init);
+                }
+                self.expr(value);
+                for case in cases {
+                    self.stmts(&case.body);
                 }
             }
+            Stmt::Select { cases } => {
+                for case in cases {
+                    if let Some(comm) = &case.comm {
+                        self.stmt(comm);
+                    }
+                    self.stmts(&case.body);
+                }
+            }
+            Stmt::Recv { define, lhs, rhs } => {
+                if *define {
+                    if let Some(lhs) = lhs {
+                        self.targets(lhs);
+                    }
+                }
+                self.expr(rhs);
+            }
+            Stmt::Block(b) => self.stmts(b),
+            Stmt::Labeled { stmt, .. } => self.stmt(stmt),
+            Stmt::NestedType | Stmt::Jump { .. } | Stmt::Fallthrough | Stmt::Empty | Stmt::Unknown(_) => {}
+        }
+    }
+
+    fn expr(&mut self, e: &Expr) {
+        for_each_child(e, &mut |child| match child {
+            Child::Expr(e) => self.expr(e),
             // A function literal's parameters are its own; its body's declarations are walked.
-            "func_literal" => {
-                if let Some(body) = field(n, "body") {
-                    self.walk(body, src);
-                }
+            Child::Body(body) => self.stmts(body),
+        });
+    }
+}
+
+/// What an expression holds that a walk may want: its sub-expressions, and the body of a function
+/// literal.
+pub(crate) enum Child<'e> {
+    Expr(&'e Expr),
+    Body(&'e [Stmt]),
+}
+
+/// Every direct child of an expression, in source order.
+pub(crate) fn for_each_child<'e>(e: &'e Expr, f: &mut dyn FnMut(Child<'e>)) {
+    match e {
+        Expr::Binary { l, r, .. } => {
+            f(Child::Expr(l));
+            f(Child::Expr(r));
+        }
+        Expr::Unary { e, .. } | Expr::Paren(e) | Expr::Spread(e) => f(Child::Expr(e)),
+        Expr::Call { f: callee, args, .. } => {
+            f(Child::Expr(callee));
+            for a in args {
+                f(Child::Expr(a));
             }
-            _ => {
-                for k in kids(n) {
-                    self.walk(k, src);
+        }
+        Expr::Selector { operand, .. } => f(Child::Expr(operand)),
+        Expr::Index { e, i } => {
+            f(Child::Expr(e));
+            f(Child::Expr(i));
+        }
+        Expr::Slice { e, lo, hi, cap } => {
+            f(Child::Expr(e));
+            for part in [lo, hi, cap].into_iter().flatten() {
+                f(Child::Expr(part));
+            }
+        }
+        Expr::Assert { e, .. } | Expr::Conv { e, .. } => f(Child::Expr(e)),
+        Expr::Composite { elems, .. } => {
+            for el in elems {
+                match el {
+                    Elem::Field(_, v) | Elem::Plain(v) | Elem::KeyedBlank(v) => f(Child::Expr(v)),
+                    Elem::Keyed(k, v) => {
+                        f(Child::Expr(k));
+                        f(Child::Expr(v));
+                    }
                 }
             }
         }
+        Expr::FuncLit { body, .. } => f(Child::Body(body)),
+        Expr::Name(_)
+        | Expr::Bool(_)
+        | Expr::Nil
+        | Expr::Iota
+        | Expr::Lit(..)
+        | Expr::Inst { .. }
+        | Expr::Type(_)
+        | Expr::Unknown(_) => {}
     }
 }
 
 /// The bound locals of one callable (its receiver excluded — that one is written `self`).
-pub(crate) fn locals_of(c: &Callable<'_>, src: &str) -> HashSet<String> {
+pub(crate) fn locals_of(f: &Func) -> HashSet<String> {
     let mut collect = Collect::default();
-    collect.params(c.params, src);
-    collect.params(c.results, src);
-    collect.walk(c.body, src);
-    if let Some(receiver) = c.receiver {
+    collect.params(&f.params);
+    if let Results::List(list) = &f.results {
+        collect.params(list);
+    }
+    collect.stmts(&f.body);
+    if let Some(receiver) = &f.receiver {
         collect.bound.remove(receiver);
     }
     collect.bound
@@ -159,7 +294,6 @@ pub(crate) fn locals_of(c: &Callable<'_>, src: &str) -> HashSet<String> {
 // ───────────────────────────── s-expr emitter ─────────────────────────────
 
 pub(crate) struct Dump<'a> {
-    src: &'a str,
     /// What each name the file imports binds — a selector on one of them is a package member.
     imports: &'a HashMap<String, Arc<str>>,
     /// Every name the callable binds, in every mode: a local shadowing a package is a value.
@@ -199,14 +333,12 @@ pub(crate) struct Dump<'a> {
 
 impl<'a> Dump<'a> {
     pub(crate) fn new(
-        src: &'a str,
         imports: &'a HashMap<String, Arc<str>>,
         bound: &'a HashSet<String>,
         receiver: Option<&'a str>,
         locals: Option<&'a HashSet<String>>,
     ) -> Self {
         Self {
-            src,
             imports,
             bound,
             receiver,
@@ -247,13 +379,17 @@ impl<'a> Dump<'a> {
         self.anchor == Some(name)
     }
 
-    fn text(&self, n: Node<'_>) -> &'a str {
-        text(n, self.src)
-    }
-
     /// Whether a bare name is an imported package rather than a value.
     fn is_package(&self, name: &str) -> bool {
         self.imports.contains_key(name) && !self.bound.contains(name) && self.receiver != Some(name)
+    }
+
+    /// The package an expression names, when it is a bare name of one.
+    fn package_of<'e>(&self, e: &'e Expr) -> Option<&'e str> {
+        match e {
+            Expr::Name(name) if self.is_package(name) => Some(name),
+            _ => None,
+        }
     }
 
     fn rename(&mut self, name: &str) -> String {
@@ -344,33 +480,30 @@ impl<'a> Dump<'a> {
     // ────── callables ──────
 
     /// `is_top` blanks the definition's own name in xname mode. The receiver is not a parameter.
-    pub(crate) fn func(&mut self, name: &str, c: &Callable<'_>, with_body: bool, is_top: bool) -> String {
+    pub(crate) fn func(&mut self, name: &str, f: &Func, with_body: bool, is_top: bool) -> String {
         let name = if is_top && self.locals.is_some() && !self.blanked {
             self.blanked = true;
             "_fn".to_owned()
         } else {
             self.rename(name)
         };
-        let params = self.params(c.params, "Params");
-        let results = self.results(c.results);
-        let body = if with_body { self.block(c.body) } else { String::new() };
+        let params = self.params(&f.params, "Params");
+        let results = self.results(&f.results);
+        let body = if with_body { self.block(&f.body) } else { String::new() };
         self.node("Func", &[Self::lit(&name), params, results, body])
     }
 
     /// A parameter list, one `Param` per name — `a, b int` is two parameters of one type.
-    fn params(&mut self, list: Option<Node<'_>>, tag: &str) -> String {
+    fn params(&mut self, decls: &[ParamDecl], tag: &str) -> String {
         let mut items = Vec::new();
-        for decl in list.map(kids).unwrap_or_default() {
-            let variadic = decl.kind() == "variadic_parameter_declaration";
-            let ty = field(decl, "type").map_or_else(String::new, |t| self.ty(t));
-            let ty = if variadic { self.node("TyVariadic", &[ty]) } else { ty };
-            let names = fields(decl, "name");
-            if names.is_empty() {
+        for decl in decls {
+            let ty = decl.ty.as_ref().map_or_else(String::new, |t| self.ty(t));
+            let ty = if decl.variadic { self.node("TyVariadic", &[ty]) } else { ty };
+            if decl.names.is_empty() {
                 items.push(self.node("Param", &[String::new(), ty]));
                 continue;
             }
-            for name in names {
-                let name = self.text(name);
+            for name in &decl.names {
                 let bound = self.bind(name);
                 items.push(self.node("Param", &[bound, ty.clone()]));
             }
@@ -379,11 +512,11 @@ impl<'a> Dump<'a> {
     }
 
     /// A result: one type, or a parenthesized list whose names are bound locals.
-    fn results(&mut self, results: Option<Node<'_>>) -> String {
+    fn results(&mut self, results: &Results) -> String {
         match results {
-            None => String::new(),
-            Some(list) if list.kind() == "parameter_list" => self.params(Some(list), "Results"),
-            Some(ty) => self.ty(ty),
+            Results::None => String::new(),
+            Results::List(list) => self.params(list, "Results"),
+            Results::Type(ty) => self.ty(ty),
         }
     }
 
@@ -393,30 +526,25 @@ impl<'a> Dump<'a> {
     /// line as context and weighs it like any other; an s-expr header spells the parse tree's grammar
     /// (`Params`, `Param`, `Bind`, `Results`), which only headers spell, so every one of those tokens
     /// was rare and the header outweighed the body of every short function (the Rust frontend's finding).
-    fn compact_header(&mut self, c: &Callable<'_>) -> String {
+    fn compact_header(&mut self, f: &Func) -> String {
         let mut out = String::from("func _fn");
-        if let Some(tps) = c.type_params {
-            let mut declared = Vec::new();
-            for decl in kids(tps) {
-                for name in fields(decl, "name") {
-                    let name = self.text(name);
-                    self.declared_types.insert(name.to_owned());
-                    declared.push(self.type_name(name));
-                }
-            }
-            if !declared.is_empty() {
-                let _ = write!(out, "[{}]", declared.join(", "));
-            }
+        let mut declared = Vec::new();
+        for name in &f.type_params {
+            self.declared_types.insert(name.clone());
+            declared.push(self.type_name(name));
         }
-        let params = self.header_params(c.params);
+        if !declared.is_empty() {
+            let _ = write!(out, "[{}]", declared.join(", "));
+        }
+        let params = self.header_params(&f.params);
         let _ = write!(out, "({params})");
-        match c.results {
-            None => {}
-            Some(list) if list.kind() == "parameter_list" => {
-                let results = self.header_params(Some(list));
+        match &f.results {
+            Results::None => {}
+            Results::List(list) => {
+                let results = self.header_params(list);
                 let _ = write!(out, " ({results})");
             }
-            Some(ty) => {
+            Results::Type(ty) => {
                 let ty = self.ty(ty);
                 let _ = write!(out, " {ty}");
             }
@@ -424,19 +552,16 @@ impl<'a> Dump<'a> {
         out
     }
 
-    fn header_params(&mut self, list: Option<Node<'_>>) -> String {
+    fn header_params(&mut self, decls: &[ParamDecl]) -> String {
         let mut items = Vec::new();
-        for decl in list.map(kids).unwrap_or_default() {
-            let variadic = decl.kind() == "variadic_parameter_declaration";
-            let ty = field(decl, "type").map_or_else(String::new, |t| self.ty(t));
-            let ty = if variadic { format!("...{ty}") } else { ty };
-            let names = fields(decl, "name");
-            if names.is_empty() {
+        for decl in decls {
+            let ty = decl.ty.as_ref().map_or_else(String::new, |t| self.ty(t));
+            let ty = if decl.variadic { format!("...{ty}") } else { ty };
+            if decl.names.is_empty() {
                 items.push(ty);
                 continue;
             }
-            for name in names {
-                let name = self.text(name);
+            for name in &decl.names {
                 let name = if name == "_" { "_".to_owned() } else { self.rename(name) };
                 items.push(format!("{name} {ty}"));
             }
@@ -446,23 +571,29 @@ impl<'a> Dump<'a> {
 
     // ────── statements / blocks ──────
 
-    pub(crate) fn block(&mut self, block: Node<'_>) -> String {
-        let items: Vec<String> = statements(block).into_iter().map(|s| self.stmt(s)).collect();
+    pub(crate) fn block(&mut self, stmts: &[Stmt]) -> String {
+        let items: Vec<String> = stmts.iter().map(|s| self.stmt(s)).collect();
         self.list("Block", &items)
     }
 
-    /// An expression list as a binding site: names become `Bind`s, a list of two or more a tuple.
-    fn binds(&mut self, list: Node<'_>) -> String {
-        let items: Vec<String> = kids(list)
-            .into_iter()
-            .map(|k| if k.kind() == "identifier" { self.bind(self.text(k)) } else { self.expr(k) })
+    /// Binding targets: names become `Bind`s, a list of two or more a tuple.
+    fn targets(&mut self, targets: &[Target]) -> String {
+        let items: Vec<String> = targets
+            .iter()
+            .map(|t| match t {
+                Target::Name(name) => self.bind(name),
+                Target::Expr(e) => self.expr(e),
+            })
             .collect();
         self.tuple_of("PatTuple", items)
     }
 
-    /// An expression list read as values, a list of two or more a tuple.
-    fn exprs(&mut self, list: Node<'_>) -> String {
-        let items: Vec<String> = kids(list).into_iter().map(|k| self.expr(k)).collect();
+    /// Expressions read as values, a list of two or more a tuple; nothing at all is an empty field.
+    fn exprs(&mut self, list: &[Expr]) -> String {
+        if list.is_empty() {
+            return String::new();
+        }
+        let items: Vec<String> = list.iter().map(|e| self.expr(e)).collect();
         self.tuple_of("Tuple", items)
     }
 
@@ -475,234 +606,220 @@ impl<'a> Dump<'a> {
     }
 
     /// One `var` / `const` spec inside a body: `Let(PatType(binds, ty), values)`.
-    fn spec(&mut self, spec: Node<'_>, tag: &str) -> String {
-        let names: Vec<String> = fields(spec, "name").into_iter().map(|n| self.bind(self.text(n))).collect();
+    fn spec(&mut self, spec: &crate::ir::Spec, tag: &str) -> String {
+        let names: Vec<String> = spec.names.iter().map(|n| self.bind(n)).collect();
         let pat = self.tuple_of("PatTuple", names);
-        let pat = match field(spec, "type") {
+        let pat = match &spec.ty {
             Some(t) => {
                 let ty = self.ty(t);
                 self.node("PatType", &[pat, ty])
             }
             None => pat,
         };
-        let value = field(spec, "value").map_or_else(String::new, |v| self.exprs(v));
+        let value = self.exprs(&spec.values);
         self.node(tag, &[pat, value])
     }
 
-    fn specs(&mut self, decl: Node<'_>, spec_kind: &str, tag: &str) -> String {
-        let mut specs = Vec::new();
-        for k in kids(decl) {
-            if k.kind() == spec_kind {
-                specs.push(k);
-            } else {
-                specs.extend(kids(k).into_iter().filter(|s| s.kind() == spec_kind));
-            }
-        }
-        let mut items: Vec<String> = specs.into_iter().map(|s| self.spec(s, tag)).collect();
-        if items.len() == 1 {
-            items.pop().unwrap_or_default()
-        } else {
-            self.list("Decls", &items)
-        }
-    }
-
-    pub(crate) fn stmt(&mut self, n: Node<'_>) -> String {
-        match n.kind() {
-            "short_var_declaration" => {
-                let left = field(n, "left").map_or_else(String::new, |l| self.binds(l));
-                let right = field(n, "right").map_or_else(String::new, |r| self.exprs(r));
+    pub(crate) fn stmt(&mut self, s: &Stmt) -> String {
+        match s {
+            Stmt::Define { lhs, rhs } => {
+                let left = self.targets(lhs);
+                let right = self.exprs(rhs);
                 self.node("Let", &[left, right])
             }
-            "var_declaration" => self.specs(n, "var_spec", "Let"),
-            "const_declaration" => self.specs(n, "const_spec", "LocalConst"),
-            "type_declaration" => self.node("NestedItem", &[]),
-            "assignment_statement" => {
-                let op = field(n, "operator").map_or("=", |o| o.kind());
-                let left = field(n, "left").map_or_else(String::new, |l| self.exprs(l));
-                let right = field(n, "right").map_or_else(String::new, |r| self.exprs(r));
+            Stmt::Decl { konst, specs } => {
+                let tag = if *konst { "LocalConst" } else { "Let" };
+                let mut items: Vec<String> = specs.iter().map(|spec| self.spec(spec, tag)).collect();
+                if items.len() == 1 {
+                    items.pop().unwrap_or_default()
+                } else {
+                    self.list("Decls", &items)
+                }
+            }
+            Stmt::NestedType => self.node("NestedItem", &[]),
+            Stmt::Assign { op, lhs, rhs } => {
+                let left = self.exprs(lhs);
+                let right = self.exprs(rhs);
                 if op == "=" {
                     self.node("Assign", &[left, right])
                 } else {
                     self.node("Bin", &[left, Self::lit(op), right])
                 }
             }
-            "inc_statement" | "dec_statement" => {
-                let tag = if n.kind() == "inc_statement" { "Inc" } else { "Dec" };
-                let e = kids(n).first().map_or_else(String::new, |e| self.expr(*e));
-                self.node(tag, &[e])
+            Stmt::IncDec { inc, target } => {
+                let e = self.expr(target);
+                self.node(if *inc { "Inc" } else { "Dec" }, &[e])
             }
-            "send_statement" => {
-                let ch = field(n, "channel").map_or_else(String::new, |c| self.expr(c));
-                let v = field(n, "value").map_or_else(String::new, |v| self.expr(v));
+            Stmt::Send { ch, value } => {
+                let ch = self.expr(ch);
+                let v = self.expr(value);
                 self.node("Send", &[ch, v])
             }
-            "expression_statement" => {
-                let e = kids(n).first().map_or_else(String::new, |e| self.expr(*e));
+            Stmt::Expr(e) => {
+                let e = self.expr(e);
                 self.node("ExprStmt", &[e])
             }
-            "return_statement" => {
-                let values = kids(n).first().map_or_else(String::new, |l| self.exprs(*l));
+            Stmt::Return(values) => {
+                let values = self.exprs(values);
                 self.node("Return", &[values])
             }
-            "go_statement" | "defer_statement" => {
-                let tag = if n.kind() == "go_statement" { "Go" } else { "Defer" };
-                let e = kids(n).first().map_or_else(String::new, |e| self.expr(*e));
+            Stmt::Go(e) | Stmt::Defer(e) => {
+                let tag = if matches!(s, Stmt::Go(_)) { "Go" } else { "Defer" };
+                let e = self.expr(e);
                 self.node(tag, &[e])
             }
-            "break_statement" | "continue_statement" | "goto_statement" => {
-                let tag = match n.kind() {
-                    "break_statement" => "Break",
-                    "continue_statement" => "Continue",
-                    _ => "Goto",
+            Stmt::Jump { kind, label } => {
+                let tag = match kind {
+                    Jump::Break => "Break",
+                    Jump::Continue => "Continue",
+                    Jump::Goto => "Goto",
                 };
-                let label = kids(n).first().map_or_else(String::new, |l| Self::lit(self.text(*l)));
+                let label = label.as_deref().map_or_else(String::new, Self::lit);
                 self.node(tag, &[label])
             }
-            "fallthrough_statement" => self.node("Fallthrough", &[]),
-            "if_statement" => {
-                let init = field(n, "initializer").map_or_else(String::new, |i| self.stmt(i));
-                let cond = field(n, "condition").map_or_else(String::new, |c| self.expr(c));
-                let then = field(n, "consequence").map_or_else(String::new, |b| self.block(b));
-                let els = match field(n, "alternative") {
-                    Some(alt) if alt.kind() == "if_statement" => self.stmt(alt),
-                    Some(alt) => self.block(alt),
+            Stmt::Fallthrough => self.node("Fallthrough", &[]),
+            Stmt::If { init, cond, then, els } => {
+                let init = init.as_deref().map_or_else(String::new, |i| self.stmt(i));
+                let cond = self.expr(cond);
+                let then = self.block(then);
+                let els = match els.as_deref() {
+                    Some(Else::If(alt)) => self.stmt(alt),
+                    Some(Else::Block(b)) => self.block(b),
                     None => String::new(),
                 };
                 self.node("If", &[init, cond, then, els])
             }
-            "for_statement" => {
-                let body = field(n, "body").map_or_else(String::new, |b| self.block(b));
-                match for_head(n) {
-                    None => self.node("Loop", &[body]),
-                    Some(h) if h.kind() == "range_clause" => {
-                        let (pat, iter) = self.range_parts(h);
+            Stmt::For { head, body } => {
+                let body = self.block(body);
+                match head {
+                    ForHead::Loop => self.node("Loop", &[body]),
+                    ForHead::Range { .. } => {
+                        let (pat, iter) = self.range_parts(head);
                         self.node("For", &[pat, iter, body])
                     }
-                    Some(h) if h.kind() == "for_clause" => {
-                        let (init, cond, update) = self.clause_parts(h);
+                    ForHead::Clause { .. } => {
+                        let (init, cond, update) = self.clause_parts(head);
                         self.node("ForC", &[init, cond, update, body])
                     }
-                    Some(cond) => {
+                    ForHead::While(cond) => {
                         let cond = self.expr(cond);
                         self.node("While", &[cond, body])
                     }
                 }
             }
-            "expression_switch_statement" => {
-                let init = field(n, "initializer").map_or_else(String::new, |i| self.stmt(i));
-                let value = field(n, "value").map_or_else(String::new, |v| self.expr(v));
-                let cases: Vec<String> = kids(n)
-                    .into_iter()
-                    .filter_map(|c| match c.kind() {
-                        "expression_case" => {
-                            let values = field(c, "value").map_or_else(String::new, |v| self.exprs(v));
-                            let body = self.clause_block(c);
-                            Some(self.node("Case", &[values, body]))
+            Stmt::Switch { init, value, cases } => {
+                let init = init.as_deref().map_or_else(String::new, |i| self.stmt(i));
+                let value = value.as_ref().map_or_else(String::new, |v| self.expr(v));
+                let cases: Vec<String> = cases
+                    .iter()
+                    .map(|case| {
+                        if let Some(values) = &case.values {
+                            let values = self.exprs(values);
+                            let body = self.block(&case.body);
+                            self.node("Case", &[values, body])
+                        } else {
+                            let body = self.block(&case.body);
+                            self.node("Default", &[body])
                         }
-                        "default_case" => {
-                            let body = self.clause_block(c);
-                            Some(self.node("Default", &[body]))
-                        }
-                        _ => None,
                     })
                     .collect();
                 let cases = cases.join(", ");
                 self.node("Switch", &[init, value, cases])
             }
-            "type_switch_statement" => {
-                let init = field(n, "initializer").map_or_else(String::new, |i| self.stmt(i));
-                let alias = field(n, "alias").map_or_else(String::new, |a| self.binds(a));
-                let value = field(n, "value").map_or_else(String::new, |v| self.expr(v));
-                let cases: Vec<String> = kids(n)
-                    .into_iter()
-                    .filter_map(|c| match c.kind() {
-                        "type_case" => {
-                            let types = self.case_types(c);
-                            let body = self.clause_block(c);
-                            Some(self.node("TypeCase", &[types, body]))
+            Stmt::TypeSwitch { init, alias, value, cases } => {
+                let init = init.as_deref().map_or_else(String::new, |i| self.stmt(i));
+                let alias = alias.as_deref().map_or_else(String::new, |a| self.targets(a));
+                let value = self.expr(value);
+                let cases: Vec<String> = cases
+                    .iter()
+                    .map(|case| {
+                        if let Some(types) = &case.types {
+                            let types = self.types_joined(types);
+                            let body = self.block(&case.body);
+                            self.node("TypeCase", &[types, body])
+                        } else {
+                            let body = self.block(&case.body);
+                            self.node("Default", &[body])
                         }
-                        "default_case" => {
-                            let body = self.clause_block(c);
-                            Some(self.node("Default", &[body]))
-                        }
-                        _ => None,
                     })
                     .collect();
                 let cases = cases.join(", ");
                 self.node("TypeSwitch", &[init, alias, value, cases])
             }
-            "select_statement" => {
-                let cases: Vec<String> = kids(n)
-                    .into_iter()
-                    .filter_map(|c| match c.kind() {
-                        "communication_case" => {
-                            let comm = field(c, "communication").map_or_else(String::new, |m| self.stmt(m));
-                            let body = self.clause_block(c);
-                            Some(self.node("CommCase", &[comm, body]))
+            Stmt::Select { cases } => {
+                let cases: Vec<String> = cases
+                    .iter()
+                    .map(|case| {
+                        if case.default {
+                            let body = self.block(&case.body);
+                            self.node("Default", &[body])
+                        } else {
+                            let comm = case.comm.as_deref().map_or_else(String::new, |m| self.stmt(m));
+                            let body = self.block(&case.body);
+                            self.node("CommCase", &[comm, body])
                         }
-                        "default_case" => {
-                            let body = self.clause_block(c);
-                            Some(self.node("Default", &[body]))
-                        }
-                        _ => None,
                     })
                     .collect();
                 self.list("Select", &cases)
             }
-            "receive_statement" => {
-                let left = match field(n, "left") {
-                    Some(l) if has_token(n, ":=") => self.binds(l),
-                    Some(l) => self.exprs(l),
+            Stmt::Recv { define, lhs, rhs } => {
+                let left = match lhs {
+                    Some(l) if *define => self.targets(l),
+                    Some(l) => self.target_exprs(l),
                     None => String::new(),
                 };
-                let right = field(n, "right").map_or_else(String::new, |r| self.expr(r));
+                let right = self.expr(rhs);
                 self.node("RecvStmt", &[left, right])
             }
-            "block" => {
-                let body = self.block(n);
+            Stmt::Block(b) => {
+                let body = self.block(b);
                 self.node("BlockExpr", &[body])
             }
-            "labeled_statement" => {
-                let label = field(n, "label").map_or_else(String::new, |l| Self::lit(self.text(l)));
-                let inner = kids(n)
-                    .into_iter()
-                    .find(|k| k.kind() != "label_name")
-                    .map_or_else(String::new, |s| self.stmt(s));
+            Stmt::Labeled { label, stmt } => {
+                let label = Self::lit(label);
+                let inner = self.stmt(stmt);
                 self.node("Labeled", &[label, inner])
             }
-            "empty_statement" => self.node("Empty", &[]),
-            other => self.node(&format!("Unknown_{other}"), &[]),
+            Stmt::Empty => self.node("Empty", &[]),
+            Stmt::Unknown(kind) => self.node(&format!("Unknown_{kind}"), &[]),
         }
     }
 
-    /// A `case` clause's statements, as a block.
-    fn clause_block(&mut self, clause: Node<'_>) -> String {
-        let items: Vec<String> = statements(clause).into_iter().map(|s| self.stmt(s)).collect();
-        self.list("Block", &items)
+    /// Targets that assign rather than declare, read as values.
+    fn target_exprs(&mut self, targets: &[Target]) -> String {
+        let items: Vec<String> = targets
+            .iter()
+            .map(|t| match t {
+                Target::Name(name) => self.ident(name),
+                Target::Expr(e) => self.expr(e),
+            })
+            .collect();
+        self.tuple_of("Tuple", items)
     }
 
-    /// The types a type switch's `case` names.
-    fn case_types(&mut self, clause: Node<'_>) -> String {
-        let types: Vec<String> = fields(clause, "type").into_iter().map(|t| self.ty(t)).collect();
+    fn types_joined(&mut self, types: &[Type]) -> String {
+        let types: Vec<String> = types.iter().map(|t| self.ty(t)).collect();
         types.join(", ")
     }
 
     /// `for k, v := range xs` → the bindings and what is ranged over.
-    fn range_parts(&mut self, clause: Node<'_>) -> (String, String) {
-        let pat = match field(clause, "left") {
-            Some(l) if has_token(clause, ":=") => self.binds(l),
-            Some(l) => self.exprs(l),
+    fn range_parts(&mut self, head: &ForHead) -> (String, String) {
+        let ForHead::Range { define, lhs, iter } = head else { return (String::new(), String::new()) };
+        let pat = match lhs {
+            Some(l) if *define => self.targets(l),
+            Some(l) => self.target_exprs(l),
             None => String::new(),
         };
-        let iter = field(clause, "right").map_or_else(String::new, |r| self.expr(r));
+        let iter = self.expr(iter);
         (pat, iter)
     }
 
     /// `for init; cond; update` → its three parts, each possibly empty.
-    fn clause_parts(&mut self, clause: Node<'_>) -> (String, String, String) {
-        let init = field(clause, "initializer").map_or_else(String::new, |i| self.stmt(i));
-        let cond = field(clause, "condition").map_or_else(String::new, |c| self.expr(c));
-        let update = field(clause, "update").map_or_else(String::new, |u| self.stmt(u));
+    fn clause_parts(&mut self, head: &ForHead) -> (String, String, String) {
+        let ForHead::Clause { init, cond, update } = head else { return (String::new(), String::new(), String::new()) };
+        let init = init.as_deref().map_or_else(String::new, |i| self.stmt(i));
+        let cond = cond.as_ref().map_or_else(String::new, |c| self.expr(c));
+        let update = update.as_deref().map_or_else(String::new, |u| self.stmt(u));
         (init, cond, update)
     }
 
@@ -712,59 +829,48 @@ impl<'a> Dump<'a> {
     // stream and the use-site walk, which must write a header the same way.
 
     /// `For(binds, iter)`, `ForC(init, cond, update)`, `While(cond)` or `Loop()`.
-    fn for_header(&mut self, n: Node<'_>) -> String {
-        match for_head(n) {
-            None => self.node("Loop", &[]),
-            Some(h) if h.kind() == "range_clause" => {
-                let (pat, iter) = self.range_parts(h);
+    fn for_header(&mut self, head: &ForHead) -> String {
+        match head {
+            ForHead::Loop => self.node("Loop", &[]),
+            ForHead::Range { .. } => {
+                let (pat, iter) = self.range_parts(head);
                 self.node("For", &[pat, iter])
             }
-            Some(h) if h.kind() == "for_clause" => {
-                let (init, cond, update) = self.clause_parts(h);
+            ForHead::Clause { .. } => {
+                let (init, cond, update) = self.clause_parts(head);
                 self.node("ForC", &[init, cond, update])
             }
-            Some(cond) => {
+            ForHead::While(cond) => {
                 let cond = self.expr(cond);
                 self.node("While", &[cond])
             }
         }
     }
 
-    /// `Switch(value)`, `TypeSwitch(alias, value)` or `Select()` — its initializer is a step of its own.
-    fn switch_header(&mut self, n: Node<'_>) -> String {
-        match n.kind() {
-            "type_switch_statement" => {
-                let alias = field(n, "alias").map_or_else(String::new, |a| self.binds(a));
-                let value = field(n, "value").map_or_else(String::new, |v| self.expr(v));
+    /// `Switch(value)`, `TypeSwitch(alias, value)` or `Select()` — its initializer is a step of its
+    /// own. `None` for any other statement.
+    fn switch_header(&mut self, s: &Stmt) -> Option<String> {
+        Some(match s {
+            Stmt::TypeSwitch { alias, value, .. } => {
+                let alias = alias.as_deref().map_or_else(String::new, |a| self.targets(a));
+                let value = self.expr(value);
                 self.node("TypeSwitch", &[alias, value])
             }
-            "select_statement" => self.node("Select", &[]),
-            _ => {
-                let value = field(n, "value").map_or_else(String::new, |v| self.expr(v));
+            Stmt::Select { .. } => self.node("Select", &[]),
+            Stmt::Switch { value, .. } => {
+                let value = value.as_ref().map_or_else(String::new, |v| self.expr(v));
                 self.node("Switch", &[value])
             }
-        }
-    }
-
-    /// A clause's own line — `Case(values)`, `TypeCase(types)`, `CommCase(comm)` or `Default()`;
-    /// `None` for what is not a clause.
-    fn case_header(&mut self, case: Node<'_>) -> Option<String> {
-        Some(match case.kind() {
-            "expression_case" => {
-                let values = field(case, "value").map_or_else(String::new, |v| self.exprs(v));
-                self.node("Case", &[values])
-            }
-            "type_case" => {
-                let types = self.case_types(case);
-                self.node("TypeCase", &[types])
-            }
-            "communication_case" => {
-                let comm = field(case, "communication").map_or_else(String::new, |m| self.stmt(m));
-                self.node("CommCase", &[comm])
-            }
-            "default_case" => self.node("Default", &[]),
             _ => return None,
         })
+    }
+
+    fn comm_head(&mut self, case: &CommCase) -> String {
+        if case.default {
+            return self.node("Default", &[]);
+        }
+        let comm = case.comm.as_deref().map_or_else(String::new, |m| self.stmt(m));
+        self.node("CommCase", &[comm])
     }
 
     // ────── expressions ──────
@@ -772,14 +878,14 @@ impl<'a> Dump<'a> {
     /// An expression — and, when units are being collected, kept as one if it is a proper part of
     /// its line: the statement's own expression is the line, already a unit. A wrapper (parentheses,
     /// `&`) is not a level of its own; what it wraps is the part.
-    pub(crate) fn expr(&mut self, n: Node<'_>) -> String {
-        if is_wrapper(n) {
-            return self.expr_inner(n);
+    pub(crate) fn expr(&mut self, e: &Expr) -> String {
+        if is_wrapper(e) {
+            return self.expr_inner(e);
         }
         self.expr_depth += 1;
-        let out = self.expr_inner(n);
+        let out = self.expr_inner(e);
         self.expr_depth -= 1;
-        if self.expr_depth > 0 && self.is_unit(n) {
+        if self.expr_depth > 0 && self.is_unit(e) {
             if let Some(units) = self.units.as_mut() {
                 units.push((self.unit_line, out.clone()));
             }
@@ -787,129 +893,114 @@ impl<'a> Dump<'a> {
         out
     }
 
-    fn expr_inner(&mut self, n: Node<'_>) -> String {
-        match n.kind() {
-            "identifier" => self.ident(self.text(n)),
-            "true" | "false" => self.node("Bool", &[Self::lit(n.kind())]),
-            "nil" => self.node("Nil", &[]),
-            "iota" => self.node("Iota", &[]),
-            "int_literal" => self.node("Int", &[Self::lit(self.text(n))]),
-            "float_literal" => self.node("Float", &[Self::lit(self.text(n))]),
-            "imaginary_literal" => self.node("Imag", &[Self::lit(self.text(n))]),
-            "rune_literal" => self.node("Char", &[Self::lit(unquote(self.text(n)))]),
-            "interpreted_string_literal" | "raw_string_literal" => self.node("Str", &[Self::lit(unquote(self.text(n)))]),
-            "binary_expression" => {
-                let l = field(n, "left").map_or_else(String::new, |e| self.expr(e));
-                let op = field(n, "operator").map_or("?op", |o| o.kind());
-                let r = field(n, "right").map_or_else(String::new, |e| self.expr(e));
+    fn opt_expr(&mut self, e: Option<&Expr>) -> String {
+        e.map_or_else(String::new, |e| self.expr(e))
+    }
+
+    fn opt_ty(&mut self, t: Option<&Type>) -> String {
+        t.map_or_else(String::new, |t| self.ty(t))
+    }
+
+    fn expr_inner(&mut self, e: &Expr) -> String {
+        match e {
+            Expr::Name(name) => self.ident(name),
+            Expr::Bool(b) => self.node("Bool", &[Self::lit(if *b { "true" } else { "false" })]),
+            Expr::Nil => self.node("Nil", &[]),
+            Expr::Iota => self.node("Iota", &[]),
+            Expr::Lit(tag, text) => self.node(tag, &[Self::lit(text)]),
+            Expr::Binary { op, l, r } => {
+                let l = self.expr(l);
+                let r = self.expr(r);
                 self.node("Bin", &[l, Self::lit(op), r])
             }
-            "unary_expression" => {
-                let op = field(n, "operator").map_or("?un", |o| o.kind());
-                let e = field(n, "operand").map_or_else(String::new, |e| self.expr(e));
-                match op {
-                    "&" => self.node("Ref", &[e]),
-                    "<-" => self.node("Recv", &[e]),
-                    op => self.node("Unary", &[Self::lit(op), e]),
+            Expr::Unary { op, e } => {
+                let inner = self.expr(e);
+                match op.as_str() {
+                    "&" => self.node("Ref", &[inner]),
+                    "<-" => self.node("Recv", &[inner]),
+                    op => self.node("Unary", &[Self::lit(op), inner]),
                 }
             }
-            "parenthesized_expression" => kids(n).first().map_or_else(String::new, |e| self.expr(*e)),
-            "call_expression" => self.call(n),
-            "selector_expression" => {
-                let operand = field(n, "operand");
-                let name = field(n, "field").map_or("", |f| self.text(f));
-                if let Some(pkg) = operand.filter(|o| o.kind() == "identifier").map(|o| self.text(o)) {
-                    if self.is_package(pkg) {
-                        let path = if self.mention(name) { "_t0".to_owned() } else { format!("{pkg}.{name}") };
-                        return self.node("Path", &[Self::lit(&path)]);
-                    }
+            Expr::Paren(inner) => self.expr(inner),
+            Expr::Call { f, args, targs } => self.call(f, args, targs.as_deref()),
+            Expr::Selector { operand, field } => {
+                if let Some(pkg) = self.package_of(operand) {
+                    let path = if self.mention(field) { "_t0".to_owned() } else { format!("{pkg}.{field}") };
+                    return self.node("Path", &[Self::lit(&path)]);
                 }
-                let base = operand.map_or_else(String::new, |o| self.expr(o));
-                self.node("Field", &[base, Self::lit(name)])
+                let base = self.expr(operand);
+                self.node("Field", &[base, Self::lit(field)])
             }
-            "index_expression" => {
-                let base = field(n, "operand").map_or_else(String::new, |e| self.expr(e));
-                let idx = field(n, "index").map_or_else(String::new, |e| self.expr(e));
+            Expr::Index { e, i } => {
+                let base = self.expr(e);
+                let idx = self.expr(i);
                 self.node("Index", &[base, idx])
             }
-            "slice_expression" => {
-                let base = field(n, "operand").map_or_else(String::new, |e| self.expr(e));
-                let lo = field(n, "start").map_or_else(String::new, |e| self.expr(e));
-                let hi = field(n, "end").map_or_else(String::new, |e| self.expr(e));
-                let cap = field(n, "capacity").map_or_else(String::new, |e| self.expr(e));
+            Expr::Slice { e, lo, hi, cap } => {
+                let base = self.expr(e);
+                let lo = self.opt_expr(lo.as_deref());
+                let hi = self.opt_expr(hi.as_deref());
+                let cap = self.opt_expr(cap.as_deref());
                 self.node("Slice", &[base, lo, hi, cap])
             }
-            "type_assertion_expression" => {
-                let e = field(n, "operand").map_or_else(String::new, |e| self.expr(e));
-                let t = field(n, "type").map_or_else(String::new, |t| self.ty(t));
+            Expr::Assert { e, ty } => {
+                let e = self.expr(e);
+                let t = self.opt_ty(ty.as_ref());
                 self.node("Assert", &[e, t])
             }
-            "type_conversion_expression" => {
-                let e = field(n, "operand").map_or_else(String::new, |e| self.expr(e));
-                let t = field(n, "type").map_or_else(String::new, |t| self.ty(t));
+            Expr::Conv { e, ty } => {
+                let e = self.expr(e);
+                let t = self.opt_ty(ty.as_ref());
                 self.node("Cast", &[e, t])
             }
-            "type_instantiation_expression" => {
-                let t = field(n, "type").map_or_else(String::new, |t| self.ty(t));
-                let args: Vec<String> =
-                    kids(n).into_iter().skip(1).map(|a| self.ty(a)).collect();
+            Expr::Inst { ty, args } => {
+                let t = self.opt_ty(ty.as_ref());
+                let args: Vec<String> = args.iter().map(|a| self.ty(a)).collect();
                 let args = self.list("TypeArgs", &args);
                 self.node("Inst", &[t, args])
             }
-            "composite_literal" => {
-                let t = field(n, "type").map_or_else(String::new, |t| self.ty(t));
+            Expr::Composite { ty, elems } => {
+                let t = self.opt_ty(ty.as_ref());
                 // A literal of the anchor sets its surface: the fields it names are marked for the
                 // profile to number.
                 let on_anchor = t.starts_with("Ty(_t0");
-                let elems = field(n, "body").map_or_else(String::new, |b| self.elements(b, on_anchor));
+                let elems = self.elements(elems, on_anchor);
                 self.node("Composite", &[t, elems])
             }
-            // An elided inner literal (`[]Point{{1, 2}}`) — its type is the enclosing one's element.
-            "literal_value" => {
-                let elems = self.elements(n, false);
-                self.node("Composite", &[String::new(), elems])
-            }
-            "func_literal" => {
-                let params = self.params(field(n, "parameters"), "Params");
-                let results = self.results(field(n, "result"));
-                let body = field(n, "body").map_or_else(String::new, |b| self.block(b));
+            Expr::FuncLit { params, results, body } => {
+                let params = self.params(params, "Params");
+                let results = self.results(results);
+                let body = self.block(body);
                 self.node("Closure", &[params, results, body])
             }
-            "variadic_argument" => {
-                let e = kids(n).first().map_or_else(String::new, |e| self.expr(*e));
-                self.node("Spread", &[e])
+            Expr::Spread(inner) => {
+                let inner = self.expr(inner);
+                self.node("Spread", &[inner])
             }
-            kind if is_type_kind(kind) => self.ty(n),
-            other => self.node(&format!("Unknown_{other}"), &[]),
+            Expr::Type(t) => self.ty(t),
+            Expr::Unknown(kind) => self.node(&format!("Unknown_{kind}"), &[]),
         }
     }
 
     /// A call: `Method(receiver, 'name', args)` when it calls through a value — the Rust frontend's
     /// method call — and `Call(callee, args)` when the callee is a name or a package member.
-    fn call(&mut self, n: Node<'_>) -> String {
-        let func = field(n, "function");
-        let mut args: Vec<String> =
-            field(n, "arguments").map(kids).unwrap_or_default().into_iter().map(|a| self.expr(a)).collect();
-        if let Some(targs) = field(n, "type_arguments") {
-            let types: Vec<String> = kids(targs).into_iter().map(|t| self.ty(t)).collect();
-            args.push(self.list("TypeArgs", &types));
+    fn call(&mut self, f: &Expr, args: &[Expr], targs: Option<&[Type]>) -> String {
+        let mut items: Vec<String> = args.iter().map(|a| self.expr(a)).collect();
+        if let Some(targs) = targs {
+            let types: Vec<String> = targs.iter().map(|t| self.ty(t)).collect();
+            items.push(self.list("TypeArgs", &types));
         }
-        let args = args.join(", ");
-        if let Some(sel) = func.filter(|f| f.kind() == "selector_expression") {
-            let operand = field(sel, "operand");
-            let on_package = operand
-                .filter(|o| o.kind() == "identifier")
-                .is_some_and(|o| self.is_package(self.text(o)));
-            if !on_package {
-                let recv = operand.map_or_else(String::new, |o| self.expr(o));
-                let method = field(sel, "field").map_or("", |f| self.text(f));
+        let args = items.join(", ");
+        if let Expr::Selector { operand, field } = f {
+            if self.package_of(operand).is_none() {
+                let recv = self.expr(operand);
                 if self.known.is_some() {
-                    self.calls.insert(format!(".{method}"));
+                    self.calls.insert(format!(".{field}"));
                 }
-                return self.node("Method", &[recv, Self::lit(method), args]);
+                return self.node("Method", &[recv, Self::lit(field), args]);
             }
         }
-        let callee = func.map_or_else(String::new, |f| self.expr(f));
+        let callee = self.expr(f);
         self.node("Call", &[callee, args])
     }
 
@@ -917,108 +1008,88 @@ impl<'a> Dump<'a> {
     /// v)`, the Rust frontend's struct-literal field, its name kept as spelled. Any other key is an
     /// expression — a map's — and the element is `KV(key, v)`. The two differ in what a varying key
     /// means: another field is another member (reflection), another map key is just another value.
-    fn elements(&mut self, body: Node<'_>, on_anchor: bool) -> String {
-        let items: Vec<String> = kids(body)
-            .into_iter()
-            .map(|el| match el.kind() {
-                "keyed_element" => {
-                    let key = field(el, "key");
-                    let name = key.and_then(|k| kids(k).into_iter().next()).filter(|i| i.kind() == "identifier");
-                    // The key is written before the value, so a local in it is numbered in source order.
-                    let (tag, key) = match (name, key) {
-                        (Some(name), _) if on_anchor => ("FieldVal", Self::lit(&format!("#{}#", self.text(name)))),
-                        (Some(name), _) => ("FieldVal", Self::lit(self.text(name))),
-                        (None, Some(k)) => ("KV", self.element(k)),
-                        (None, None) => ("KV", String::new()),
-                    };
-                    let value = field(el, "value").map_or_else(String::new, |v| self.element(v));
-                    self.node(tag, &[key, value])
+    fn elements(&mut self, elems: &[Elem], on_anchor: bool) -> String {
+        let items: Vec<String> = elems
+            .iter()
+            .map(|el| match el {
+                Elem::Field(name, value) => {
+                    let key = if on_anchor { Self::lit(&format!("#{name}#")) } else { Self::lit(name) };
+                    let value = self.expr(value);
+                    self.node("FieldVal", &[key, value])
                 }
-                _ => self.element(el),
+                // The key is written before the value, so a local in it is numbered in source order.
+                Elem::Keyed(key, value) => {
+                    let key = self.expr(key);
+                    let value = self.expr(value);
+                    self.node("KV", &[key, value])
+                }
+                Elem::KeyedBlank(value) => {
+                    let value = self.expr(value);
+                    self.node("KV", &[String::new(), value])
+                }
+                Elem::Plain(value) => self.expr(value),
             })
             .collect();
         items.join(", ")
     }
 
-    fn element(&mut self, el: Node<'_>) -> String {
-        match kids(el).first() {
-            Some(inner) => self.expr(*inner),
-            None => String::new(),
-        }
-    }
-
     // ────── types (summarized) ──────
 
-    pub(crate) fn ty(&mut self, n: Node<'_>) -> String {
-        match n.kind() {
-            "type_identifier" | "qualified_type" | "identifier" => {
-                let name = self.type_name(self.text(n));
+    pub(crate) fn ty(&mut self, t: &Type) -> String {
+        match t {
+            Type::Named(name) => {
+                let name = self.type_name(name);
                 self.node("Ty", &[name, String::new()])
             }
-            "generic_type" => {
-                let name = field(n, "type").map_or_else(String::new, |t| self.type_name(self.text(t)));
-                let args: Vec<String> =
-                    field(n, "type_arguments").map(kids).unwrap_or_default().into_iter().map(|a| self.ty(a)).collect();
+            Type::Generic(name, args) => {
+                let name = if name.is_empty() { String::new() } else { self.type_name(name) };
+                let args: Vec<String> = args.iter().map(|a| self.ty(a)).collect();
                 let args = args.join(", ");
                 self.node("Ty", &[name, args])
             }
-            "pointer_type" => {
-                let inner = kids(n).first().map_or_else(String::new, |t| self.ty(*t));
+            Type::Ptr(inner) => {
+                let inner = self.ty(inner);
                 self.node("TyPtr", &[inner])
             }
-            "slice_type" => {
-                let inner = field(n, "element").map_or_else(String::new, |t| self.ty(t));
+            Type::Slice(inner) => {
+                let inner = self.ty(inner);
                 self.node("TySlice", &[inner])
             }
-            "array_type" | "implicit_length_array_type" => {
-                let inner = field(n, "element").map_or_else(String::new, |t| self.ty(t));
+            Type::Array(inner) => {
+                let inner = self.ty(inner);
                 self.node("TyArray", &[inner])
             }
-            "map_type" => {
-                let k = field(n, "key").map_or_else(String::new, |t| self.ty(t));
-                let v = field(n, "value").map_or_else(String::new, |t| self.ty(t));
+            Type::Map(k, v) => {
+                let k = self.ty(k);
+                let v = self.ty(v);
                 self.node("TyMap", &[k, v])
             }
-            "channel_type" => {
-                let spelled = self.text(n);
-                let dir = if spelled.starts_with("<-") {
-                    "recv"
-                } else if spelled.trim_start_matches("chan").trim_start().starts_with("<-") {
-                    "send"
-                } else {
-                    ""
-                };
-                let v = field(n, "value").map_or_else(String::new, |t| self.ty(t));
+            Type::Chan(dir, v) => {
+                let v = self.ty(v);
                 self.node("TyChan", &[Self::lit(dir), v])
             }
-            "function_type" => {
-                let params = self.params(field(n, "parameters"), "Params");
-                let results = self.results(field(n, "result"));
+            Type::Func(params, results) => {
+                let params = self.params(params, "Params");
+                let results = self.results(results);
                 self.node("TyFn", &[params, results])
             }
-            "struct_type" => {
-                let fields = struct_fields(self, n);
+            Type::Struct(fields) => {
+                let fields = struct_fields(self, fields);
                 self.node("TyStruct", &[fields])
             }
-            "interface_type" => {
-                let items = interface_items(self, n);
+            Type::Iface(items) => {
+                let items = interface_items(self, items);
                 self.node("TyIface", &[items])
             }
-            "parenthesized_type" => kids(n).first().map_or_else(String::new, |t| self.ty(*t)),
-            "negated_type" => {
-                let inner = kids(n).first().map_or_else(String::new, |t| self.ty(*t));
+            Type::Approx(inner) => {
+                let inner = self.ty(inner);
                 self.node("TyApprox", &[inner])
             }
-            // A constraint union (`~int | ~string`) and a type argument's element.
-            "type_elem" | "type_constraint" => {
-                let mut parts: Vec<String> = kids(n).into_iter().map(|t| self.ty(t)).collect();
-                if parts.len() == 1 {
-                    parts.pop().unwrap_or_default()
-                } else {
-                    self.list("TyUnion", &parts)
-                }
+            Type::Union(parts) => {
+                let parts: Vec<String> = parts.iter().map(|p| self.ty(p)).collect();
+                self.list("TyUnion", &parts)
             }
-            _ => self.node("Ty_Other", &[]),
+            Type::Other => self.node("Ty_Other", &[]),
         }
     }
 
@@ -1026,100 +1097,66 @@ impl<'a> Dump<'a> {
     /// read, an operator application, a literal with elements, a function literal — not a bare name,
     /// a package member, or a literal, which carry no agreement by themselves. The rule the Python
     /// and Rust frontends keep.
-    fn is_unit(&self, n: Node<'_>) -> bool {
-        match n.kind() {
-            "call_expression"
-            | "index_expression"
-            | "slice_expression"
-            | "binary_expression"
-            | "unary_expression"
-            | "type_assertion_expression"
-            | "type_conversion_expression"
-            | "type_instantiation_expression"
-            | "func_literal" => true,
-            "selector_expression" => !field(n, "operand")
-                .filter(|o| o.kind() == "identifier")
-                .is_some_and(|o| self.is_package(self.text(o))),
-            "composite_literal" => field(n, "body").is_some_and(|b| !kids(b).is_empty()),
-            "literal_value" => !kids(n).is_empty(),
+    fn is_unit(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Call { .. }
+            | Expr::Index { .. }
+            | Expr::Slice { .. }
+            | Expr::Binary { .. }
+            | Expr::Unary { .. }
+            | Expr::Assert { .. }
+            | Expr::Conv { .. }
+            | Expr::Inst { .. }
+            | Expr::FuncLit { .. } => true,
+            Expr::Selector { operand, .. } => self.package_of(operand).is_none(),
+            Expr::Composite { elems, .. } => !elems.is_empty(),
             _ => false,
         }
     }
 }
 
 /// Syntax around an expression that is not a part of its own: what it wraps is the part.
-fn is_wrapper(n: Node<'_>) -> bool {
-    match n.kind() {
-        "parenthesized_expression" => true,
-        "unary_expression" => field(n, "operator").is_some_and(|o| o.kind() == "&"),
+fn is_wrapper(e: &Expr) -> bool {
+    match e {
+        Expr::Paren(_) => true,
+        Expr::Unary { op, .. } => op == "&",
         _ => false,
     }
-}
-
-/// Whether a grammar kind is a type — what an argument list may hold in place of an expression
-/// (`make([]int, n)`, `new(T)` parses `T` as a name).
-fn is_type_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "array_type"
-            | "channel_type"
-            | "function_type"
-            | "generic_type"
-            | "implicit_length_array_type"
-            | "interface_type"
-            | "map_type"
-            | "negated_type"
-            | "parenthesized_type"
-            | "pointer_type"
-            | "qualified_type"
-            | "slice_type"
-            | "struct_type"
-            | "type_identifier"
-    )
-}
-
-/// The node a `for` statement tests: a `range` clause, a three-part clause, a bare condition, or
-/// nothing (`for {}`).
-fn for_head(n: Node<'_>) -> Option<Node<'_>> {
-    let body = field(n, "body").map(|b| b.id());
-    kids(n).into_iter().find(|k| Some(k.id()) != body)
 }
 
 // ───────────────────────────── declaration canonicals ─────────────────────────────
 
 /// A struct's fields, one per name; an embedded field is `Embed(type)`. Tags are left out: two
 /// structs that hold the same fields are the same shape however they serialize.
-fn struct_fields(d: &mut Dump<'_>, struct_type: Node<'_>) -> String {
+fn struct_fields(d: &mut Dump<'_>, fields: &[FieldDecl]) -> String {
     let mut items = Vec::new();
-    for list in kids(struct_type) {
-        for decl in kids(list).into_iter().filter(|k| k.kind() == "field_declaration") {
-            let ty = field(decl, "type").map_or_else(String::new, |t| d.ty(t));
-            let names = fields(decl, "name");
-            if names.is_empty() {
-                items.push(d.node("Embed", &[ty]));
-                continue;
-            }
-            for name in names {
-                let name = Dump::lit(d.text(name));
-                items.push(d.node("Field", &[name, ty.clone()]));
-            }
+    for decl in fields {
+        let ty = decl.ty.as_ref().map_or_else(String::new, |t| d.ty(t));
+        if decl.names.is_empty() {
+            items.push(d.node("Embed", &[ty]));
+            continue;
+        }
+        for name in &decl.names {
+            let name = Dump::lit(name);
+            items.push(d.node("Field", &[name, ty.clone()]));
         }
     }
     d.list("Named", &items)
 }
 
 /// An interface's method set and embedded types, with method signatures only.
-fn interface_items(d: &mut Dump<'_>, iface: Node<'_>) -> String {
-    let items: Vec<String> = kids(iface)
-        .into_iter()
-        .map(|item| {
-            if item.kind() == "method_elem" {
-                let name = field(item, "name").map_or_else(String::new, |n| Dump::lit(d.text(n)));
-                let params = d.params(field(item, "parameters"), "Params");
-                let results = d.results(field(item, "result"));
+fn interface_items(d: &mut Dump<'_>, items: &[IfaceItem]) -> String {
+    let items: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            IfaceItem::Method { name, params, results } => {
+                let name = Dump::lit(name);
+                let params = d.params(params, "Params");
+                let results = d.results(results);
                 d.node("IfaceFn", &[name, params, results])
-            } else {
-                let ty = d.ty(item);
+            }
+            IfaceItem::Embed(ty) => {
+                let ty = d.ty(ty);
                 d.node("IfaceEmbed", &[ty])
             }
         })
@@ -1138,8 +1175,8 @@ fn generics_tag(type_params: Option<Node<'_>>) -> String {
 #[must_use]
 pub(crate) fn struct_canon(src: &str, name: &str, type_params: Option<Node<'_>>, struct_type: Node<'_>) -> String {
     let (imports, bound) = (HashMap::new(), HashSet::new());
-    let mut d = Dump::new(src, &imports, &bound, None, None);
-    let fields = struct_fields(&mut d, struct_type);
+    let mut d = Dump::new(&imports, &bound, None, None);
+    let fields = struct_fields(&mut d, &lower_fields(struct_type, src));
     d.node("Struct", &[Dump::lit(name), generics_tag(type_params), fields])
 }
 
@@ -1148,44 +1185,55 @@ pub(crate) fn struct_canon(src: &str, name: &str, type_params: Option<Node<'_>>,
 #[must_use]
 pub(crate) fn interface_canon(src: &str, name: &str, type_params: Option<Node<'_>>, iface: Node<'_>) -> String {
     let (imports, bound) = (HashMap::new(), HashSet::new());
-    let mut d = Dump::new(src, &imports, &bound, None, None);
-    let items = interface_items(&mut d, iface);
+    let mut d = Dump::new(&imports, &bound, None, None);
+    let items = interface_items(&mut d, &lower_iface(iface, src));
     d.node("Interface", &[Dump::lit(name), generics_tag(type_params), items])
 }
 
 // ───────────────────────────── callable analysis ─────────────────────────────
 
-/// Every canonical form of one callable, off its syntax tree — no re-parse.
-pub(crate) fn analyze(src: &str, imports: &HashMap<String, Arc<str>>, name: &str, c: &Callable<'_>) -> AnalyzedFn {
-    let bound = locals_of(c, src);
-    let cluster = Dump::new(src, imports, &bound, c.receiver, None).func(name, c, true, true);
+/// Every canonical form of one callable.
+///
+/// The cluster canonical and the statement stream read the body as written: the name-gated pass
+/// compares what is spelled, and converge reads the stream to say where two definitions stop
+/// agreeing — a rewritten line would point the reader at code that is not there. The Type-3 lines
+/// read the normal form that keeps every statement, the exact canonical the one that also inlines
+/// single-use temporaries ([`crate::normal`]).
+pub(crate) fn analyze(imports: &HashMap<String, Arc<str>>, name: &str, f: &Func) -> AnalyzedFn {
+    let bound = locals_of(f);
+    let receiver = f.receiver.as_deref();
+    let cluster = Dump::new(imports, &bound, receiver, None).func(name, f, true, true);
 
     let statements = {
-        let mut dump = Dump::new(src, imports, &bound, c.receiver, Some(&bound));
+        let mut dump = Dump::new(imports, &bound, receiver, Some(&bound));
         // The definition's own header opens the stream at depth 0 and the body starts at depth 1 — the
         // contract every frontend agrees on.
-        let head = dump.func(name, c, false, true);
+        let head = dump.func(name, f, false, true);
         let mut walk = StreamWalk { dump: &mut dump, out: Vec::new() };
         walk.push(0, head);
-        walk.stmts(c.body, 1);
+        walk.stmts(&f.body, 1);
         walk.out
     };
 
+    let statement_form = crate::normal::normal_form(f, false);
     let (type3_lines, type3_units, type_refs) = {
-        let mut dump = Dump::new(src, imports, &bound, c.receiver, Some(&bound));
+        let bound = locals_of(&statement_form);
+        let mut dump = Dump::new(imports, &bound, receiver, Some(&bound));
         dump.tmap = Some(HashMap::new());
         dump.units = Some(Vec::new());
         dump.unit_line = UNFILED;
-        let head = dump.compact_header(c);
+        let head = dump.compact_header(&statement_form);
         let mut walk = StreamWalk { dump: &mut dump, out: Vec::new() };
         walk.push(0, head);
-        walk.stmts(c.body, 1);
+        walk.stmts(&statement_form.body, 1);
         let lines = walk.out.into_iter().map(|s| s.line).collect();
         (lines, dump.units.unwrap_or_default(), dump.type_refs)
     };
 
-    let mut xd = Dump::new(src, imports, &bound, c.receiver, Some(&bound));
-    let xname = xd.func(name, c, true, true);
+    let exact_form = crate::normal::normal_form(&statement_form, true);
+    let exact_bound = locals_of(&exact_form);
+    let mut xd = Dump::new(imports, &exact_bound, receiver, Some(&exact_bound));
+    let xname = xd.func(name, &exact_form, true, true);
     let size = xd.count;
     AnalyzedFn { cluster_canonical: cluster, xname_canonical: xname, type3_lines, type_refs, type3_units, statements, size }
 }
@@ -1219,87 +1267,122 @@ impl StreamWalk<'_, '_> {
         self.out.push(Statement { line, depth });
     }
 
-    fn stmts(&mut self, holder: Node<'_>, depth: u16) {
-        for s in statements(holder) {
+    fn stmts(&mut self, stmts: &[Stmt], depth: u16) {
+        for s in stmts {
             self.stmt(s, depth);
         }
     }
 
-    fn init(&mut self, n: Node<'_>, depth: u16) {
-        if let Some(init) = field(n, "initializer") {
+    fn init(&mut self, init: Option<&Stmt>, depth: u16) {
+        if let Some(init) = init {
             let line = self.dump.stmt(init);
             self.push(depth, line);
         }
     }
 
-    fn stmt(&mut self, n: Node<'_>, depth: u16) {
-        match n.kind() {
-            "if_statement" => self.if_chain(n, depth),
-            "for_statement" => {
-                let head = self.dump.for_header(n);
+    fn stmt(&mut self, s: &Stmt, depth: u16) {
+        match s {
+            Stmt::If { .. } => self.if_chain(s, depth),
+            Stmt::For { head, body } => {
+                let head = self.dump.for_header(head);
                 self.push(depth, head);
-                if let Some(body) = field(n, "body") {
-                    self.stmts(body, depth + 1);
-                }
+                self.stmts(body, depth + 1);
             }
-            "expression_switch_statement" | "type_switch_statement" | "select_statement" => {
-                self.init(n, depth);
-                let head = self.dump.switch_header(n);
-                self.push(depth, head);
-                for case in kids(n) {
-                    let Some(head) = self.dump.case_header(case) else { continue };
-                    self.push(depth + 1, head);
-                    self.stmts(case, depth + 2);
-                }
+            Stmt::Switch { init, .. } | Stmt::TypeSwitch { init, .. } => {
+                self.init(init.as_deref(), depth);
+                self.switch(s, depth);
             }
-            "block" => {
+            Stmt::Select { .. } => self.switch(s, depth),
+            Stmt::Block(b) => {
                 let head = self.dump.node("Block", &[]);
                 self.push(depth, head);
-                self.stmts(n, depth + 1);
+                self.stmts(b, depth + 1);
             }
             // A label names a statement; the statement is the step.
-            "labeled_statement" => {
-                if let Some(inner) = kids(n).into_iter().find(|k| k.kind() != "label_name") {
-                    self.stmt(inner, depth);
-                }
-            }
-            "empty_statement" => {}
+            Stmt::Labeled { stmt, .. } => self.stmt(stmt, depth),
+            Stmt::Empty => {}
             _ => {
-                let line = self.dump.stmt(n);
+                let line = self.dump.stmt(s);
                 self.push(depth, line);
             }
         }
     }
 
+    fn switch(&mut self, s: &Stmt, depth: u16) {
+        let Some(head) = self.dump.switch_header(s) else { return };
+        self.push(depth, head);
+        for (head, body) in clauses(s) {
+            let head = head.render(self.dump);
+            self.push(depth + 1, head);
+            self.stmts(body, depth + 2);
+        }
+    }
+
     /// `if` / `else if` / `else`: an `else if` is a sibling of its `else`, not a level deeper — what
     /// the source means, and what Python's `elif` and the Rust frontend's chains render as.
-    fn if_chain(&mut self, n: Node<'_>, depth: u16) {
-        self.init(n, depth);
-        let cond = field(n, "condition").map_or_else(String::new, |c| self.dump.expr(c));
+    fn if_chain(&mut self, s: &Stmt, depth: u16) {
+        let Stmt::If { init, cond, then, els } = s else { return };
+        self.init(init.as_deref(), depth);
+        let cond = self.dump.expr(cond);
         let head = self.dump.node("If", &[cond]);
         self.push(depth, head);
-        if let Some(then) = field(n, "consequence") {
-            self.stmts(then, depth + 1);
-        }
-        if let Some(alt) = field(n, "alternative") {
+        self.stmts(then, depth + 1);
+        if let Some(els) = els.as_deref() {
             let head = self.dump.node("Else", &[]);
             self.push(depth, head);
-            if alt.kind() == "if_statement" {
-                self.if_chain(alt, depth);
-            } else {
-                self.stmts(alt, depth + 1);
+            match els {
+                Else::If(alt) => self.if_chain(alt, depth),
+                Else::Block(b) => self.stmts(b, depth + 1),
             }
         }
     }
 }
 
+/// A clause whose header is rendered when the walk reaches it — so its units are filed under its
+/// own line, not under the header of the clause before it.
+enum ClauseHead<'s> {
+    Case(Option<&'s [Expr]>),
+    TypeCase(Option<&'s [Type]>),
+    Comm(&'s CommCase),
+}
+
+impl ClauseHead<'_> {
+    fn render(&self, d: &mut Dump<'_>) -> String {
+        match self {
+            ClauseHead::Case(Some(values)) => {
+                let values = d.exprs(values);
+                d.node("Case", &[values])
+            }
+            ClauseHead::TypeCase(Some(types)) => {
+                let types = d.types_joined(types);
+                d.node("TypeCase", &[types])
+            }
+            ClauseHead::Case(None) | ClauseHead::TypeCase(None) => d.node("Default", &[]),
+            ClauseHead::Comm(case) => d.comm_head(case),
+        }
+    }
+}
+
+/// The clauses of a `switch` / type switch / `select`, headers unrendered.
+fn clauses(s: &Stmt) -> Vec<(ClauseHead<'_>, &[Stmt])> {
+    match s {
+        Stmt::Switch { cases, .. } => {
+            cases.iter().map(|c| (ClauseHead::Case(c.values.as_deref()), c.body.as_slice())).collect()
+        }
+        Stmt::TypeSwitch { cases, .. } => {
+            cases.iter().map(|c| (ClauseHead::TypeCase(c.types.as_deref()), c.body.as_slice())).collect()
+        }
+        Stmt::Select { cases } => cases.iter().map(|c| (ClauseHead::Comm(c), c.body.as_slice())).collect(),
+        _ => Vec::new(),
+    }
+}
+
 // ───────────────────────────── use sites ─────────────────────────────
 
-/// What every dump of one definition shares: its source, the file's imports, the names it binds and
-/// its receiver.
+/// What every dump of one definition shares: the file's imports, the names it binds and its
+/// receiver.
 #[derive(Clone, Copy)]
 pub(crate) struct Scope<'a> {
-    pub(crate) src: &'a str,
     pub(crate) imports: &'a HashMap<String, Arc<str>>,
     pub(crate) bound: &'a HashSet<String>,
     pub(crate) receiver: Option<&'a str>,
@@ -1307,22 +1390,17 @@ pub(crate) struct Scope<'a> {
 
 impl<'a> Scope<'a> {
     fn dump(&self) -> Dump<'a> {
-        Dump::new(self.src, self.imports, self.bound, self.receiver, Some(self.bound))
+        Dump::new(self.imports, self.bound, self.receiver, Some(self.bound))
     }
 }
 
 /// The body canonicalized with every name the **file** introduced erased — the widest rung of the
 /// erasure ladder, which the `scope` lens projects as a single fact.
 #[must_use]
-pub(crate) fn scope_canonical(
-    src: &str,
-    imports: &HashMap<String, Arc<str>>,
-    c: &Callable<'_>,
-    file_names: &HashSet<String>,
-) -> String {
-    let mut locals = locals_of(c, src);
+pub(crate) fn scope_canonical(imports: &HashMap<String, Arc<str>>, f: &Func, file_names: &HashSet<String>) -> String {
+    let mut locals = locals_of(f);
     locals.extend(file_names.iter().cloned());
-    Dump::new(src, imports, &locals, c.receiver, Some(&locals)).func("_fn", c, true, true)
+    Dump::new(imports, &locals, f.receiver.as_deref(), Some(&locals)).func("_fn", f, true, true)
 }
 
 /// Every use site in one source — the Go half of the `use` lens ([`dup_defs_core::uses`]): each
@@ -1341,7 +1419,7 @@ pub(crate) fn collect_sites(source: &str, _path: &str, known: &HashSet<&str>) ->
     let Some(tree) = crate::tree::parse(source) else { return Vec::new() };
     let root = tree.root_node();
     let imports = file_imports(root, source);
-    let mut walk = UseWalk { src: source, imports: &imports, known, out: Vec::new() };
+    let mut walk = UseWalk { imports: &imports, known, out: Vec::new() };
     for item in kids(root) {
         if item.has_error() {
             continue;
@@ -1349,10 +1427,14 @@ pub(crate) fn collect_sites(source: &str, _path: &str, known: &HashSet<&str>) ->
         match item.kind() {
             "function_declaration" | "method_declaration" => {
                 if let Some(c) = crate::defs::callable_of(item, source) {
-                    walk.function(&c);
+                    walk.function(&lower_func(&c, source));
                 }
             }
-            "const_declaration" | "var_declaration" => walk.values(item),
+            "const_declaration" | "var_declaration" => {
+                if let crate::ir::Stmt::Decl { konst, specs } = crate::ir::lower_stmt(item, source) {
+                    walk.values(konst, &specs);
+                }
+            }
             _ => {}
         }
     }
@@ -1360,7 +1442,6 @@ pub(crate) fn collect_sites(source: &str, _path: &str, known: &HashSet<&str>) ->
 }
 
 struct UseWalk<'k> {
-    src: &'k str,
     imports: &'k HashMap<String, Arc<str>>,
     known: &'k HashSet<&'k str>,
     out: Vec<Site>,
@@ -1386,42 +1467,31 @@ impl UseWalk<'_> {
 
     /// A function: its signature is a site when it names a known type, its body is walked under its
     /// own locals.
-    fn function(&mut self, c: &Callable<'_>) {
-        let locals = locals_of(c, self.src);
-        let scope = Scope { src: self.src, imports: self.imports, bound: &locals, receiver: c.receiver };
-        self.site(&scope, "plain", &[], |d| Some(d.compact_header(c)));
-        self.block(&scope, c.body, Within::default());
+    fn function(&mut self, f: &Func) {
+        let locals = locals_of(f);
+        let scope = Scope { imports: self.imports, bound: &locals, receiver: f.receiver.as_deref() };
+        self.site(&scope, "plain", &[], |d| Some(d.compact_header(f)));
+        self.block(&scope, &f.body, Within::default());
     }
 
     /// A package-level `const` / `var`: its value is a use of what it names.
-    fn values(&mut self, decl: Node<'_>) {
+    fn values(&mut self, konst: bool, specs: &[crate::ir::Spec]) {
         let empty = HashSet::new();
-        let scope = Scope { src: self.src, imports: self.imports, bound: &empty, receiver: None };
-        let mut specs = Vec::new();
-        for k in kids(decl) {
-            if matches!(k.kind(), "const_spec" | "var_spec") {
-                specs.push(k);
-            } else {
-                specs.extend(kids(k).into_iter().filter(|s| s.kind() == "var_spec"));
-            }
-        }
-        for spec in specs {
-            let tag = if spec.kind() == "const_spec" { "Const" } else { "Var" };
-            if let Some(value) = field(spec, "value") {
-                self.site(&scope, "plain", &[], |d| {
-                    let v = d.exprs(value);
-                    Some(d.node(tag, &[v]))
-                });
-            }
+        let scope = Scope { imports: self.imports, bound: &empty, receiver: None };
+        let tag = if konst { "Const" } else { "Var" };
+        for spec in specs.iter().filter(|s| !s.values.is_empty()) {
+            self.site(&scope, "plain", &[], |d| {
+                let v = d.exprs(&spec.values);
+                Some(d.node(tag, &[v]))
+            });
         }
     }
 
     /// A block's statements, each with the methods called beside it — the co-occurrence channel.
-    fn block(&mut self, scope: &Scope<'_>, holder: Node<'_>, within: Within) {
-        let stmts = statements(holder);
+    fn block(&mut self, scope: &Scope<'_>, stmts: &[Stmt], within: Within) {
         let mut hunt = Dump::hunting(scope, self.known);
-        for s in &stmts {
-            let _ = use_line(&mut hunt, *s);
+        for s in stmts {
+            let _ = use_line(&mut hunt, s);
         }
         let neighbours: Vec<String> = hunt.calls.into_iter().collect();
         for s in stmts {
@@ -1429,52 +1499,48 @@ impl UseWalk<'_> {
         }
     }
 
-    fn stmt(&mut self, scope: &Scope<'_>, n: Node<'_>, within: Within, neighbours: &[String]) {
+    fn stmt(&mut self, scope: &Scope<'_>, s: &Stmt, within: Within, neighbours: &[String]) {
         let plain = site_ctx(Construct::Plain, within);
         let guard = site_ctx(Construct::Guard, within);
-        match n.kind() {
-            "if_statement" => {
-                if let Some(init) = field(n, "initializer") {
+        match s {
+            Stmt::If { init, cond, then, els } => {
+                if let Some(init) = init.as_deref() {
                     self.site(scope, plain, neighbours, |d| Some(d.stmt(init)));
                 }
                 self.site(scope, guard, neighbours, |d| {
-                    let cond = field(n, "condition").map_or_else(String::new, |c| d.expr(c));
+                    let cond = d.expr(cond);
                     Some(d.node("If", &[cond]))
                 });
-                if let Some(then) = field(n, "consequence") {
-                    self.block(scope, then, within);
-                }
-                match field(n, "alternative") {
-                    Some(alt) if alt.kind() == "if_statement" => self.stmt(scope, alt, within, neighbours),
-                    Some(alt) => self.block(scope, alt, within),
+                self.block(scope, then, within);
+                match els.as_deref() {
+                    Some(Else::If(alt)) => self.stmt(scope, alt, within, neighbours),
+                    Some(Else::Block(b)) => self.block(scope, b, within),
                     None => {}
                 }
             }
-            "for_statement" => {
+            Stmt::For { head, body } => {
                 let looped = site_ctx(Construct::Loop, within);
-                self.site(scope, looped, neighbours, |d| Some(d.for_header(n)));
-                if let Some(body) = field(n, "body") {
-                    self.block(scope, body, Within { in_loop: true, ..within });
-                }
+                self.site(scope, looped, neighbours, |d| Some(d.for_header(head)));
+                self.block(scope, body, Within { in_loop: true, ..within });
             }
-            "expression_switch_statement" | "type_switch_statement" | "select_statement" => {
-                if let Some(init) = field(n, "initializer") {
+            Stmt::Switch { .. } | Stmt::TypeSwitch { .. } | Stmt::Select { .. } => {
+                let init = match s {
+                    Stmt::Switch { init, .. } | Stmt::TypeSwitch { init, .. } => init.as_deref(),
+                    _ => None,
+                };
+                if let Some(init) = init {
                     self.site(scope, plain, neighbours, |d| Some(d.stmt(init)));
                 }
-                self.site(scope, guard, neighbours, |d| Some(d.switch_header(n)));
-                for case in kids(n) {
-                    self.site(scope, guard, neighbours, |d| d.case_header(case));
-                    self.block(scope, case, within);
+                self.site(scope, guard, neighbours, |d| d.switch_header(s));
+                for (head, body) in clauses(s) {
+                    self.site(scope, guard, neighbours, |d| Some(head.render(d)));
+                    self.block(scope, body, within);
                 }
             }
-            "block" => self.block(scope, n, within),
-            "labeled_statement" => {
-                if let Some(inner) = kids(n).into_iter().find(|k| k.kind() != "label_name") {
-                    self.stmt(scope, inner, within, neighbours);
-                }
-            }
-            "empty_statement" => {}
-            _ => self.site(scope, plain, neighbours, |d| use_line(d, n)),
+            Stmt::Block(b) => self.block(scope, b, within),
+            Stmt::Labeled { stmt, .. } => self.stmt(scope, stmt, within, neighbours),
+            Stmt::Empty => {}
+            _ => self.site(scope, plain, neighbours, |d| use_line(d, s)),
         }
     }
 }
@@ -1482,25 +1548,26 @@ impl UseWalk<'_> {
 /// A statement's own line, as a use site sees it: a compound statement's header (and its
 /// initializer, rendered for the calls it makes), any other statement whole — `None` for a bare
 /// block, whose statements are walked.
-fn use_line(d: &mut Dump<'_>, n: Node<'_>) -> Option<String> {
-    match n.kind() {
-        "if_statement" => {
-            if let Some(init) = field(n, "initializer") {
+fn use_line(d: &mut Dump<'_>, s: &Stmt) -> Option<String> {
+    match s {
+        Stmt::If { init, cond, .. } => {
+            if let Some(init) = init.as_deref() {
                 let _ = d.stmt(init);
             }
-            let cond = field(n, "condition").map_or_else(String::new, |c| d.expr(c));
+            let cond = d.expr(cond);
             Some(d.node("If", &[cond]))
         }
-        "for_statement" => Some(d.for_header(n)),
-        "expression_switch_statement" | "type_switch_statement" | "select_statement" => {
-            if let Some(init) = field(n, "initializer") {
+        Stmt::For { head, .. } => Some(d.for_header(head)),
+        Stmt::Switch { init, .. } | Stmt::TypeSwitch { init, .. } => {
+            if let Some(init) = init.as_deref() {
                 let _ = d.stmt(init);
             }
-            Some(d.switch_header(n))
+            d.switch_header(s)
         }
-        "block" | "empty_statement" => None,
-        "labeled_statement" => kids(n).into_iter().find(|k| k.kind() != "label_name").and_then(|s| use_line(d, s)),
-        _ => Some(d.stmt(n)),
+        Stmt::Select { .. } => d.switch_header(s),
+        Stmt::Block(_) | Stmt::Empty => None,
+        Stmt::Labeled { stmt, .. } => use_line(d, stmt),
+        _ => Some(d.stmt(s)),
     }
 }
 

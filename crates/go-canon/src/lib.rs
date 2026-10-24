@@ -7,7 +7,9 @@
 mod canon;
 mod defs;
 mod frontend;
+mod ir;
 mod lenses;
+mod normal;
 mod tree;
 
 pub use defs::scan_source;

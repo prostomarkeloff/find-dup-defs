@@ -31,6 +31,7 @@ use tree_sitter::Node;
 
 use crate::canon::{analyze, file_imports, interface_canon, locals_of, reached_paths, scope_canonical, struct_canon, Callable};
 use crate::frontend::{CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
+use crate::ir::lower_func;
 use crate::tree::{field, fields, kids, parse, statements, text};
 
 /// Whether a file declares itself generated: a `// Code generated … DO NOT EDIT.` line before the
@@ -194,14 +195,15 @@ impl Builder<'_> {
         if is_trivial(c.body, self.source) {
             return;
         }
+        let func = lower_func(c, self.source);
         if !self.lenses.is_empty() {
-            let scope = scope_canonical(self.source, &self.imports, c, &self.file_names);
-            let locals = locals_of(c, self.source);
+            let scope = scope_canonical(&self.imports, &func, &self.file_names);
+            let locals = locals_of(&func);
             let facts = crate::lenses::callable_facts(c, self.source, &self.imports, &locals, &self.file_names, scope);
             self.push_lens(&name, decl, &facts);
         }
         let AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, type_refs, type3_units, statements, size } =
-            analyze(self.source, &self.imports, own_name, c);
+            analyze(&self.imports, own_name, &func);
         let canon = DefCanon {
             cluster: Some(cluster_canonical),
             analysis: Some(Analysis {
