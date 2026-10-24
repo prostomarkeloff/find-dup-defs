@@ -1,0 +1,104 @@
+--- duplicate constants (cross-file, by name) ---
+
+--- duplicate functions (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate functions (cross-name, exact AST-normalized) ---
+
+--- duplicate functions (cross-name Type-3, IDF-weighted cosine) ---
+DUPLICATE FUNCTION [WARNING]: Check0/Check14/Check28  [ast sim 0.73, T=0.48, n=3, loc=9, args=1]  # evidence: p = 1.3e-2 under the bipartite configuration model
+  go/shipping/shipping.go:5
+  go/shipping/shipping.go:145
+  go/shipping/shipping.go:285
+
+DUPLICATE FUNCTION [WARNING]: Check1/Check15/Check29  [ast sim 0.73, T=0.48, n=3, loc=9, args=1]  # evidence: p = 1.3e-2 under the bipartite configuration model
+  go/shipping/shipping.go:15
+  go/shipping/shipping.go:155
+  go/shipping/shipping.go:295
+
+DUPLICATE FUNCTION [WARNING]: Check10/Check24/Check38  [ast sim 0.73, T=0.48, n=3, loc=9, args=1]  # evidence: p = 1.3e-2 under the bipartite configuration model
+  go/shipping/shipping.go:105
+  go/shipping/shipping.go:245
+  go/shipping/shipping.go:385
+
+DUPLICATE FUNCTION [WARNING]: Check11/Check25/Check39  [ast sim 0.73, T=0.48, n=3, loc=9, args=1]  # evidence: p = 1.3e-2 under the bipartite configuration model
+  go/shipping/shipping.go:115
+  go/shipping/shipping.go:255
+  go/shipping/shipping.go:395
+
+DUPLICATE FUNCTION [WARNING]: Check12/Check26  [ast sim 0.73, T=0.35, n=2, loc=9, args=1]  # evidence: p = 8.1e-3 under the bipartite configuration model
+  go/shipping/shipping.go:125
+  go/shipping/shipping.go:265
+
+DUPLICATE FUNCTION [WARNING]: Check13/Check27  [ast sim 0.73, T=0.35, n=2, loc=9, args=1]  # evidence: p = 8.1e-3 under the bipartite configuration model
+  go/shipping/shipping.go:135
+  go/shipping/shipping.go:275
+
+DUPLICATE FUNCTION [WARNING]: Check16/Check2/Check30  [ast sim 0.73, T=0.48, n=3, loc=9, args=1]  # evidence: p = 1.3e-2 under the bipartite configuration model
+  go/shipping/shipping.go:25
+  go/shipping/shipping.go:165
+  go/shipping/shipping.go:305
+
+DUPLICATE FUNCTION [WARNING]: Check17/Check3/Check31  [ast sim 0.73, T=0.48, n=3, loc=9, args=1]  # evidence: p = 1.3e-2 under the bipartite configuration model
+  go/shipping/shipping.go:35
+  go/shipping/shipping.go:175
+  go/shipping/shipping.go:315
+
+DUPLICATE FUNCTION [WARNING]: Check18/Check32/Check4  [ast sim 0.73, T=0.48, n=3, loc=9, args=1]  # evidence: p = 1.3e-2 under the bipartite configuration model
+  go/shipping/shipping.go:45
+  go/shipping/shipping.go:185
+  go/shipping/shipping.go:325
+
+DUPLICATE FUNCTION [WARNING]: Check19/Check33/Check5  [ast sim 0.73, T=0.48, n=3, loc=9, args=1]  # evidence: p = 1.1e-2 under the bipartite configuration model
+  go/shipping/shipping.go:55
+  go/shipping/shipping.go:195
+  go/shipping/shipping.go:335
+
+DUPLICATE FUNCTION [WARNING]: Check20/Check34/Check6  [ast sim 0.73, T=0.48, n=3, loc=9, args=1]  # evidence: p = 1.1e-2 under the bipartite configuration model
+  go/shipping/shipping.go:65
+  go/shipping/shipping.go:205
+  go/shipping/shipping.go:345
+
+DUPLICATE FUNCTION [WARNING]: Check21/Check35/Check7  [ast sim 0.73, T=0.48, n=3, loc=9, args=1]  # evidence: p = 1.3e-2 under the bipartite configuration model
+  go/shipping/shipping.go:75
+  go/shipping/shipping.go:215
+  go/shipping/shipping.go:355
+
+DUPLICATE FUNCTION [WARNING]: Check22/Check36/Check8  [ast sim 0.73, T=0.48, n=3, loc=9, args=1]  # evidence: p = 1.3e-2 under the bipartite configuration model
+  go/shipping/shipping.go:85
+  go/shipping/shipping.go:225
+  go/shipping/shipping.go:365
+
+DUPLICATE FUNCTION [WARNING]: Check23/Check37/Check9  [ast sim 0.73, T=0.48, n=3, loc=9, args=1]  # evidence: p = 1.3e-2 under the bipartite configuration model
+  go/shipping/shipping.go:95
+  go/shipping/shipping.go:235
+  go/shipping/shipping.go:375
+
+
+--- duplicate methods (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate methods (cross-name, exact AST-normalized) ---
+
+--- duplicate methods (cross-name Type-3, IDF-weighted cosine) ---
+
+--- duplicate classes (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate interfaces (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate type aliases (cross-file, by name) ---
+
+--- decisions in functions (one decision, written in two places) ---
+DUPLICATE FUNCTION [INFO]: Offers / Refuse  [T=0.05, n=2, loc=9, args=1]  votes[2]: decides×2 members×2  # decide on 2 shared fact(s), 0.83 expected by chance; surprise 15.0 nats (null mean 0.8); p = 5.5e-5 under the bipartite configuration model, Benjamini–Hochberg cut 9.3e-5 at FDR 0.05 over 1081 pairs;   · @example.com.shop.models.StatusOpen = _.Status;   · ? _.Paid
+  go/catalog/catalog.go:6
+  go/orders/orders.go:15
+
+DUPLICATE FUNCTION [INFO]: Retryable / Backoff  [T=0.05, n=2, loc=7, args=2]  votes[2]: decides×2 members×2  # decide on 2 shared fact(s), 0.83 expected by chance; surprise 15.0 nats (null mean 0.8); p = 5.5e-5 under the bipartite configuration model, Benjamini–Hochberg cut 9.3e-5 at FDR 0.05 over 1081 pairs;   · @example.com.shop.retry.ErrBusy = _;   · @example.com.shop.retry.ErrTimeout = _
+  go/retry/retry.go:14
+  go/retry/retry.go:19
+
+
+--- decisions in methods (one decision, written in two places) ---
+
+--- decision families in functions (one decision, written in many places) ---
+
+--- decision families in methods (one decision, written in many places) ---
+# summary: 0 ERROR, 16 WARNING groups

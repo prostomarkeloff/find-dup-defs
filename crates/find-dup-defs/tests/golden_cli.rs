@@ -19,6 +19,8 @@ const FIX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mixed");
 const FIX_CONVERGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/converge");
 /// A third tree for the decisions pass: one rule written twice — once as a guard, once as a filter —
 /// among forty definitions that decide on facts of their own, so the null has a corpus to be a null of.
+/// One language per subtree, each scanned alone: the null is fitted to the corpus it is given, and a
+/// second language in the same run would move every figure of the first.
 const FIX_DECISIONS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/decisions");
 
 fn run(extra: &[&str]) -> String {
@@ -26,10 +28,15 @@ fn run(extra: &[&str]) -> String {
 }
 
 fn run_in(fixture: &str, extra: &[&str]) -> String {
+    run_at(fixture, fixture, extra)
+}
+
+/// Scan `tree`, naming members relative to `root`.
+fn run_at(tree: &str, root: &str, extra: &[&str]) -> String {
     let out = Command::new(BIN)
-        .arg(fixture)
+        .arg(tree)
         .arg("--repo-root")
-        .arg(fixture)
+        .arg(root)
         .args(extra)
         .output()
         .expect("spawn find-dup-defs");
@@ -93,11 +100,24 @@ fn lenses_matches_golden() {
 fn converge_matches_golden() {
     // Locks both anchors, the family rubric and the per-dialect vocabulary: the fixture holds a
     // Python pair that meets only on a subject, a Python family worded three ways, and a Rust and a
-    // TypeScript pair whose canonicals are s-expr dumps rather than source-like.
+    // TypeScript pair whose canonicals are s-expr dumps rather than source-like. The Go pair has its
+    // own golden: converge weighs a statement by how rare it is in the run, so adding it here would
+    // move every figure below.
     assert_golden(
-        &run_in(FIX_CONVERGE, &["--converge", "--show-info"]),
+        &run_in(FIX_CONVERGE, &["--converge", "--show-info", "--only", "py,rs,ts"]),
         include_str!("golden/converge.txt"),
         "converge.txt",
+    );
+}
+
+#[test]
+fn converge_go_matches_golden() {
+    // The batch pair again, in Go: the statements both write agree, the loop each fills parts them,
+    // and the subject is the package both reach by its import path.
+    assert_golden(
+        &run_in(FIX_CONVERGE, &["--converge", "--show-info", "--only", "go"]),
+        include_str!("golden/converge.go.txt"),
+        "converge.go.txt",
     );
 }
 
@@ -106,9 +126,21 @@ fn decisions_matches_golden() {
     // Locks the facts, the null and the cut together: the guard and the filter share no line and are
     // found; the forty definitions sharing a common fact or two are not.
     assert_golden(
-        &run_in(FIX_DECISIONS, &["--decisions", "--show-info"]),
+        &run_at(&format!("{FIX_DECISIONS}/py"), FIX_DECISIONS, &["--decisions", "--show-info"]),
         include_str!("golden/decisions.txt"),
         "decisions.txt",
+    );
+}
+
+#[test]
+fn decisions_go_matches_golden() {
+    // The same corpus in Go, plus a rule Go spells two ways: `errors.Is` against two sentinels, and a
+    // `switch` over the same two. The guard and the filter meet across packages, by the module path
+    // `go.mod` declares; the constants they test are facts although Go spells them like types.
+    assert_golden(
+        &run_at(&format!("{FIX_DECISIONS}/go"), FIX_DECISIONS, &["--decisions", "--show-info"]),
+        include_str!("golden/decisions.go.txt"),
+        "decisions.go.txt",
     );
 }
 
