@@ -14,9 +14,14 @@ use rayon::prelude::*;
 use crate::defs::scan_source;
 
 // The shared `KindSpec` vocabulary. Go supports all six body/text kinds (`interfaces` = `interface`).
-pub use dup_defs_core::kinds::{CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
+pub use dup_defs_core::kinds::{CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, LENSES, METHODS, TYPE_ALIASES};
 
 static KINDS: &[&KindSpec] = &[&FUNCTIONS, &METHODS, &CLASSES, &INTERFACES, &CONSTANTS, &TYPE_ALIASES];
+
+/// The kind list with the opt-in `lenses` kind appended — never in the default set, so the default
+/// run stays byte-identical (see the Rust frontend).
+static KINDS_WITH_LENSES: &[&KindSpec] =
+    &[&FUNCTIONS, &METHODS, &CLASSES, &INTERFACES, &CONSTANTS, &TYPE_ALIASES, &LENSES];
 
 /// Go frontend over the tree-sitter Go grammar.
 pub struct Go;
@@ -28,10 +33,18 @@ impl Frontend for Go {
     fn extensions(&self) -> &'static [&'static str] {
         &["go"]
     }
-    fn kinds(&self, _opts: &ScanOpts) -> &'static [&'static KindSpec] {
-        KINDS
+    fn kinds(&self, opts: &ScanOpts) -> &'static [&'static KindSpec] {
+        if opts.wants("lenses") { KINDS_WITH_LENSES } else { KINDS }
+    }
+    /// The `use` lens counts a name's mentions across the whole set, so in lens mode this frontend
+    /// takes every file — and reads each content once (`scan_with_uses`).
+    fn scans_across_files(&self, opts: &ScanOpts) -> bool {
+        opts.wants("lenses")
     }
     fn scan(&self, files: &[Arc<str>], opts: &ScanOpts) -> Vec<Def> {
+        if opts.wants("lenses") {
+            return dup_defs_core::uses::scan_with_uses(files, |src, f| scan_source(src, f, opts), crate::canon::collect_sites);
+        }
         files
             .par_iter()
             .flat_map(|f| fs::read_to_string(&**f).map_or_else(|_| Vec::new(), |src| scan_source(&src, f, opts)))

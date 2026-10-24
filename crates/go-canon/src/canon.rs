@@ -26,10 +26,11 @@
     clippy::match_same_arms // distinct kinds intentionally share an emission for clarity
 )]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use dup_defs_core::uses::{site_ctx, Construct, Site, Within};
 use dup_defs_core::{AnalyzedFn, Statement, UNFILED};
 use tree_sitter::Node;
 
@@ -40,6 +41,8 @@ use crate::tree::{field, fields, has_token, kids, statements, text, unquote};
 /// A function or method, as the grammar splits it — the input every analysis below reads.
 #[derive(Clone, Copy)]
 pub(crate) struct Callable<'t> {
+    /// Whether it is a method — declared on a receiver, named or not.
+    pub method: bool,
     /// The receiver's name, for a method that names it (`func (s *S)`); `None` for a function, an
     /// anonymous receiver (`func (*S)`), or `_`.
     pub receiver: Option<&'t str>,
@@ -142,7 +145,7 @@ impl Collect {
 }
 
 /// The bound locals of one callable (its receiver excluded — that one is written `self`).
-fn locals_of(c: &Callable<'_>, src: &str) -> HashSet<String> {
+pub(crate) fn locals_of(c: &Callable<'_>, src: &str) -> HashSet<String> {
     let mut collect = Collect::default();
     collect.params(c.params, src);
     collect.params(c.results, src);
@@ -182,6 +185,16 @@ pub(crate) struct Dump<'a> {
     type_refs: Vec<String>,
     /// Type parameters the definition declares: slotted like any type, but bound, not vocabulary.
     declared_types: HashSet<String>,
+    /// Use-site mode: the definition whose use is being written. A name or package member naming it
+    /// becomes the anchor `_t0` — whichever package it was reached through, so a use inside its own
+    /// package and one from outside read alike — and a struct literal of it marks the fields it sets
+    /// `#name#` for the profile to number.
+    anchor: Option<&'a str>,
+    /// Hunt mode: the names that count as anchors. Every one the walk meets is kept in `hunted`.
+    known: Option<&'a HashSet<&'a str>>,
+    hunted: Vec<String>,
+    /// Hunt mode: the methods called (`.name`), for the co-occurrence channel of the `use` lens.
+    calls: BTreeSet<String>,
 }
 
 impl<'a> Dump<'a> {
@@ -207,7 +220,31 @@ impl<'a> Dump<'a> {
             tmap: None,
             type_refs: Vec::new(),
             declared_types: HashSet::new(),
+            anchor: None,
+            known: None,
+            hunted: Vec::new(),
+            calls: BTreeSet::new(),
         }
+    }
+
+    /// A dump that notes which of `known` a line mentions, and the methods it calls.
+    fn hunting(scope: &Scope<'a>, known: &'a HashSet<&'a str>) -> Self {
+        Self { known: Some(known), tmap: Some(HashMap::new()), ..scope.dump() }
+    }
+
+    /// A dump that writes a line as a use site of `anchor`.
+    fn anchoring(scope: &Scope<'a>, anchor: &'a str) -> Self {
+        Self { anchor: Some(anchor), tmap: Some(HashMap::new()), ..scope.dump() }
+    }
+
+    /// A reference to a package-level name: noted when it is hunted for, and whether it is the anchor.
+    fn mention(&mut self, name: &str) -> bool {
+        if let Some(known) = self.known {
+            if known.contains(name) && !self.hunted.iter().any(|h| h == name) {
+                self.hunted.push(name.to_owned());
+            }
+        }
+        self.anchor == Some(name)
     }
 
     fn text(&self, n: Node<'_>) -> &'a str {
@@ -268,6 +305,11 @@ impl<'a> Dump<'a> {
     /// value satisfies. Two bodies differing only in their types may not be one definition, so the
     /// exact pass keeps them apart; the near-copy pass reads a type as vocabulary like any other.
     fn type_name(&mut self, name: &str) -> String {
+        // The anchor keeps its own slot even in type position, through whichever package it was named.
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        if self.mention(bare) {
+            return "_t0".to_owned();
+        }
         let Some(tmap) = self.tmap.as_mut() else { return Self::lit(name) };
         if !self.declared_types.contains(name) {
             self.type_refs.push(name.to_owned());
@@ -291,6 +333,9 @@ impl<'a> Dump<'a> {
         }
         if self.receiver == Some(name) {
             return self.node("Path", &[Self::lit("self")]);
+        }
+        if !self.bound.contains(name) && self.mention(name) {
+            return self.node("Path", &[Self::lit("_t0")]);
         }
         let renamed = self.rename(name);
         self.node("Path", &[Self::lit(&renamed)])
@@ -661,6 +706,67 @@ impl<'a> Dump<'a> {
         (init, cond, update)
     }
 
+    // ────── compound-statement headers ──────
+    //
+    // A compound statement's own line — what it tests, its body elided. Shared by the statement
+    // stream and the use-site walk, which must write a header the same way.
+
+    /// `For(binds, iter)`, `ForC(init, cond, update)`, `While(cond)` or `Loop()`.
+    fn for_header(&mut self, n: Node<'_>) -> String {
+        match for_head(n) {
+            None => self.node("Loop", &[]),
+            Some(h) if h.kind() == "range_clause" => {
+                let (pat, iter) = self.range_parts(h);
+                self.node("For", &[pat, iter])
+            }
+            Some(h) if h.kind() == "for_clause" => {
+                let (init, cond, update) = self.clause_parts(h);
+                self.node("ForC", &[init, cond, update])
+            }
+            Some(cond) => {
+                let cond = self.expr(cond);
+                self.node("While", &[cond])
+            }
+        }
+    }
+
+    /// `Switch(value)`, `TypeSwitch(alias, value)` or `Select()` — its initializer is a step of its own.
+    fn switch_header(&mut self, n: Node<'_>) -> String {
+        match n.kind() {
+            "type_switch_statement" => {
+                let alias = field(n, "alias").map_or_else(String::new, |a| self.binds(a));
+                let value = field(n, "value").map_or_else(String::new, |v| self.expr(v));
+                self.node("TypeSwitch", &[alias, value])
+            }
+            "select_statement" => self.node("Select", &[]),
+            _ => {
+                let value = field(n, "value").map_or_else(String::new, |v| self.expr(v));
+                self.node("Switch", &[value])
+            }
+        }
+    }
+
+    /// A clause's own line — `Case(values)`, `TypeCase(types)`, `CommCase(comm)` or `Default()`;
+    /// `None` for what is not a clause.
+    fn case_header(&mut self, case: Node<'_>) -> Option<String> {
+        Some(match case.kind() {
+            "expression_case" => {
+                let values = field(case, "value").map_or_else(String::new, |v| self.exprs(v));
+                self.node("Case", &[values])
+            }
+            "type_case" => {
+                let types = self.case_types(case);
+                self.node("TypeCase", &[types])
+            }
+            "communication_case" => {
+                let comm = field(case, "communication").map_or_else(String::new, |m| self.stmt(m));
+                self.node("CommCase", &[comm])
+            }
+            "default_case" => self.node("Default", &[]),
+            _ => return None,
+        })
+    }
+
     // ────── expressions ──────
 
     /// An expression — and, when units are being collected, kept as one if it is a proper part of
@@ -714,7 +820,8 @@ impl<'a> Dump<'a> {
                 let name = field(n, "field").map_or("", |f| self.text(f));
                 if let Some(pkg) = operand.filter(|o| o.kind() == "identifier").map(|o| self.text(o)) {
                     if self.is_package(pkg) {
-                        return self.node("Path", &[Self::lit(&format!("{pkg}.{name}"))]);
+                        let path = if self.mention(name) { "_t0".to_owned() } else { format!("{pkg}.{name}") };
+                        return self.node("Path", &[Self::lit(&path)]);
                     }
                 }
                 let base = operand.map_or_else(String::new, |o| self.expr(o));
@@ -751,12 +858,15 @@ impl<'a> Dump<'a> {
             }
             "composite_literal" => {
                 let t = field(n, "type").map_or_else(String::new, |t| self.ty(t));
-                let elems = field(n, "body").map_or_else(String::new, |b| self.elements(b));
+                // A literal of the anchor sets its surface: the fields it names are marked for the
+                // profile to number.
+                let on_anchor = t.starts_with("Ty(_t0");
+                let elems = field(n, "body").map_or_else(String::new, |b| self.elements(b, on_anchor));
                 self.node("Composite", &[t, elems])
             }
             // An elided inner literal (`[]Point{{1, 2}}`) — its type is the enclosing one's element.
             "literal_value" => {
-                let elems = self.elements(n);
+                let elems = self.elements(n, false);
                 self.node("Composite", &[String::new(), elems])
             }
             "func_literal" => {
@@ -793,6 +903,9 @@ impl<'a> Dump<'a> {
             if !on_package {
                 let recv = operand.map_or_else(String::new, |o| self.expr(o));
                 let method = field(sel, "field").map_or("", |f| self.text(f));
+                if self.known.is_some() {
+                    self.calls.insert(format!(".{method}"));
+                }
                 return self.node("Method", &[recv, Self::lit(method), args]);
             }
         }
@@ -804,7 +917,7 @@ impl<'a> Dump<'a> {
     /// v)`, the Rust frontend's struct-literal field, its name kept as spelled. Any other key is an
     /// expression — a map's — and the element is `KV(key, v)`. The two differ in what a varying key
     /// means: another field is another member (reflection), another map key is just another value.
-    fn elements(&mut self, body: Node<'_>) -> String {
+    fn elements(&mut self, body: Node<'_>, on_anchor: bool) -> String {
         let items: Vec<String> = kids(body)
             .into_iter()
             .map(|el| match el.kind() {
@@ -813,6 +926,7 @@ impl<'a> Dump<'a> {
                     let name = key.and_then(|k| kids(k).into_iter().next()).filter(|i| i.kind() == "identifier");
                     // The key is written before the value, so a local in it is numbered in source order.
                     let (tag, key) = match (name, key) {
+                        (Some(name), _) if on_anchor => ("FieldVal", Self::lit(&format!("#{}#", self.text(name)))),
                         (Some(name), _) => ("FieldVal", Self::lit(self.text(name))),
                         (None, Some(k)) => ("KV", self.element(k)),
                         (None, None) => ("KV", String::new()),
@@ -1122,75 +1236,18 @@ impl StreamWalk<'_, '_> {
         match n.kind() {
             "if_statement" => self.if_chain(n, depth),
             "for_statement" => {
-                let head = match for_head(n) {
-                    None => self.dump.node("Loop", &[]),
-                    Some(h) if h.kind() == "range_clause" => {
-                        let (pat, iter) = self.dump.range_parts(h);
-                        self.dump.node("For", &[pat, iter])
-                    }
-                    Some(h) if h.kind() == "for_clause" => {
-                        let (init, cond, update) = self.dump.clause_parts(h);
-                        self.dump.node("ForC", &[init, cond, update])
-                    }
-                    Some(cond) => {
-                        let cond = self.dump.expr(cond);
-                        self.dump.node("While", &[cond])
-                    }
-                };
+                let head = self.dump.for_header(n);
                 self.push(depth, head);
                 if let Some(body) = field(n, "body") {
                     self.stmts(body, depth + 1);
                 }
             }
-            "expression_switch_statement" => {
+            "expression_switch_statement" | "type_switch_statement" | "select_statement" => {
                 self.init(n, depth);
-                let value = field(n, "value").map_or_else(String::new, |v| self.dump.expr(v));
-                let head = self.dump.node("Switch", &[value]);
+                let head = self.dump.switch_header(n);
                 self.push(depth, head);
                 for case in kids(n) {
-                    let head = match case.kind() {
-                        "expression_case" => {
-                            let values = field(case, "value").map_or_else(String::new, |v| self.dump.exprs(v));
-                            self.dump.node("Case", &[values])
-                        }
-                        "default_case" => self.dump.node("Default", &[]),
-                        _ => continue,
-                    };
-                    self.push(depth + 1, head);
-                    self.stmts(case, depth + 2);
-                }
-            }
-            "type_switch_statement" => {
-                self.init(n, depth);
-                let alias = field(n, "alias").map_or_else(String::new, |a| self.dump.binds(a));
-                let value = field(n, "value").map_or_else(String::new, |v| self.dump.expr(v));
-                let head = self.dump.node("TypeSwitch", &[alias, value]);
-                self.push(depth, head);
-                for case in kids(n) {
-                    let head = match case.kind() {
-                        "type_case" => {
-                            let types = self.dump.case_types(case);
-                            self.dump.node("TypeCase", &[types])
-                        }
-                        "default_case" => self.dump.node("Default", &[]),
-                        _ => continue,
-                    };
-                    self.push(depth + 1, head);
-                    self.stmts(case, depth + 2);
-                }
-            }
-            "select_statement" => {
-                let head = self.dump.node("Select", &[]);
-                self.push(depth, head);
-                for case in kids(n) {
-                    let head = match case.kind() {
-                        "communication_case" => {
-                            let comm = field(case, "communication").map_or_else(String::new, |m| self.dump.stmt(m));
-                            self.dump.node("CommCase", &[comm])
-                        }
-                        "default_case" => self.dump.node("Default", &[]),
-                        _ => continue,
-                    };
+                    let Some(head) = self.dump.case_header(case) else { continue };
                     self.push(depth + 1, head);
                     self.stmts(case, depth + 2);
                 }
@@ -1233,6 +1290,217 @@ impl StreamWalk<'_, '_> {
                 self.stmts(alt, depth + 1);
             }
         }
+    }
+}
+
+// ───────────────────────────── use sites ─────────────────────────────
+
+/// What every dump of one definition shares: its source, the file's imports, the names it binds and
+/// its receiver.
+#[derive(Clone, Copy)]
+pub(crate) struct Scope<'a> {
+    pub(crate) src: &'a str,
+    pub(crate) imports: &'a HashMap<String, Arc<str>>,
+    pub(crate) bound: &'a HashSet<String>,
+    pub(crate) receiver: Option<&'a str>,
+}
+
+impl<'a> Scope<'a> {
+    fn dump(&self) -> Dump<'a> {
+        Dump::new(self.src, self.imports, self.bound, self.receiver, Some(self.bound))
+    }
+}
+
+/// The body canonicalized with every name the **file** introduced erased — the widest rung of the
+/// erasure ladder, which the `scope` lens projects as a single fact.
+#[must_use]
+pub(crate) fn scope_canonical(
+    src: &str,
+    imports: &HashMap<String, Arc<str>>,
+    c: &Callable<'_>,
+    file_names: &HashSet<String>,
+) -> String {
+    let mut locals = locals_of(c, src);
+    locals.extend(file_names.iter().cloned());
+    Dump::new(src, imports, &locals, c.receiver, Some(&locals)).func("_fn", c, true, true)
+}
+
+/// Every use site in one source — the Go half of the `use` lens ([`dup_defs_core::uses`]): each
+/// statement that mentions a known name, written with that name as the anchor. A site is the
+/// statement's own line — a compound statement's header (`If(cond)`, `Switch(value)`, a clause's
+/// values), not its body, whose statements are sites of their own — as the statement stream writes
+/// it, and inside a function its locals rename as they do there. A function literal stays part of
+/// the statement it is written in, as a closure does in the Rust frontend.
+///
+/// A generated file holds no sites, as it holds no definitions: what its uses would say is the
+/// generator's habit.
+pub(crate) fn collect_sites(source: &str, _path: &str, known: &HashSet<&str>) -> Vec<Site> {
+    if crate::defs::is_generated(source) {
+        return Vec::new();
+    }
+    let Some(tree) = crate::tree::parse(source) else { return Vec::new() };
+    let root = tree.root_node();
+    let imports = file_imports(root, source);
+    let mut walk = UseWalk { src: source, imports: &imports, known, out: Vec::new() };
+    for item in kids(root) {
+        if item.has_error() {
+            continue;
+        }
+        match item.kind() {
+            "function_declaration" | "method_declaration" => {
+                if let Some(c) = crate::defs::callable_of(item, source) {
+                    walk.function(&c);
+                }
+            }
+            "const_declaration" | "var_declaration" => walk.values(item),
+            _ => {}
+        }
+    }
+    walk.out
+}
+
+struct UseWalk<'k> {
+    src: &'k str,
+    imports: &'k HashMap<String, Arc<str>>,
+    known: &'k HashSet<&'k str>,
+    out: Vec<Site>,
+}
+
+impl UseWalk<'_> {
+    /// One site per known name `render` mentions, each written with that name as the anchor.
+    fn site<F>(&mut self, scope: &Scope<'_>, ctx: &'static str, neighbours: &[String], render: F)
+    where
+        F: Fn(&mut Dump<'_>) -> Option<String>,
+    {
+        let mut hunt = Dump::hunting(scope, self.known);
+        if render(&mut hunt).is_none() {
+            return;
+        }
+        for name in hunt.hunted {
+            let mut anchored = Dump::anchoring(scope, &name);
+            if let Some(canon) = render(&mut anchored) {
+                self.out.push(Site { name, canon, ctx, cooc: neighbours.to_vec() });
+            }
+        }
+    }
+
+    /// A function: its signature is a site when it names a known type, its body is walked under its
+    /// own locals.
+    fn function(&mut self, c: &Callable<'_>) {
+        let locals = locals_of(c, self.src);
+        let scope = Scope { src: self.src, imports: self.imports, bound: &locals, receiver: c.receiver };
+        self.site(&scope, "plain", &[], |d| Some(d.compact_header(c)));
+        self.block(&scope, c.body, Within::default());
+    }
+
+    /// A package-level `const` / `var`: its value is a use of what it names.
+    fn values(&mut self, decl: Node<'_>) {
+        let empty = HashSet::new();
+        let scope = Scope { src: self.src, imports: self.imports, bound: &empty, receiver: None };
+        let mut specs = Vec::new();
+        for k in kids(decl) {
+            if matches!(k.kind(), "const_spec" | "var_spec") {
+                specs.push(k);
+            } else {
+                specs.extend(kids(k).into_iter().filter(|s| s.kind() == "var_spec"));
+            }
+        }
+        for spec in specs {
+            let tag = if spec.kind() == "const_spec" { "Const" } else { "Var" };
+            if let Some(value) = field(spec, "value") {
+                self.site(&scope, "plain", &[], |d| {
+                    let v = d.exprs(value);
+                    Some(d.node(tag, &[v]))
+                });
+            }
+        }
+    }
+
+    /// A block's statements, each with the methods called beside it — the co-occurrence channel.
+    fn block(&mut self, scope: &Scope<'_>, holder: Node<'_>, within: Within) {
+        let stmts = statements(holder);
+        let mut hunt = Dump::hunting(scope, self.known);
+        for s in &stmts {
+            let _ = use_line(&mut hunt, *s);
+        }
+        let neighbours: Vec<String> = hunt.calls.into_iter().collect();
+        for s in stmts {
+            self.stmt(scope, s, within, &neighbours);
+        }
+    }
+
+    fn stmt(&mut self, scope: &Scope<'_>, n: Node<'_>, within: Within, neighbours: &[String]) {
+        let plain = site_ctx(Construct::Plain, within);
+        let guard = site_ctx(Construct::Guard, within);
+        match n.kind() {
+            "if_statement" => {
+                if let Some(init) = field(n, "initializer") {
+                    self.site(scope, plain, neighbours, |d| Some(d.stmt(init)));
+                }
+                self.site(scope, guard, neighbours, |d| {
+                    let cond = field(n, "condition").map_or_else(String::new, |c| d.expr(c));
+                    Some(d.node("If", &[cond]))
+                });
+                if let Some(then) = field(n, "consequence") {
+                    self.block(scope, then, within);
+                }
+                match field(n, "alternative") {
+                    Some(alt) if alt.kind() == "if_statement" => self.stmt(scope, alt, within, neighbours),
+                    Some(alt) => self.block(scope, alt, within),
+                    None => {}
+                }
+            }
+            "for_statement" => {
+                let looped = site_ctx(Construct::Loop, within);
+                self.site(scope, looped, neighbours, |d| Some(d.for_header(n)));
+                if let Some(body) = field(n, "body") {
+                    self.block(scope, body, Within { in_loop: true, ..within });
+                }
+            }
+            "expression_switch_statement" | "type_switch_statement" | "select_statement" => {
+                if let Some(init) = field(n, "initializer") {
+                    self.site(scope, plain, neighbours, |d| Some(d.stmt(init)));
+                }
+                self.site(scope, guard, neighbours, |d| Some(d.switch_header(n)));
+                for case in kids(n) {
+                    self.site(scope, guard, neighbours, |d| d.case_header(case));
+                    self.block(scope, case, within);
+                }
+            }
+            "block" => self.block(scope, n, within),
+            "labeled_statement" => {
+                if let Some(inner) = kids(n).into_iter().find(|k| k.kind() != "label_name") {
+                    self.stmt(scope, inner, within, neighbours);
+                }
+            }
+            "empty_statement" => {}
+            _ => self.site(scope, plain, neighbours, |d| use_line(d, n)),
+        }
+    }
+}
+
+/// A statement's own line, as a use site sees it: a compound statement's header (and its
+/// initializer, rendered for the calls it makes), any other statement whole — `None` for a bare
+/// block, whose statements are walked.
+fn use_line(d: &mut Dump<'_>, n: Node<'_>) -> Option<String> {
+    match n.kind() {
+        "if_statement" => {
+            if let Some(init) = field(n, "initializer") {
+                let _ = d.stmt(init);
+            }
+            let cond = field(n, "condition").map_or_else(String::new, |c| d.expr(c));
+            Some(d.node("If", &[cond]))
+        }
+        "for_statement" => Some(d.for_header(n)),
+        "expression_switch_statement" | "type_switch_statement" | "select_statement" => {
+            if let Some(init) = field(n, "initializer") {
+                let _ = d.stmt(init);
+            }
+            Some(d.switch_header(n))
+        }
+        "block" | "empty_statement" => None,
+        "labeled_statement" => kids(n).into_iter().find(|k| k.kind() != "label_name").and_then(|s| use_line(d, s)),
+        _ => Some(d.stmt(n)),
     }
 }
 

@@ -22,19 +22,20 @@
 //! clause — the Go convention `go generate` tools write and linters honour) yields nothing: its
 //! duplication is the generator's, and editing it is not how it would be fixed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use dup_defs_core::lens::{enabled_lenses, lens_def, DefSite, Lens, LensFacts};
 use dup_defs_core::{count_loc, Analysis, AnalyzedFn, CanonDialect, Def, Facets, KindSpec, LineMap, ScanOpts};
 use tree_sitter::Node;
 
-use crate::canon::{analyze, file_imports, interface_canon, reached_paths, struct_canon, Callable};
+use crate::canon::{analyze, file_imports, interface_canon, locals_of, reached_paths, scope_canonical, struct_canon, Callable};
 use crate::frontend::{CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
 use crate::tree::{field, fields, kids, parse, statements, text};
 
 /// Whether a file declares itself generated: a `// Code generated … DO NOT EDIT.` line before the
 /// `package` clause.
-fn is_generated(src: &str) -> bool {
+pub(crate) fn is_generated(src: &str) -> bool {
     for line in src.lines() {
         let line = line.trim();
         if line.starts_with("package ") {
@@ -88,6 +89,26 @@ fn is_atom(n: Node<'_>) -> bool {
     )
 }
 
+/// A function or method declaration's parts; `None` for one without a body (an assembly-backed
+/// declaration).
+pub(crate) fn callable_of<'t>(decl: Node<'t>, src: &'t str) -> Option<Callable<'t>> {
+    let body = field(decl, "body")?;
+    let method = decl.kind() == "method_declaration";
+    let receiver = field(decl, "receiver").and_then(|list| kids(list).into_iter().next());
+    let receiver = receiver
+        .and_then(|r| fields(r, "name").into_iter().next())
+        .map(|n| text(n, src))
+        .filter(|n| *n != "_");
+    Some(Callable {
+        method,
+        receiver,
+        type_params: field(decl, "type_parameters"),
+        params: field(decl, "parameters"),
+        results: field(decl, "result"),
+        body,
+    })
+}
+
 /// The named type a receiver is declared on: `*Server[K]` → `Server`.
 fn receiver_type(ty: Node<'_>, src: &str) -> String {
     match ty.kind() {
@@ -122,10 +143,29 @@ struct Builder<'a> {
     file: &'a Arc<str>,
     /// What each package name this file imports stands for — resolved once, read by every callable.
     imports: HashMap<String, Arc<str>>,
+    /// Which lenses this run asked for; empty when it did not ask.
+    lenses: Vec<Lens>,
+    /// Names the file itself introduced — what every lens erases before it looks.
+    file_names: HashSet<String>,
     out: Vec<Def>,
 }
 
 impl Builder<'_> {
+    /// One lens [`Def`] for this definition, when the run asked for lenses and the projection has
+    /// enough to say. The record, the thinness floor and the scoring are the shared module's.
+    fn push_lens(&mut self, name: &str, span: Node<'_>, facts: &LensFacts) {
+        if self.lenses.is_empty() {
+            return;
+        }
+        let start = span.start_byte();
+        let (line, col) = self.lines.loc0(start);
+        let loc = count_loc(self.source.get(start..span.end_byte()).unwrap_or(""));
+        let site = DefSite { name, file: self.file, line, col, loc };
+        if let Some(def) = lens_def("go", CanonDialect::Go, &site, &self.lenses, facts) {
+            self.out.push(def);
+        }
+    }
+
     fn push(&mut self, kind: &'static KindSpec, name: String, span: Node<'_>, args: usize, canon: DefCanon) {
         let DefCanon { cluster: cluster_canonical, analysis, facets } = canon;
         let (start, end) = (span.start_byte(), span.end_byte());
@@ -154,6 +194,12 @@ impl Builder<'_> {
         if is_trivial(c.body, self.source) {
             return;
         }
+        if !self.lenses.is_empty() {
+            let scope = scope_canonical(self.source, &self.imports, c, &self.file_names);
+            let locals = locals_of(c, self.source);
+            let facts = crate::lenses::callable_facts(c, self.source, &self.imports, &locals, &self.file_names, scope);
+            self.push_lens(&name, decl, &facts);
+        }
         let AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, type_refs, type3_units, statements, size } =
             analyze(self.source, &self.imports, own_name, c);
         let canon = DefCanon {
@@ -176,36 +222,18 @@ impl Builder<'_> {
     }
 
     fn function(&mut self, decl: Node<'_>) {
-        let Some(body) = field(decl, "body") else { return }; // an assembly-backed declaration
+        let Some(c) = callable_of(decl, self.source) else { return };
         let Some(name) = field(decl, "name").map(|n| text(n, self.source)) else { return };
-        let c = Callable {
-            receiver: None,
-            type_params: field(decl, "type_parameters"),
-            params: field(decl, "parameters"),
-            results: field(decl, "result"),
-            body,
-        };
         self.callable(&FUNCTIONS, name.to_owned(), name, decl, &c);
     }
 
     fn method(&mut self, decl: Node<'_>) {
-        let Some(body) = field(decl, "body") else { return };
+        let Some(c) = callable_of(decl, self.source) else { return };
         let Some(name) = field(decl, "name").map(|n| text(n, self.source)) else { return };
-        let receiver = field(decl, "receiver").and_then(|list| kids(list).into_iter().next());
-        let owner = receiver
+        let owner = field(decl, "receiver")
+            .and_then(|list| kids(list).into_iter().next())
             .and_then(|r| field(r, "type"))
             .map_or_else(|| "<ty>".to_owned(), |t| receiver_type(t, self.source));
-        let receiver_name = receiver
-            .and_then(|r| fields(r, "name").into_iter().next())
-            .map(|n| text(n, self.source))
-            .filter(|n| *n != "_");
-        let c = Callable {
-            receiver: receiver_name,
-            type_params: None,
-            params: field(decl, "parameters"),
-            results: field(decl, "result"),
-            body,
-        };
         self.callable(&METHODS, format!("{owner}.{name}"), name, decl, &c);
     }
 
@@ -220,6 +248,10 @@ impl Builder<'_> {
             let Some(ty) = field(spec, "type") else { continue };
             let span = if single { decl } else { spec };
             let type_params = field(spec, "type_parameters");
+            if spec.kind() == "type_spec" && ty.kind() == "struct_type" && !self.lenses.is_empty() {
+                let facts = crate::lenses::struct_facts(ty, self.source, &self.file_names);
+                self.push_lens(name, span, &facts);
+            }
             let (kind, canon) = match (spec.kind(), ty.kind()) {
                 ("type_spec", "struct_type") => (&CLASSES, Some(struct_canon(self.source, name, type_params, ty))),
                 ("type_spec", "interface_type") => {
@@ -252,14 +284,26 @@ impl Builder<'_> {
 /// Scan one Go source string → its definitions as [`Def`]s with canon precomputed. A declaration
 /// holding a syntax error is skipped; the rest of the file is still read.
 #[must_use]
-pub fn scan_source(source: &str, file: &Arc<str>, _opts: &ScanOpts) -> Vec<Def> {
+pub fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec<Def> {
     if is_generated(source) {
         return Vec::new();
     }
     let Some(tree) = parse(source) else { return Vec::new() };
     let root = tree.root_node();
     let lines = LineMap::new(source);
-    let mut b = Builder { source, lines: &lines, file, imports: file_imports(root, source), out: Vec::new() };
+    let lenses = enabled_lenses(opts);
+    // Every lens reads the file's own names, so they are collected once per file — and only when asked.
+    let file_names =
+        if lenses.is_empty() { HashSet::new() } else { crate::lenses::file_bound_names(root, source) };
+    let mut b = Builder {
+        source,
+        lines: &lines,
+        file,
+        imports: file_imports(root, source),
+        lenses,
+        file_names,
+        out: Vec::new(),
+    };
     for item in kids(root) {
         if item.has_error() {
             continue;
@@ -521,6 +565,119 @@ func real(x int) int { y := x + 1; return y * 2 }
         let src = "package p\nfunc Broken(x int) int {\n\ty := x +\n}\nfunc Fine(x int) int {\n\ty := x + 1\n\treturn y\n}\n";
         let fns = names_of_kind(src, "functions");
         assert_eq!(fns, vec!["Fine".to_owned()], "{fns:?}");
+    }
+
+    fn lens_record(src: &str, name: &str) -> Vec<String> {
+        let f: Arc<str> = Arc::from("t.go");
+        let kinds = vec!["lenses".to_owned()];
+        let opts = ScanOpts { kinds: Some(&kinds) };
+        scan_source(src, &f, &opts)
+            .into_iter()
+            .find(|d| d.kind.id == "lenses" && d.name == name)
+            .map(|d| d.analysis.expect("lens analysis").type3_lines)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn lenses_are_absent_unless_the_run_asks_for_them() {
+        let src = "package p\nfunc F(x int) int {\n\tif x > 0 {\n\t\tg(x)\n\t}\n\treturn x\n}\n";
+        assert!(scan(src).iter().all(|d| d.kind.id != "lenses"), "the default run stays byte-identical");
+        assert!(!lens_record(src, "F").is_empty());
+    }
+
+    #[test]
+    fn a_go_callable_projects_through_every_lens_it_can_answer() {
+        let src = r#"package p
+
+import (
+	"errors"
+	"os"
+)
+
+var ErrEmpty = errors.New("empty")
+
+func Load(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	buf, err := readAll(f)
+	if len(buf) == 0 {
+		return nil, ErrEmpty
+	}
+	for _, b := range buf {
+		emit(b)
+	}
+	return buf, err
+}
+"#;
+        let facts = lens_record(src, "Load");
+        let has = |f: &str| facts.iter().any(|x| x == f);
+        assert!(has("outgoing:os.Open"), "{facts:?}");
+        assert!(has("outgoing:emit"), "{facts:?}");
+        assert!(has("control:if"), "{facts:?}");
+        assert!(has("control:for"), "{facts:?}");
+        assert!(has("control:+return"), "nesting rides on the tag: {facts:?}");
+        // Go's failures: the error handed back, and the sentinel returned.
+        assert!(has("failures:?"), "{facts:?}");
+        assert!(has("failures:ErrEmpty"), "{facts:?}");
+        // What it holds open is what the deferred release acquired.
+        assert!(has("resources:os.Open"), "{facts:?}");
+        assert!(has("signature:arity=1"), "{facts:?}");
+        assert!(has("signature:ret:[]"), "{facts:?}");
+        assert!(facts.iter().any(|f| f.starts_with("scope:")), "the widest rung rides as one fact: {facts:?}");
+        // The file's own name is erased from the lenses: `ErrEmpty` is a failure, not a callee.
+        assert!(!has("outgoing:ErrEmpty"), "{facts:?}");
+    }
+
+    #[test]
+    fn a_release_of_something_not_bound_here_is_the_release_itself() {
+        let src = "package p\nfunc (s *S) Bump(n int) int {\n\ts.mu.Lock()\n\tdefer s.mu.Unlock()\n\ts.n += n\n\treturn s.n\n}\n";
+        let facts = lens_record(src, "S.Bump");
+        assert!(facts.contains(&"resources:.Unlock".to_owned()), "{facts:?}");
+        assert!(facts.contains(&"signature:method".to_owned()), "{facts:?}");
+    }
+
+    #[test]
+    fn a_struct_declares_a_shape_as_a_set_with_its_tag_keys_as_options() {
+        // Three fields: a record of fewer facts carries no shape (`MIN_FACTS`), and Go has no
+        // attribute to add a fourth.
+        let a = "package p\ntype S struct {\n\tA int `json:\"a\" db:\"a\"`\n\tB []string\n\tC *time.Time\n}\n";
+        let b = "package p\ntype S struct {\n\tC *time.Time\n\tB []string\n\tA int `json:\"x\" db:\"x\"`\n}\n";
+        // A declaration is a set; a tag's keys are the field's options, its values are not compared.
+        assert_eq!(lens_record(a, "S"), lens_record(b, "S"));
+        assert!(lens_record(a, "S").contains(&"schema:int json db".to_owned()), "{:?}", lens_record(a, "S"));
+    }
+
+    #[test]
+    fn divergent_bodies_with_identical_handling_share_their_use_facts() {
+        use dup_defs_core::uses::use_facts;
+        // Two caches whose bodies share nothing, written by key, read by key and swept by age the
+        // same way — one used from inside its package, the other through its package name.
+        let a = concat!(
+            "package a\n",
+            "type ImageCache struct { key string; blob []byte; deadAt int64 }\n",
+            "func PutImage(s *Session, k string, v []byte) { s.Add(&ImageCache{key: k, blob: v, deadAt: soon()}) }\n",
+            "func GetImage(s *Session, k string) *Row { return s.Find(ByKey(ImageCache{}, k)) }\n",
+            "func ReapImages(s *Session) { s.Delete(OlderThan(ImageCache{}, now())) }\n",
+        );
+        let b = concat!(
+            "package b\n",
+            "import \"x/store\"\n",
+            "func PutPrompt(s *Session, k string, v Json) { s.Add(&store.PromptStore{key: k, blob: v, deadAt: soon()}) }\n",
+            "func GetPrompt(s *Session, k string) *Row { return s.Find(ByKey(store.PromptStore{}, k)) }\n",
+            "func ReapPrompts(s *Session) { s.Delete(OlderThan(store.PromptStore{}, now())) }\n",
+        );
+        let c = "package store\ntype PromptStore struct { payload Json }\n";
+        let (fa, fb, fc): (Arc<str>, Arc<str>, Arc<str>) = (Arc::from("a.go"), Arc::from("b.go"), Arc::from("c.go"));
+        let opts = ScanOpts::default();
+        let mut defs = scan_source(a, &fa, &opts);
+        defs.extend(scan_source(b, &fb, &opts));
+        defs.extend(scan_source(c, &fc, &opts));
+        let facts = use_facts(&[(a, "a.go", 1), (b, "b.go", 1), (c, "c.go", 1)], &defs, crate::canon::collect_sites);
+        let get = |n: &str| facts.get(n).unwrap_or_else(|| panic!("no use facts for {n}: {facts:?}")).clone();
+        assert_eq!(get("ImageCache"), get("PromptStore"), "identical handling ⇒ identical use facts");
     }
 
     #[test]
