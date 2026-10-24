@@ -4,6 +4,7 @@
 //! interface, constant and other type declaration to a [`Def`](dup_defs_core::Def) with a structural
 //! s-expr canonical precomputed off the syntax tree.
 
+mod build;
 mod canon;
 mod decides;
 mod defs;

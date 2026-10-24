@@ -5,12 +5,14 @@
 //! registry entry. Section bases match the other frontends so a mixed-language report keeps one
 //! consistent section order.
 
+use std::collections::HashMap;
 use std::fs;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use dup_defs_core::{Def, Frontend, KindSpec, ScanOpts};
 use rayon::prelude::*;
 
+use crate::build::{alternative_unit, collapse_alternatives};
 use crate::defs::scan_source;
 
 // The shared `KindSpec` vocabulary. Go supports all six body/text kinds (`interfaces` = `interface`).
@@ -41,14 +43,23 @@ impl Frontend for Go {
     fn scans_across_files(&self, opts: &ScanOpts) -> bool {
         opts.wants("lenses")
     }
+    /// Each file is read on its own; then, among the files built only in some configurations, a
+    /// name a package declares in two of them is reported once (see [`crate::build`]).
     fn scan(&self, files: &[Arc<str>], opts: &ScanOpts) -> Vec<Def> {
-        if opts.wants("lenses") {
-            return dup_defs_core::uses::scan_with_uses(files, |src, f| scan_source(src, f, opts), crate::canon::collect_sites);
-        }
-        files
-            .par_iter()
-            .flat_map(|f| fs::read_to_string(&**f).map_or_else(|_| Vec::new(), |src| scan_source(&src, f, opts)))
-            .collect()
+        let units: Mutex<HashMap<Arc<str>, (String, String)>> = Mutex::new(HashMap::new());
+        let read = |src: &str, f: &Arc<str>| {
+            if let Some(unit) = alternative_unit(src, f) {
+                units.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(Arc::clone(f), unit);
+            }
+            scan_source(src, f, opts)
+        };
+        let defs = if opts.wants("lenses") {
+            dup_defs_core::uses::scan_with_uses(files, read, crate::canon::collect_sites)
+        } else {
+            files.par_iter().flat_map(|f| fs::read_to_string(&**f).map_or_else(|_| Vec::new(), |src| read(&src, f))).collect()
+        };
+        let units = units.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
+        collapse_alternatives(defs, |file| units.get(file).cloned())
     }
 }
 
@@ -56,6 +67,7 @@ impl Frontend for Go {
 mod tests {
     use super::Go;
     use dup_defs_core::{Frontend, ScanOpts};
+    use std::sync::Arc;
 
     #[test]
     fn registry_metadata() {
@@ -64,5 +76,39 @@ mod tests {
         assert_eq!(go.extensions(), &["go"]);
         assert_eq!(go.kinds(&ScanOpts::default()).len(), 6);
         assert!(go.kinds(&ScanOpts::default()).iter().all(|k| k.id != "lenses"));
+    }
+
+    #[test]
+    fn a_name_two_build_alternatives_declare_is_one_definition() {
+        let dir = std::env::temp_dir().join(format!("go-canon-build-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cmd")).expect("temp dir");
+        let body = "func Default(method string) int {\n\tn := len(method)\n\treturn n + 1\n}\n\nfunc init() {\n\tregister(1)\n}\n";
+        let files = [
+            ("binding.go", format!("//go:build !nomsgpack\n\npackage binding\n\n{body}")),
+            ("binding_nomsgpack.go", format!("//go:build nomsgpack\n\npackage binding\n\n{body}")),
+            ("poll_windows.go", format!("package binding\n\n{body}")),
+            // Every build compiles these two, so a repeated name is a real copy.
+            ("plain.go", "package binding\n\nfunc Copied(x int) int {\n\ty := x * 2\n\treturn y\n}\n".to_owned()),
+            ("plain2.go", "package binding\n\nfunc Copied(x int) int {\n\ty := x * 2\n\treturn y\n}\n".to_owned()),
+            // `go run` programs, one per file: no build includes them, none is another's alternative.
+            ("cmd/a.go", "//go:build ignore\n\npackage main\n\nfunc main() {\n\tx := run()\n\tprint(x)\n}\n".to_owned()),
+            ("cmd/b.go", "//go:build ignore\n\npackage main\n\nfunc main() {\n\tx := run()\n\tprint(x)\n}\n".to_owned()),
+        ];
+        let paths: Vec<Arc<str>> = files
+            .iter()
+            .map(|(name, src)| {
+                let path = dir.join(name);
+                std::fs::write(&path, src).expect("fixture");
+                Arc::from(path.to_string_lossy().as_ref())
+            })
+            .collect();
+        let defs = Go.scan(&paths, &ScanOpts::default());
+        let count = |name: &str| defs.iter().filter(|d| d.name == name).count();
+        assert_eq!(count("Default"), 1, "three build alternatives, one definition");
+        assert_eq!(count("init"), 3, "a package holds as many `init`s as it likes");
+        assert_eq!(count("Copied"), 2);
+        assert_eq!(count("main"), 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
