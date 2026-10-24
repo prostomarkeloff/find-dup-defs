@@ -75,6 +75,22 @@ const TYPED_SPLIT: char = '#';
 /// Separates a local path's module from the name inside it. `~` cannot occur in an identifier.
 const LOCAL_SPLIT: char = '~';
 
+/// Marks a path the frontend knows to name a value; see [`value_path`].
+const VALUE: &str = "@=";
+
+/// `head` with `rest` read off it, dotted: `a.b` and `["c"]` → `a.b.c`. An empty head is the root.
+#[must_use]
+pub fn dotted(head: &str, rest: &[&str]) -> String {
+    let mut out = head.to_owned();
+    for attr in rest {
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(attr);
+    }
+    out
+}
+
 /// A field reached from a hole: `_.a.b`.
 #[must_use]
 pub fn field(attrs: &[&str]) -> String {
@@ -226,6 +242,20 @@ pub fn path(dotted: &str) -> String {
     format!("@{dotted}")
 }
 
+/// A name resolved to the dotted path it stands for, which the language itself says is a **value** — a
+/// constant or a variable — whatever its spelling.
+///
+/// [`names_constant`] reads a path's casing, the convention Python, Rust and TypeScript share. Go does
+/// not keep it: its constants and variables take the same `MixedCaps` its types and functions do
+/// (`StatusOpen`, `http.StatusOK`, `ErrNotFound`), so `@app.orders.StatusOpen` reads exactly like a
+/// Python class `@app.db.Order`, and a field compared with it was a column against a value the text
+/// does not fix — a filter, dropped. What no spelling tells apart, the grammar does: an operand of a
+/// comparison in Go can only be a value, so the frontend writes it as one.
+#[must_use]
+pub fn value_path(dotted: &str) -> String {
+    format!("{VALUE}{dotted}")
+}
+
 /// A name the module defined itself: `module` is the module's own dotted file path, `name` the name
 /// and any attributes after it.
 ///
@@ -295,6 +325,10 @@ pub fn has_identity(term: &str) -> bool {
 /// column compared with a value the text does not fix — a filter, dropped — so the commonest
 /// decision a Rust or TypeScript function makes was invisible to the pass.
 fn names_constant(path: &str) -> bool {
+    // A path the frontend wrote as a value ([`value_path`]) is one, whatever its casing.
+    if path.starts_with(VALUE) {
+        return true;
+    }
     let capitalized = |segment: &str| segment.chars().next().is_some_and(char::is_uppercase);
     let mut previous: Option<&str> = None;
     for segment in path.split(['.', LOCAL_SPLIT]) {
@@ -480,15 +514,42 @@ pub fn parts(atom: &str) -> (&str, Vec<&str>) {
     (rel, it.collect())
 }
 
-/// The atom for a human: `a = b`, `a < b`, `a in b`, `? a`.
+/// The atom for a human: `a = b`, `a < b`, `a in b`, `? a`. A [`value_path`] reads as the path it is —
+/// the mark is for [`is_fact`], not for the reader.
 #[must_use]
 pub fn render(atom: &str) -> String {
     let (rel, terms) = parts(atom);
-    match terms.as_slice() {
+    let shown = match terms.as_slice() {
         [one] => format!("{rel} {one}"),
         [a, b] => format!("{a} {rel} {b}"),
         _ => atom.replace(SEP, " "),
+    };
+    unmarked(&shown)
+}
+
+/// `text` with every [`value_path`] mark read as a plain path. Quoted literals are skipped.
+fn unmarked(text: &str) -> String {
+    if !text.contains(VALUE) {
+        return text.to_owned();
     }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(quoted) = rest.strip_prefix('"') {
+            let end = closing_quote(quoted);
+            out.push('"');
+            out.push_str(&quoted[..end]);
+            rest = &quoted[end..];
+        } else if let Some(after) = rest.strip_prefix(VALUE) {
+            out.push('@');
+            rest = after;
+        } else {
+            let c = rest.chars().next().unwrap_or(' ');
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
 }
 
 /// Rewrite every local path in `atom` by `resolve(module)`, which names the module the way the rest
@@ -637,6 +698,21 @@ mod tests {
         // A type's fields and methods are lower-case: `Order.status` is still a column.
         assert!(!is_value(&path("app.db.Order.status")));
         assert!(!is_value(&path("app.db.Order")));
+    }
+
+    #[test]
+    fn a_path_the_frontend_marks_as_a_value_is_one_whatever_its_casing() {
+        use super::{is_fact, is_value, value_path};
+        // Go spells a constant like a class: read by casing, `StatusOpen` would be a column and the
+        // comparison a filter. Written as a value, it is the fact it is.
+        assert!(!is_value(&path("app.orders.StatusOpen")));
+        assert!(is_value(&value_path("app.orders.StatusOpen")));
+        assert!(is_fact(&equal(&field(&["status"]), &value_path("app.orders.StatusOpen")).unwrap_or_default()));
+        assert!(is_fact(&equal(HOLE, &value_path("app.ErrNotFound")).unwrap_or_default()));
+        assert!(!is_fact(&equal(&field(&["status"]), &path("app.orders.StatusOpen")).unwrap_or_default()));
+        // The mark is for the filter, not the reader — and a literal holding its text is left alone.
+        let shown = equal(&field(&["status"]), &call(&path("app.f"), vec![value_path("app.Open"), literal("@=x")]));
+        assert_eq!(render(&shown.unwrap_or_default()), "@app.f(\"@=x\", @app.Open) = _.status");
     }
 
     #[test]

@@ -37,7 +37,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use dup_defs_core::decide::{self, DecisionFacts};
+use dup_defs_core::decide::{self, dotted, DecisionFacts};
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{BinOp, Expr, Fields, FnArg, Item, Lit, Member, Pat, Stmt, Token, Type, UnOp, UseTree};
@@ -56,17 +56,6 @@ pub(crate) struct FileScope {
     /// The structs the module defines, each field with the type it is declared as where that names
     /// one — what a chain of typed fields hops through.
     records: HashMap<String, Vec<(String, Option<String>)>>,
-}
-
-fn dotted(head: &str, rest: &[&str]) -> String {
-    let mut out = head.to_owned();
-    for attr in rest {
-        if !out.is_empty() {
-            out.push('.');
-        }
-        out.push_str(attr);
-    }
-    out
 }
 
 fn parent(module: &str) -> String {

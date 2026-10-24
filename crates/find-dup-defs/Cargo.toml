@@ -1,7 +1,7 @@
 [package]
 name = "find-dup-defs"
-version = "0.15.0"
-description = "Find duplicate / near-duplicate top-level definitions across a codebase via clone clustering — Python, Rust, and TypeScript frontends, plus an opt-in structural helper-extraction pass."
+version = "0.16.0"
+description = "Find duplicate / near-duplicate top-level definitions across a codebase via clone clustering — Python, Rust, TypeScript and Go frontends, plus an opt-in structural helper-extraction pass."
 keywords = ["duplicate", "clone", "refactor", "lint", "ast"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
@@ -16,13 +16,15 @@ path = "src/main.rs"
 
 [dependencies]
 # The frontend↔engine contract (Def / KindSpec / Frontend) the engine clusters over.
-dup-defs-core = { path = "../dup-defs-core", version = "0.4.0" }
+dup-defs-core = { path = "../dup-defs-core", version = "0.4.1" }
 py-canon = { path = "../py-canon", version = "0.6.0" }
 # TypeScript frontend — same contract as `py-canon`, oxc-based parser. `0.1.4` carries the
 # arrow-const name blanking the TS patternology dialect relies on, so pin the floor there.
 ts-canon = { path = "../ts-canon", version = "0.3.0" }
 # Rust frontend — same contract as `py-canon`/`ts-canon`, over the `syn` parser.
-rs-canon = { path = "../rs-canon", version = "0.3.0" }
+rs-canon = { path = "../rs-canon", version = "0.3.1" }
+# Go frontend — same contract, over the tree-sitter Go grammar.
+go-canon = { path = "../go-canon", version = "0.1.0" }
 # exact difflib Ratcliff–Obershelp ratio + clustering + exact weighted-cosine similarity join
 # (simjoin) — https://crates.io/crates/difflib-fast
 difflib-fast = "0.4"

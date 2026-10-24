@@ -1617,6 +1617,484 @@ fn rs_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
     }
 }
 
+// ── Go dialect ───────────────────────────────────────────────────────────────
+
+/// The Go dialect — `go-canon`'s tree-sitter-derived structural dump. It speaks the Rust dump's tags
+/// wherever the construct is the same one and splices list elements as node children the same way,
+/// but a function is `Func(name, Params(…), results, Block(…))` — no flags slot, so the body sits at
+/// slot 3 — and Go adds constructs of its own (`Switch`/`Case`, `Select`, `Defer`/`Go`, `Composite`,
+/// `Assert`, `Slice`, `Send`). Selectors are the `Method`/`Field` name slots and a struct literal's
+/// field names (`FieldVal`); a map literal's key (`KV`) is a value like any other. Parameter types and
+/// the result are signature material.
+pub(crate) struct GoDialect;
+
+impl Dialect for GoDialect {
+    fn slot_ctx(&self, tag: &str, k: usize) -> Ctx {
+        match (tag, k) {
+            // Every child of a `Block` is a statement; every body (`If`/`For`/`Case`/…) is a `Block`.
+            ("Block", _) => Ctx::Stmt,
+            ("Method" | "Field", 1) | ("FieldVal", 0) => Ctx::Selector,
+            ("Param" | "PatType", 1) | ("Func", 0 | 2) => Ctx::Anno,
+            _ => Ctx::Expr,
+        }
+    }
+
+    fn parse_function_body(&self, canon: &str) -> Vec<Term> {
+        go_parse_function_body(canon)
+    }
+
+    fn render(&self, t: &Term, out: &mut String, budget: &mut usize) {
+        go_render(t, out, budget);
+    }
+
+    fn is_sequence(&self, tag: &str) -> bool {
+        matches!(
+            tag,
+            "Block" | "Params" | "Results" | "Tuple" | "PatTuple" | "Named" | "Select" | "TypeArgs" | "TyUnion" | "Decls"
+        )
+    }
+}
+
+/// Parse only the body of a Go `Func(name, Params, results, Block(stmts…))` — skip the three
+/// signature slots without building them, then return the `Block` node's children.
+fn go_parse_function_body(canon: &str) -> Vec<Term> {
+    let mut p = TermParser::new(canon);
+    p.skip_ws();
+    let start = p.i;
+    while p.i < p.b.len() && (p.b[p.i].is_ascii_alphanumeric() || p.b[p.i] == b'_') {
+        p.i += 1;
+    }
+    if &canon[start..p.i] != "Func" || p.b.get(p.i) != Some(&b'(') {
+        return Vec::new();
+    }
+    p.i += 1; // past '('
+    p.skip_arg(); // name
+    p.skip_arg(); // Params(…)
+    p.skip_arg(); // results
+    p.skip_ws();
+    match p.term() {
+        Term::Node(tag, ch) if tag == "Block" => ch,
+        _ => Vec::new(),
+    }
+}
+
+/// An empty field of the dump: a middle field the emitter left blank parses as a stray `,` atom (the
+/// separator the empty field ate), a trailing one as nothing at all.
+fn go_blank(t: Option<&Term>) -> bool {
+    match t {
+        None => true,
+        Some(Term::Atom(s)) => unq(s).trim_matches(',').is_empty(),
+        _ => false,
+    }
+}
+
+/// Render a `Block` node's statements joined with `; ` (a bare body, no braces).
+fn go_block_inner(t: Option<&Term>, out: &mut String, b: &mut usize) {
+    match t {
+        Some(Term::Node(tag, ch)) if tag == "Block" => {
+            for (i, s) in ch.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("; ");
+                }
+                if *b == 0 {
+                    out.push('…');
+                    return;
+                }
+                go_render(s, out, b);
+            }
+        }
+        Some(other) if !go_blank(Some(other)) => go_render(other, out, b),
+        _ => {}
+    }
+}
+
+/// `{ body }` of a construct.
+fn go_braced(t: Option<&Term>, out: &mut String, b: &mut usize) {
+    out.push_str("{ ");
+    go_block_inner(t, out, b);
+    out.push_str(" }");
+}
+
+/// A child, or nothing when the field is blank.
+fn go_opt(t: Option<&Term>, out: &mut String, b: &mut usize) {
+    if let Some(t) = t.filter(|t| !go_blank(Some(t))) {
+        go_render(t, out, b);
+    }
+}
+
+/// Render a folded Go term as one line of pseudo-source. Mirrors [`rs_render`]: bounded by `b`, holes
+/// `?`, unknown tags fall back to the raw `Tag(child, …)` form.
+fn go_render(t: &Term, out: &mut String, b: &mut usize) {
+    if *b == 0 {
+        out.push('…');
+        return;
+    }
+    *b -= 1;
+    match t {
+        Term::Hole => out.push('?'),
+        Term::Atom(s) => out.push_str(unq(s)),
+        Term::List(items) => {
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                go_render(it, out, b);
+            }
+        }
+        Term::Node(tag, ch) => go_node(tag, ch, out, b),
+    }
+}
+
+#[allow(clippy::too_many_lines)] // one arm per construct reads better straight-through
+fn go_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
+    let hole = &Term::Hole;
+    let at = |i: usize| ch.get(i).unwrap_or(hole);
+    match tag {
+        "Func" | "Closure" => {
+            // `Func(name, Params, results, Block)`; a literal has no name: `Closure(Params, results, Block)`.
+            let skip = usize::from(tag == "Func");
+            out.push_str("func");
+            if tag == "Func" {
+                out.push(' ');
+                out.push_str(&ident(ch.first()));
+            }
+            out.push('(');
+            if let Some(Term::Node(pt, pch)) = ch.get(skip) {
+                if pt == "Params" {
+                    seq(pch, 0, out, b, go_render);
+                }
+            }
+            out.push(')');
+            if !go_blank(ch.get(skip + 1)) {
+                out.push(' ');
+                go_render(at(skip + 1), out, b);
+            }
+            out.push(' ');
+            go_braced(ch.get(skip + 2), out, b);
+        }
+        "Params" | "Tuple" | "PatTuple" | "Decls" | "TypeArgs" => seq(ch, 0, out, b, go_render),
+        "Results" => {
+            out.push('(');
+            seq(ch, 0, out, b, go_render);
+            out.push(')');
+        }
+        "Param" | "PatType" => {
+            if !go_blank(ch.first()) {
+                go_render(at(0), out, b);
+                out.push(' ');
+            }
+            go_render(at(1), out, b);
+        }
+        "Block" => go_braced(Some(&Term::Node(tag.to_owned(), ch.to_vec())), out, b),
+        "Let" => {
+            if let Some(Term::Node(t, tch)) = ch.first() {
+                if t == "PatType" {
+                    // `var x T = v`
+                    out.push_str("var ");
+                    go_render(tch.first().unwrap_or(hole), out, b);
+                    out.push(' ');
+                    go_render(tch.get(1).unwrap_or(hole), out, b);
+                    if !go_blank(ch.get(1)) {
+                        out.push_str(" = ");
+                        go_render(at(1), out, b);
+                    }
+                    return;
+                }
+            }
+            go_render(at(0), out, b);
+            out.push_str(" := ");
+            go_render(at(1), out, b);
+        }
+        "LocalConst" => {
+            out.push_str("const ");
+            go_render(at(0), out, b);
+            out.push_str(" = ");
+            go_render(at(1), out, b);
+        }
+        "RecvStmt" => {
+            if !go_blank(ch.first()) {
+                go_render(at(0), out, b);
+                out.push_str(" := ");
+            }
+            go_render(at(1), out, b);
+        }
+        "Assign" => {
+            go_render(at(0), out, b);
+            out.push_str(" = ");
+            go_render(at(1), out, b);
+        }
+        "Bin" => {
+            go_render(at(0), out, b);
+            out.push(' ');
+            out.push_str(&ident(ch.get(1)));
+            out.push(' ');
+            go_render(at(2), out, b);
+        }
+        "Inc" | "Dec" => {
+            go_render(at(0), out, b);
+            out.push_str(if tag == "Inc" { "++" } else { "--" });
+        }
+        "Send" => {
+            go_render(at(0), out, b);
+            out.push_str(" <- ");
+            go_render(at(1), out, b);
+        }
+        "ExprStmt" | "BlockExpr" => go_render(at(0), out, b),
+        "Return" | "Go" | "Defer" | "Break" | "Continue" | "Goto" => {
+            out.push_str(match tag {
+                "Return" => "return",
+                "Go" => "go",
+                "Defer" => "defer",
+                "Break" => "break",
+                "Continue" => "continue",
+                _ => "goto",
+            });
+            if !go_blank(ch.first()) {
+                out.push(' ');
+                go_render(at(0), out, b);
+            }
+        }
+        "Fallthrough" => out.push_str("fallthrough"),
+        "If" => {
+            // `If(init, cond, Block, else)`
+            out.push_str("if ");
+            if !go_blank(ch.first()) {
+                go_render(at(0), out, b);
+                out.push_str("; ");
+            }
+            go_render(at(1), out, b);
+            out.push(' ');
+            go_braced(ch.get(2), out, b);
+            if !go_blank(ch.get(3)) {
+                out.push_str(" else ");
+                match at(3) {
+                    Term::Node(t, _) if t == "If" => go_render(at(3), out, b),
+                    other => go_braced(Some(other), out, b),
+                }
+            }
+        }
+        "Loop" => {
+            out.push_str("for ");
+            go_braced(ch.first(), out, b);
+        }
+        "While" => {
+            out.push_str("for ");
+            go_render(at(0), out, b);
+            out.push(' ');
+            go_braced(ch.get(1), out, b);
+        }
+        "For" => {
+            out.push_str("for ");
+            if !go_blank(ch.first()) {
+                go_render(at(0), out, b);
+                out.push_str(" := ");
+            }
+            out.push_str("range ");
+            go_render(at(1), out, b);
+            out.push(' ');
+            go_braced(ch.get(2), out, b);
+        }
+        "ForC" => {
+            out.push_str("for ");
+            go_opt(ch.first(), out, b);
+            out.push_str("; ");
+            go_opt(ch.get(1), out, b);
+            out.push_str("; ");
+            go_opt(ch.get(2), out, b);
+            out.push(' ');
+            go_braced(ch.get(3), out, b);
+        }
+        "Switch" | "TypeSwitch" => {
+            // `Switch(init, value, cases…)`, `TypeSwitch(init, alias, value, cases…)`.
+            let type_switch = tag == "TypeSwitch";
+            out.push_str("switch ");
+            if !go_blank(ch.first()) {
+                go_render(at(0), out, b);
+                out.push_str("; ");
+            }
+            if type_switch && !go_blank(ch.get(1)) {
+                go_render(at(1), out, b);
+                out.push_str(" := ");
+            }
+            let value = if type_switch { 2 } else { 1 };
+            go_opt(ch.get(value), out, b);
+            if type_switch {
+                out.push_str(".(type)");
+            }
+            out.push_str(" { ");
+            for (i, case) in ch.iter().enumerate().skip(value + 1) {
+                if i > value + 1 {
+                    out.push_str("; ");
+                }
+                go_render(case, out, b);
+            }
+            out.push_str(" }");
+        }
+        "Select" => {
+            out.push_str("select { ");
+            for (i, case) in ch.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("; ");
+                }
+                go_render(case, out, b);
+            }
+            out.push_str(" }");
+        }
+        // `Case(values, Block)`, `TypeCase(types…, Block)`, `CommCase(comm, Block)`, `Default(Block)`.
+        "Case" | "TypeCase" | "CommCase" | "Default" => {
+            if tag == "Default" {
+                out.push_str("default");
+            } else {
+                out.push_str("case ");
+                seq(&ch[..ch.len().saturating_sub(1)], 0, out, b, go_render);
+            }
+            out.push_str(": ");
+            go_block_inner(ch.last(), out, b);
+        }
+        "Labeled" => {
+            out.push_str(&ident(ch.first()));
+            out.push_str(": ");
+            go_render(at(1), out, b);
+        }
+        "Path" | "Bind" | "Int" | "Float" | "Imag" | "Bool" => out.push_str(&ident(ch.first())),
+        "Wild" => out.push('_'),
+        "Nil" => out.push_str("nil"),
+        "Iota" => out.push_str("iota"),
+        "Str" => {
+            out.push('"');
+            out.push_str(&ident(ch.first()));
+            out.push('"');
+        }
+        "Char" => {
+            out.push('\'');
+            out.push_str(&ident(ch.first()));
+            out.push('\'');
+        }
+        "Unary" => {
+            out.push_str(&ident(ch.first()));
+            go_render(at(1), out, b);
+        }
+        "Ref" => {
+            out.push('&');
+            go_render(at(0), out, b);
+        }
+        "Recv" => {
+            out.push_str("<-");
+            go_render(at(0), out, b);
+        }
+        "Spread" => {
+            go_render(at(0), out, b);
+            out.push_str("...");
+        }
+        "Call" => {
+            go_render(at(0), out, b);
+            out.push('(');
+            seq(ch, 1, out, b, go_render);
+            out.push(')');
+        }
+        "Method" => {
+            go_render(at(0), out, b);
+            out.push('.');
+            out.push_str(&ident(ch.get(1)));
+            out.push('(');
+            seq(ch, 2, out, b, go_render);
+            out.push(')');
+        }
+        "Field" => {
+            go_render(at(0), out, b);
+            out.push('.');
+            out.push_str(&ident(ch.get(1)));
+        }
+        "Index" | "Inst" => {
+            go_render(at(0), out, b);
+            out.push('[');
+            go_render(at(1), out, b);
+            out.push(']');
+        }
+        "Slice" => {
+            go_render(at(0), out, b);
+            out.push('[');
+            go_opt(ch.get(1), out, b);
+            out.push(':');
+            go_opt(ch.get(2), out, b);
+            if !go_blank(ch.get(3)) {
+                out.push(':');
+                go_render(at(3), out, b);
+            }
+            out.push(']');
+        }
+        "Assert" => {
+            go_render(at(0), out, b);
+            out.push_str(".(");
+            go_render(at(1), out, b);
+            out.push(')');
+        }
+        "Cast" => {
+            go_render(at(1), out, b);
+            out.push('(');
+            go_render(at(0), out, b);
+            out.push(')');
+        }
+        "Composite" => {
+            go_opt(ch.first(), out, b);
+            out.push('{');
+            seq(ch, 1, out, b, go_render);
+            out.push('}');
+        }
+        "FieldVal" | "KV" => {
+            if tag == "FieldVal" {
+                out.push_str(&ident(ch.first()));
+            } else {
+                go_render(at(0), out, b);
+            }
+            out.push_str(": ");
+            go_render(at(1), out, b);
+        }
+        "Ty" => {
+            out.push_str(&ident(ch.first()));
+            if ch.len() > 1 && !go_blank(ch.get(1)) {
+                out.push('[');
+                seq(ch, 1, out, b, go_render);
+                out.push(']');
+            }
+        }
+        "TyPtr" => {
+            out.push('*');
+            go_render(at(0), out, b);
+        }
+        "TySlice" | "TyArray" => {
+            out.push_str("[]");
+            go_render(at(0), out, b);
+        }
+        "TyMap" => {
+            out.push_str("map[");
+            go_render(at(0), out, b);
+            out.push(']');
+            go_render(at(1), out, b);
+        }
+        "TyChan" => {
+            out.push_str("chan ");
+            go_render(at(1), out, b);
+        }
+        "TyVariadic" => {
+            out.push_str("...");
+            go_render(at(0), out, b);
+        }
+        "TyFn" => out.push_str("func(?)"),
+        "TyStruct" => out.push_str("struct{…}"),
+        "TyIface" => out.push_str("interface{…}"),
+        // Unknown / unhandled node: compact `Tag(child, …)` fallback (keeps holes visible).
+        _ => {
+            out.push_str(tag);
+            if !ch.is_empty() {
+                out.push('(');
+                seq(ch, 0, out, b, go_render);
+                out.push(')');
+            }
+        }
+    }
+}
+
 // ── TypeScript dialect ───────────────────────────────────────────────────────
 
 /// The TypeScript dialect — `ts-canon`'s `oxc`-derived structural dump. Same `Tag(field, …)`
@@ -3453,7 +3931,7 @@ mod tests {
 
     #[test]
     fn a_spliced_body_aligns_like_a_list() {
-        // Rust and TypeScript splice a body's statements as `Block`'s children. One statement more in
+        // Rust, TypeScript and Go splice a body's statements as `Block`'s children. One statement more in
         // the middle is one hole; read field by field, everything after it would be.
         let a = parse_term("Block(ExprStmt(Call(Path('log'))), ExprStmt(Call(Path('save'))), Tail(Path('_v0')))");
         let b = parse_term("Block(ExprStmt(Call(Path('log'))), Tail(Path('_v0')))");
@@ -3880,5 +4358,92 @@ mod tests {
             cands[0].body,
             "function _fn(_v0) { return <section className={\"?\"}><h1>{_v0.title}</h1>read more<Link href={_v0.url} /></section> }",
         );
+    }
+
+    // ── Go dialect (the `go-canon` tree-sitter shape) ────────────────────────
+    //
+    // The canonicals come from `go-canon` itself rather than being written by hand, so these tests
+    // follow the emitter: a change to its output that the dialect does not read breaks them here.
+
+    fn go_xname(src: &str, name: &str) -> String {
+        let file: std::sync::Arc<str> = std::sync::Arc::from("t.go");
+        go_canon::scan_source(src, &file, &dup_defs_core::ScanOpts::default())
+            .into_iter()
+            .find(|d| d.name == name)
+            .and_then(|d| d.analysis)
+            .map_or_else(|| panic!("no analysis for {name}"), |a| a.xname_canonical)
+    }
+
+    #[test]
+    fn go_parse_function_body_matches_full_parse() {
+        // The body sits at slot 3 — no flags slot, unlike Rust — and a missing result leaves a blank
+        // field the borrow must step over, not read as the body.
+        for src in [
+            "package p\nfunc F(id int) *User {\n\tv := NewUser(id)\n\tstore.Add(v)\n\treturn v\n}\n",
+            "package p\nfunc F(id int) {\n\tv := NewUser(id)\n\tstore.Add(v)\n}\n",
+        ] {
+            let canon = go_xname(src, "F");
+            let full = match parse_term(&canon) {
+                Term::Node(_, ch) => match ch.get(3) {
+                    Some(Term::Node(tag, stmts)) if tag == "Block" => stmts.clone(),
+                    other => panic!("slot 3 is not the body: {other:?} in {canon}"),
+                },
+                other => panic!("not a node: {other:?}"),
+            };
+            assert_eq!(go_parse_function_body(&canon), full, "{canon}");
+        }
+    }
+
+    #[test]
+    fn go_whole_fn_emits_factory_helper() {
+        // Two builders differing in the constructor they call and the type they return: the
+        // constructor is a value (a function can be passed), the return type a type parameter.
+        let a = go_xname("package p\nfunc MakeUser(id int) *User {\n\tv := NewUser(id)\n\tstore.Add(v)\n\treturn v\n}\n", "MakeUser");
+        let b = go_xname("package p\nfunc MakeOrder(id int) *Order {\n\tv := NewOrder(id)\n\tstore.Add(v)\n\treturn v\n}\n", "MakeOrder");
+        let cands = whole_fn_helpers(&GoDialect, &[a, b], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert_eq!(cands.len(), 1, "exactly the factory helper");
+        let c = &cands[0];
+        assert_eq!(c.granularity, "whole-fn");
+        assert_eq!(c.body, "func _fn(_v0 int) *? { _v1 := ?(_v0); store.Add(_v1); return _v1 }", "body: {}", c.body);
+        assert_eq!(c.params, 2, "the constructor and the returned type");
+    }
+
+    #[test]
+    fn go_subblock_mines_the_load_or_return_motif() {
+        // Go's own idiom — call, check the error, hand it back — embedded in two functions whose
+        // first statements share nothing. The divergent string argument is the one parameter.
+        let a = go_xname("package p\nfunc A(k string) (*Row, error) {\n\tlog(\"a\")\n\trow, err := db.Load(k, \"users\")\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\treturn row, nil\n}\n", "A");
+        let b = go_xname("package p\nfunc B(k string) (*Row, error) {\n\tcount++\n\trow, err := db.Load(k, \"orders\")\n\tif err != nil {\n\t\treturn nil, err\n\t}\n\treturn row, nil\n}\n", "B");
+        let cands = subblock_helpers(&GoDialect, &[a, b], 2, &ExtractCfg::default());
+        assert_eq!(cands.len(), 1, "exactly the load-or-return motif");
+        let c = &cands[0];
+        assert_eq!(c.granularity, "sub-block");
+        assert_eq!(c.members, vec![0, 1]);
+        assert_eq!(
+            c.body,
+            "_v1, _v2 := db.Load(_v0, \"?\"); if _v2 != nil { return nil, _v2 }; return _v1, nil",
+            "body: {}",
+            c.body
+        );
+        assert_eq!(c.params, 1);
+    }
+
+    #[test]
+    fn go_a_varying_field_is_a_selector_and_a_map_key_a_value() {
+        // `r.Price` vs `r.Qty`: another member, reached only by reflection — not extractable.
+        let sum = go_xname("package p\nfunc Sum(rows []Row) int {\n\ttotal := 0\n\tfor _, r := range rows {\n\t\tif r.Ok {\n\t\t\ttotal += r.Price\n\t\t}\n\t}\n\treturn total\n}\n", "Sum");
+        let qty = go_xname("package p\nfunc Count(rows []Row) int {\n\ttotal := 0\n\tfor _, r := range rows {\n\t\tif r.Ok {\n\t\t\ttotal += r.Qty\n\t\t}\n\t}\n\treturn total\n}\n", "Count");
+        let none = whole_fn_helpers(&GoDialect, &[sum, qty], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert!(none.is_empty(), "a varying field name must not extract, got: {none:?}");
+        // A struct field's name is fixed; a map key is a value like any other and becomes a parameter.
+        let load = go_xname("package p\nfunc Load(c *Conf) *Srv {\n\treturn &Srv{Name: c.Name, Port: 80, Tags: map[string]int{\"a\": 1}}\n}\n", "Load");
+        let make = go_xname("package p\nfunc Make(c *Conf) *Srv {\n\treturn &Srv{Name: c.Name, Port: 81, Tags: map[string]int{\"b\": 1}}\n}\n", "Make");
+        let cands = whole_fn_helpers(&GoDialect, &[load, make], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert_eq!(cands.len(), 1);
+        assert_eq!(
+            cands[0].body,
+            "func _fn(_v0 *Conf) *Srv { return &Srv{Name: _v0.Name, Port: ?, Tags: map[string]int{\"?\": 1}} }"
+        );
+        assert_eq!(cands[0].params, 2);
     }
 }

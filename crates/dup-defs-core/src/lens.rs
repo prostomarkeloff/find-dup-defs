@@ -133,7 +133,7 @@ pub fn enabled_lenses(opts: &ScanOpts) -> Vec<Lens> {
 
 /// How deep a control-flow fact sits, rendered into the fact itself.
 ///
-/// 🔴 Shared because the three frontends must **agree**, not merely to avoid a copy. A `control`
+/// 🔴 Shared because the frontends must **agree**, not merely to avoid a copy. A `control`
 /// fact is compared across languages by string, so if one walk capped the depth marker at four and
 /// another at five, the same nesting would produce different facts and two genuinely alike
 /// procedures would be held apart by a constant neither of them is about. The cap exists because

@@ -4,7 +4,7 @@
 # constants, AnalyzedFn, the lens machinery, the dotted-path form) lives in `dup-defs-core`. What
 # remains below is
 # IRREDUCIBLE cross-frontend structure: each `*-canon` crate implements the same Frontend contract
-# over a *different* parser AST (Ruff / syn / oxc), so these can't be merged into one function
+# over a *different* parser AST (Ruff / syn / oxc / tree-sitter), so these can't be merged into one function
 # without erasing the per-crate API. De-escalated (ERROR -> WARNING) rather than suppressed, so they
 # stay visible as advisory.
 #
@@ -16,7 +16,7 @@
 # the fixtures alone, which is why the claim of "0 ERROR" had quietly stopped being true.
 suppress:*@*/tests/fixtures/*=fixture duplication is the fixture
 
-# Per-frontend kind subset — Python declares 5 kinds, Rust/TS 6 (interfaces). Different content.
+# Per-frontend kind subset — Python declares 5 kinds, Rust/TS/Go 6 (interfaces). Different content.
 de-escalate:<constants>KINDS@*canon/src/frontend.rs=per-frontend kind subset, not duplication
 
 # Public per-crate batch wrappers — identical `par_iter().map(...).collect()` body, but each calls
@@ -37,9 +37,9 @@ de-escalate:<methods>*::scan@*canon/src/frontend.rs=Frontend trait impl, identic
 # The Collect visitor — same shape, but walks a different AST (Ruff/syn/oxc node types) per crate.
 de-escalate:<classes>Collect@*canon/src/canon.rs=per-language AST visitor, different node types
 
-# The perspective walks. Same shape three times over three parser ASTs — the same irreducibility as
-# `Collect` above, one rung up: each answers the ten lens questions from Ruff / syn / oxc nodes, and
-# merging them would mean one walk that knows all three grammars.
+# The perspective walks. Same shape four times over four parser ASTs — the same irreducibility as
+# `Collect` above, one rung up: each answers the ten lens questions from Ruff / syn / oxc /
+# tree-sitter nodes, and merging them would mean one walk that knows all four grammars.
 de-escalate:<functions>callable_facts@*canon/src/lenses.rs=per-language lens projection
 de-escalate:<functions>used_names@*canon/src/canon.rs=per-language identifier walk
 de-escalate:<classes>Walked@*canon/src/lenses.rs=per-language fact record, different node types
@@ -49,7 +49,7 @@ de-escalate:<methods>FactWalk::nested@*canon/src/lenses.rs=per-language depth gu
 
 # The statement-stream walkers — one per language that has block structure to walk, over its own AST.
 de-escalate:<classes>StreamWalk@*canon/src/canon.rs=per-language statement walker, different node types
-de-escalate:<methods>StreamWalk::push@*canon/src/canon.rs=thin per-crate accumulator
+de-escalate:<methods>StreamWalk::{push,stmts}@*canon/src/canon.rs=thin per-crate accumulator and list walk
 
 # The opt-in `lenses` kind list and the trait method that selects it — per-frontend by construction,
 # same reason as `KINDS` above.
@@ -69,16 +69,17 @@ de-escalate:<functions>analyze_item_fn@*canon/src/canon.rs=per-syn-item-type ent
 de-escalate:<functions>type3_walk@*canon/src/canon.rs=per-language statement walker, different node types
 de-escalate:<classes>UseWalk@*canon/src/canon.rs=per-language site walker, different node types
 de-escalate:<methods>UseWalk::site@*canon/src/canon.rs=per-language site walker over its own Dump
-de-escalate:<methods>Dump::{expr,anchoring,hunting}@*canon/src/canon.rs=thin per-crate Dump method
+de-escalate:<methods>Dump::{expr,anchoring,hunting,block,mention}@*canon/src/canon.rs=thin per-crate Dump method
 
 # The normal forms. Each frontend rewrites a body over its own parser AST, so the rule walks — which
 # names a body reads, whether an expression can have effects, the substitution that inlines a
-# temporary, the operands of a `&&` chain — have one shape and three node types. What they share (the
-# round bound, the name counts) is `dup_defs_core::normal`'s.
-de-escalate:<functions>{has_effects,names_read,reads_of,names_read_count,operands}@*canon/src/normal.rs=per-language walk over its own AST
+# temporary, the operands of a `&&` chain, whether a block ends, the placeholder a rewrite leaves while
+# it moves a node — have one shape and four node types. What they share (the round bound, the name
+# counts) is `dup_defs_core::normal`'s.
+de-escalate:<functions>{has_effects,names_read,reads_of,names_read_count,operands,block_ends,placeholder}@*canon/src/normal.rs=per-language walk over its own AST
 de-escalate:<classes>{ScopeWalk,Subst}@*canon/src/normal.rs=per-language visitor over its own AST
 
-# The decisions frontends. One reading of propositions, three ASTs: the term a name stands for follows
+# The decisions frontends. One reading of propositions, four ASTs: the term a name stands for follows
 # each language's own binding rules, and the visitors that collect bindings, calls and reads walk its
 # own nodes. The atom grammar, the facts record and the typed-field chain are `dup_defs_core::decide`'s.
 de-escalate:<methods>Atoms::named@*canon/src/decides.rs=per-language binding rules
@@ -87,3 +88,11 @@ de-escalate:<methods>FileScope::module@*canon/src/decides.rs=thin per-crate gett
 de-escalate:<methods>Locals::*@*canon/src/decides.rs=per-language binding counter over its own AST
 de-escalate:<classes>Refs@*canon/src/decides.rs=per-language visitor over its own AST
 de-escalate:<classes>FileNames@*canon/src/defs.rs=per-language pair of the file's name tables
+de-escalate:<methods>{Atoms,Walk}::is_local@*go-canon/src/*=two walks of one frontend, each over its own binding fields
+
+# The per-file builder. The Go frontend's mirrors the Rust frontend's field for field — the bundle a
+# definition is pushed from, the lens site, the `Def` it becomes — over a different span: syn's
+# `Span` with the item's attributes there, a tree-sitter node here.
+de-escalate:<classes>{Builder,DefCanon}@*canon/src/defs.rs=per-language builder over its own span type
+de-escalate:<methods>Builder::{push,push_lens}@*canon/src/defs.rs=per-language builder over its own span type
+de-escalate:<methods>DefCanon::body@*canon/src/defs.rs=per-language builder over its own span type

@@ -97,6 +97,7 @@ struct Cli {
     ///   `py` — Python via `py-canon` (Ruff parser)
     ///   `ts` — TypeScript via `ts-canon` (oxc parser)
     ///   `rs` — Rust via `rs-canon` (syn parser)
+    ///   `go` — Go via `go-canon` (tree-sitter parser)
     /// Unknown codes exit non-zero. Useful in mixed-language repos where you only care about
     /// one frontend per CI job (`--only py`, `--only ts`), or when a frontend's parser is
     /// crashing on bad input and you need to scan around it.
@@ -443,8 +444,8 @@ fn main() {
     // Frontend registry — the binary is the composition root that knows every language; the
     // engine itself is frontend-agnostic. Bound to locals so the `&dyn Frontend` refs outlive
     // the whole run.
-    let (py, ts, rs) = (py_canon::Python, ts_canon::TypeScript, rs_canon::Rust);
-    let registry: Vec<&dyn Frontend> = vec![&py, &ts, &rs];
+    let (py, ts, rs, go) = (py_canon::Python, ts_canon::TypeScript, rs_canon::Rust, go_canon::Go);
+    let registry: Vec<&dyn Frontend> = vec![&py, &ts, &rs, &go];
     // `--only` selects a subset by language code. Unknown codes are an error (exit 2) rather
     // than a silent no-op — a typo'd `--only py,rs` should fail loud so a CI job that meant to
     // include Rust doesn't ship an empty report.
@@ -1363,6 +1364,17 @@ fn infer_directives(
         3,
         "de-escalate:*@*.{test,spec}.*=test files by .test.* / .spec.* naming",
         |n| format!("{n} clusters live entirely in `*.test.*` / `*.spec.*` files (jest/vitest/mocha)"),
+    ) {
+        out.push(s);
+    }
+    // Go keeps its tests beside the code they test, marked by the `_test.go` suffix alone — no test
+    // directory — so neither marker above sees them. Its own parallel directive, for the same reason.
+    if let Some(s) = build_suggestion(
+        findings,
+        |f| f.members.iter().all(|(p, _, _)| p.ends_with("_test.go")),
+        3,
+        "de-escalate:*@*_test.go=Go test files — table-test candidates",
+        |n| format!("{n} clusters live entirely in `*_test.go` files"),
     ) {
         out.push(s);
     }

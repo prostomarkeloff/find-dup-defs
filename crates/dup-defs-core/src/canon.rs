@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::Statement;
 
-/// The result of analyzing one callable. Identical across the three frontends — they differ only in
+/// The result of analyzing one callable. Identical across the frontends — they differ only in
 /// how they *produce* the fields.
 ///
 /// It was a bare 4-tuple, which is why `statements` did not exist: adding a fifth slot to an
@@ -71,6 +71,28 @@ impl AnalyzedFn {
             size,
         }
     }
+}
+
+/// A name or an operator as an s-expression canonical spells it: single-quoted, with `\\`, `'` and the
+/// three whitespace escapes escaped — `Path('_v0')`, `Bin(…, '==', …)`. The Rust and Go canonicals
+/// share one tag vocabulary, and the engine reads the quoted runs of both as identifiers, so they
+/// must quote alike.
+#[must_use]
+pub fn quoted(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Non-blank line count of a def's source text — the simplest "how big" metric the report surfaces.
