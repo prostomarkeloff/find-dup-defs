@@ -636,7 +636,7 @@ func real(x int) int { y := x + 1; return y * 2 }
     fn lenses_are_absent_unless_the_run_asks_for_them() {
         let src = "package p\nfunc F(x int) int {\n\tif x > 0 {\n\t\tg(x)\n\t}\n\treturn x\n}\n";
         assert!(scan(src).iter().all(|d| d.kind.id != "lenses"), "the default run stays byte-identical");
-        assert!(!lens_record(src, "F").is_empty());
+        assert_ne!(lens_record(src, "F"), Vec::<String>::new());
     }
 
     #[test]
