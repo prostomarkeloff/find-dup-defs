@@ -30,6 +30,7 @@ use dup_defs_core::{count_loc, Analysis, AnalyzedFn, CanonDialect, Def, Facets, 
 use tree_sitter::Node;
 
 use crate::canon::{analyze, file_imports, interface_canon, locals_of, reached_paths, scope_canonical, struct_canon, Callable};
+use crate::decides::{decides, FileScope};
 use crate::frontend::{CLASSES, CONSTANTS, FUNCTIONS, INTERFACES, METHODS, TYPE_ALIASES};
 use crate::ir::lower_func;
 use crate::tree::{field, fields, kids, parse, statements, text};
@@ -110,6 +111,15 @@ pub(crate) fn callable_of<'t>(decl: Node<'t>, src: &'t str) -> Option<Callable<'
     })
 }
 
+/// Whether the runtime calls a function rather than the code: a package's `init` and `main`, and the
+/// `go test` entry points — what such a function's parameters hold is the toolchain's to say.
+fn runtime_called(name: &str) -> bool {
+    matches!(name, "init" | "main")
+        || ["Test", "Benchmark", "Fuzz", "Example"].iter().any(|p| {
+            name.strip_prefix(p).is_some_and(|rest| rest.is_empty() || !rest.starts_with(char::is_lowercase))
+        })
+}
+
 /// The named type a receiver is declared on: `*Server[K]` → `Server`.
 fn receiver_type(ty: Node<'_>, src: &str) -> String {
     match ty.kind() {
@@ -148,6 +158,8 @@ struct Builder<'a> {
     lenses: Vec<Lens>,
     /// Names the file itself introduced — what every lens erases before it looks.
     file_names: HashSet<String>,
+    /// What the file's names stand for, as the decisions pass writes them.
+    decides: FileScope,
     out: Vec<Def>,
 }
 
@@ -190,8 +202,9 @@ impl Builder<'_> {
         });
     }
 
-    /// A function or method: canonical forms, statement stream, and the packages it reaches.
-    fn callable(&mut self, kind: &'static KindSpec, name: String, own_name: &str, decl: Node<'_>, c: &Callable<'_>) {
+    /// A function or method: canonical forms, statement stream, the packages it reaches, and what it
+    /// decides on. `open` — reached by calls the corpus cannot show (see [`decides`]).
+    fn callable(&mut self, kind: &'static KindSpec, name: String, own_name: &str, decl: Node<'_>, c: &Callable<'_>, open: bool) {
         if is_trivial(c.body, self.source) {
             return;
         }
@@ -202,6 +215,7 @@ impl Builder<'_> {
             let facts = crate::lenses::callable_facts(c, self.source, &self.imports, &locals, &self.file_names, scope);
             self.push_lens(&name, decl, &facts);
         }
+        let read = decides(&func, &self.decides, open);
         let AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, type_refs, type3_units, statements, size } =
             analyze(&self.imports, own_name, &func);
         let canon = DefCanon {
@@ -217,7 +231,12 @@ impl Builder<'_> {
             facets: Facets {
                 statements,
                 reaches: reached_paths(c.body, self.source, &self.imports),
-                ..Facets::default()
+                decides: read.atoms,
+                identity: Some(self.decides.identity(&name)),
+                params: read.params,
+                calls: read.calls,
+                mentions: read.mentions,
+                loose_keywords: read.loose,
             },
         };
         self.push(kind, name, decl, count_args(c.params), canon);
@@ -226,7 +245,7 @@ impl Builder<'_> {
     fn function(&mut self, decl: Node<'_>) {
         let Some(c) = callable_of(decl, self.source) else { return };
         let Some(name) = field(decl, "name").map(|n| text(n, self.source)) else { return };
-        self.callable(&FUNCTIONS, name.to_owned(), name, decl, &c);
+        self.callable(&FUNCTIONS, name.to_owned(), name, decl, &c, runtime_called(name));
     }
 
     fn method(&mut self, decl: Node<'_>) {
@@ -236,7 +255,8 @@ impl Builder<'_> {
             .and_then(|list| kids(list).into_iter().next())
             .and_then(|r| field(r, "type"))
             .map_or_else(|| "<ty>".to_owned(), |t| receiver_type(t, self.source));
-        self.callable(&METHODS, format!("{owner}.{name}"), name, decl, &c);
+        // A method is dispatched through every interface its type satisfies: no call names it alone.
+        self.callable(&METHODS, format!("{owner}.{name}"), name, decl, &c, true);
     }
 
     /// `type` declarations. A declaration of one spec reports its whole text, `type` keyword
@@ -255,13 +275,21 @@ impl Builder<'_> {
                 self.push_lens(name, span, &facts);
             }
             let (kind, canon) = match (spec.kind(), ty.kind()) {
-                ("type_spec", "struct_type") => (&CLASSES, Some(struct_canon(self.source, name, type_params, ty))),
-                ("type_spec", "interface_type") => {
-                    (&INTERFACES, Some(interface_canon(self.source, name, type_params, ty)))
+                ("type_spec", "struct_type") => {
+                    let mut canon = DefCanon::body(Some(struct_canon(self.source, name, type_params, ty)));
+                    // A struct is a record: its literal is a constructor, called with its fields.
+                    canon.facets.identity = Some(self.decides.identity(name));
+                    if let Some(fields) = self.decides.record(name) {
+                        canon.facets.params = fields.iter().map(|(f, _)| Arc::from(f.as_str())).collect();
+                    }
+                    (&CLASSES, canon)
                 }
-                _ => (&TYPE_ALIASES, None),
+                ("type_spec", "interface_type") => {
+                    (&INTERFACES, DefCanon::body(Some(interface_canon(self.source, name, type_params, ty))))
+                }
+                _ => (&TYPE_ALIASES, DefCanon::body(None)),
             };
-            self.push(kind, name.to_owned(), span, 0, DefCanon::body(canon));
+            self.push(kind, name.to_owned(), span, 0, canon);
         }
     }
 
@@ -297,15 +325,18 @@ pub fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec<Def> {
     // Every lens reads the file's own names, so they are collected once per file — and only when asked.
     let file_names =
         if lenses.is_empty() { HashSet::new() } else { crate::lenses::file_bound_names(root, source) };
+    let imports = file_imports(root, source);
     let mut b = Builder {
         source,
         lines: &lines,
         file,
-        imports: file_imports(root, source),
+        imports: HashMap::new(),
         lenses,
         file_names,
+        decides: FileScope::new(file, root, source, &imports),
         out: Vec::new(),
     };
+    b.imports = imports;
     for item in kids(root) {
         if item.has_error() {
             continue;

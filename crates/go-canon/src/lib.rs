@@ -5,6 +5,7 @@
 //! s-expr canonical precomputed off the syntax tree.
 
 mod canon;
+mod decides;
 mod defs;
 mod frontend;
 mod ir;
