@@ -1614,8 +1614,18 @@ fn default_package_name(path: &str) -> String {
     name.replace(['-', '.'], "_")
 }
 
+/// The packages Go spells its built-in types' methods with. `strings.HasPrefix(s, p)` is the
+/// `s.startswith(p)` of Python and the `s.starts_with(p)` of Rust, and neither of those reaches a
+/// module: calling one is speaking the language, not turning to a subject. Reported as reached, they
+/// made `strings` and `fmt` the subject two unrelated functions meet on — measured over fifty
+/// libraries, a pair whose only anchor was such a subject was noise seventeen times in eighteen.
+const VOCABULARY: &[&str] = &[
+    "bytes", "cmp", "errors", "fmt", "maps", "math.bits", "reflect", "slices", "sort", "strconv", "strings", "unicode",
+    "unicode.utf16", "unicode.utf8",
+];
+
 /// The dotted paths one callable reaches: every package it names through a selector or a qualified
-/// type, resolved through the file's imports.
+/// type, resolved through the file's imports — save the language's own [`VOCABULARY`].
 ///
 /// Not filtered by boundness, as in the Rust frontend: a local shadowing a package inside one
 /// function is rare, and reading the shadow as "this definition does not reach that package" is a
@@ -1627,7 +1637,7 @@ pub(crate) fn reached_paths(body: Node<'_>, src: &str, imports: &HashMap<String,
             "qualified_type" => field(n, "package"),
             _ => None,
         };
-        if let Some(path) = head.and_then(|h| imports.get(text(h, src))) {
+        if let Some(path) = head.and_then(|h| imports.get(text(h, src))).filter(|p| !VOCABULARY.contains(&&***p)) {
             out.push(Arc::clone(path));
         }
         for k in kids(n) {

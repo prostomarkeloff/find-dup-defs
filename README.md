@@ -271,8 +271,9 @@ clusters in the first place:
   `todo!` / `unimplemented!` / `panic!` / `unreachable!` stubs; and `#[cfg(...)]`-gated same-name
   siblings (`#[cfg(unix)] fn x` + `#[cfg(windows)] fn x`) collapse to one logical item.
 - **Go** — bodies that only `return` names and literals (`return nil`, `return 0, nil`) or only
-  `panic(…)`; files that declare themselves generated (`// Code generated … DO NOT EDIT.` before the
-  `package` clause) contribute nothing; and a name two build alternatives of one package declare
+  `panic(…)`; files that declare themselves generated (a comment saying `DO NOT EDIT` before the
+  `package` clause — the one-line `// Code generated … DO NOT EDIT.`, or an older generator's
+  warning on a line of its own) contribute nothing; and a name two build alternatives of one package declare
   (`binding.go` under `//go:build !nomsgpack`, `binding_nomsgpack.go` under `nomsgpack`, or a
   `_windows.go` beside a `_linux.go`) is one definition, as Rust's `cfg` siblings are.
 
@@ -776,6 +777,14 @@ What such a pair does share is a **subject**: both reach the same module. Import
 own declaration of what a definition is about, so the frontend resolves the dotted path each name it
 uses stands for, and the engine takes prefixes of it — which is how *imported the module* and
 *imported a member of it* are made to meet, instead of failing to meet as strings.
+
+Go needs one exception. It spells the methods other languages hang on built-in types as package
+functions — `strings.HasPrefix(s, p)` is Python's `s.startswith(p)` — so `strings`, `bytes`,
+`strconv`, `fmt`, `errors`, `reflect`, `sort` / `slices` / `maps` / `cmp`, `math/bits` and `unicode`
+are not reported as reached: calling one is speaking the language, not turning to a subject. Over
+fifty Go libraries, a pair whose only anchor was such a package was noise seventeen times in
+eighteen; leaving them out cut the pairs anchored on a subject alone from 589 to 469 across the
+libraries' top fifties, with the decisions and name passes byte-identical.
 
 | anchor | agreement | divergence | reads as |
 |---|---|---|---|
