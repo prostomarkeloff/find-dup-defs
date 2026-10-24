@@ -28,7 +28,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use dup_defs_core::uses::{site_ctx, Construct, Site, Within};
-use dup_defs_core::{Statement, UNFILED};
+use dup_defs_core::{quoted, Statement, UNFILED};
 
 use syn::punctuated::Punctuated;
 use syn::{
@@ -296,7 +296,7 @@ impl<'a> Dump<'a> {
         if self.named_path(name) == "_t0" {
             return "_t0".to_owned();
         }
-        let Some(tmap) = self.tmap.as_mut() else { return Self::lit(name) };
+        let Some(tmap) = self.tmap.as_mut() else { return quoted(name) };
         if !self.declared_types.contains(name) {
             self.type_refs.push(name.to_owned());
         }
@@ -327,23 +327,6 @@ impl<'a> Dump<'a> {
         self.node(tag, &[joined])
     }
 
-    fn lit(s: &str) -> String {
-        let mut out = String::with_capacity(s.len() + 2);
-        out.push('\'');
-        for c in s.chars() {
-            match c {
-                '\\' => out.push_str("\\\\"),
-                '\'' => out.push_str("\\'"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c => out.push(c),
-            }
-        }
-        out.push('\'');
-        out
-    }
-
     // ────── callables ──────
 
     /// `is_top` blanks the def's own name in xname mode. Receiver (`self`) params are skipped.
@@ -363,7 +346,7 @@ impl<'a> Dump<'a> {
             u8::from(sig.constness.is_some()),
         );
         let body = body.map_or_else(String::new, |b| self.block(b));
-        self.node("Func", &[Self::lit(&name), params, output, Self::lit(&flags), body])
+        self.node("Func", &[quoted(&name), params, output, quoted(&flags), body])
     }
 
     /// Parameter patterns, with the `self` receiver dropped so methods align with free fns.
@@ -494,17 +477,17 @@ impl<'a> Dump<'a> {
                 let s = path_str(&p.path);
                 let named = self.named_path(&s);
                 let renamed = if named == s { self.rename(&s) } else { named };
-                self.node("Path", &[Self::lit(&renamed)])
+                self.node("Path", &[quoted(&renamed)])
             }
             Expr::Lit(l) => self.lit_expr(&l.lit),
             Expr::Binary(b) => {
                 let l = self.expr(&b.left);
                 let r = self.expr(&b.right);
-                self.node("Bin", &[l, Self::lit(binop_str(&b.op)), r])
+                self.node("Bin", &[l, quoted(binop_str(&b.op)), r])
             }
             Expr::Unary(u) => {
                 let e = self.expr(&u.expr);
-                self.node("Unary", &[Self::lit(unop_str(&u.op)), e])
+                self.node("Unary", &[quoted(unop_str(&u.op)), e])
             }
             Expr::Assign(a) => {
                 let l = self.expr(&a.left);
@@ -539,9 +522,9 @@ impl<'a> Dump<'a> {
                             })
                             .collect();
                         let turbofish = self.list("Turbofish", types);
-                        self.node("Method", &[recv, Self::lit(&method), joined, turbofish])
+                        self.node("Method", &[recv, quoted(&method), joined, turbofish])
                     }
-                    None => self.node("Method", &[recv, Self::lit(&method), joined]),
+                    None => self.node("Method", &[recv, quoted(&method), joined]),
                 }
             }
             Expr::Field(f) => {
@@ -550,7 +533,7 @@ impl<'a> Dump<'a> {
                     Member::Named(id) => id.to_string(),
                     Member::Unnamed(idx) => idx.index.to_string(),
                 };
-                self.node("Field", &[base, Self::lit(&member)])
+                self.node("Field", &[base, quoted(&member)])
             }
             Expr::Index(i) => {
                 let base = self.expr(&i.expr);
@@ -626,7 +609,7 @@ impl<'a> Dump<'a> {
             Expr::Reference(r) => {
                 let e = self.expr(&r.expr);
                 let m = if r.mutability.is_some() { "mut" } else { "" };
-                self.node("Ref", &[Self::lit(m), e])
+                self.node("Ref", &[quoted(m), e])
             }
             Expr::Try(t) => {
                 let e = self.expr(&t.expr);
@@ -675,12 +658,12 @@ impl<'a> Dump<'a> {
                         };
                         let member = if on_anchor { format!("#{member}#") } else { member };
                         let v = self.expr(&f.expr);
-                        self.node("FieldVal", &[Self::lit(&member), v])
+                        self.node("FieldVal", &[quoted(&member), v])
                     })
                     .collect();
                 let joined = fields.join(", ");
                 let rest = s.rest.as_ref().map_or_else(String::new, |e| self.expr(e));
-                self.node("StructLit", &[Self::lit(&path), joined, rest])
+                self.node("StructLit", &[quoted(&path), joined, rest])
             }
             Expr::Closure(c) => {
                 let params: Vec<String> = c.inputs.iter().map(|p| self.pat(p)).collect();
@@ -703,7 +686,7 @@ impl<'a> Dump<'a> {
     /// arguments, and these are calls in all but syntax. A body that does not parse as expressions
     /// (`vec![x; n]`, a DSL) stays opaque, as it was.
     fn macro_call(&mut self, tag: &str, mac: &syn::Macro) -> String {
-        let path = Self::lit(&path_str(&mac.path));
+        let path = quoted(&path_str(&mac.path));
         match mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) {
             Ok(args) => {
                 let args: Vec<String> = args.iter().map(|a| self.expr(a)).collect();
@@ -725,7 +708,7 @@ impl<'a> Dump<'a> {
             Lit::Bool(b) => ("Bool", b.value.to_string()),
             _ => ("Lit", String::new()),
         };
-        self.node(tag, &[Self::lit(&val)])
+        self.node(tag, &[quoted(&val)])
     }
 
     // ────── patterns ──────
@@ -734,7 +717,7 @@ impl<'a> Dump<'a> {
         match pat {
             Pat::Ident(pi) => {
                 let n = self.rename(&pi.ident.to_string());
-                self.node("Bind", &[Self::lit(&n)])
+                self.node("Bind", &[quoted(&n)])
             }
             Pat::Wild(_) => self.node("Wild", &[]),
             Pat::Rest(_) => self.node("Rest", &[]),
@@ -742,7 +725,7 @@ impl<'a> Dump<'a> {
             Pat::Path(p) => {
                 let s = path_str(&p.path);
                 let s = self.named_path(&s);
-                self.node("PatPath", &[Self::lit(&s)])
+                self.node("PatPath", &[quoted(&s)])
             }
             Pat::Reference(r) => {
                 let inner = self.pat(&r.pat);
@@ -757,7 +740,7 @@ impl<'a> Dump<'a> {
                 let path = self.named_path(&path);
                 let items: Vec<String> = ts.elems.iter().map(|p| self.pat(p)).collect();
                 let joined = items.join(", ");
-                self.node("PatTupleStruct", &[Self::lit(&path), joined])
+                self.node("PatTupleStruct", &[quoted(&path), joined])
             }
             Pat::Struct(s) => {
                 let path = path_str(&s.path);
@@ -771,11 +754,11 @@ impl<'a> Dump<'a> {
                             Member::Unnamed(idx) => idx.index.to_string(),
                         };
                         let p = self.pat(&f.pat);
-                        self.node("PatField", &[Self::lit(&member), p])
+                        self.node("PatField", &[quoted(&member), p])
                     })
                     .collect();
                 let joined = fields.join(", ");
-                self.node("PatStruct", &[Self::lit(&path), joined])
+                self.node("PatStruct", &[quoted(&path), joined])
             }
             Pat::Slice(s) => {
                 let items: Vec<String> = s.elems.iter().map(|p| self.pat(p)).collect();
@@ -805,7 +788,7 @@ impl<'a> Dump<'a> {
                 // the Type-3 lines, where they are slots.
                 let Some(seg) = p.path.segments.last() else { return self.node("Ty", &[]) };
                 let name =
-                    if self.tmap.is_some() { self.type_ref(&path_str(&p.path)) } else { Self::lit(&seg.ident.to_string()) };
+                    if self.tmap.is_some() { self.type_ref(&path_str(&p.path)) } else { quoted(&seg.ident.to_string()) };
                 let args = match &seg.arguments {
                     syn::PathArguments::AngleBracketed(ab) => {
                         let items: Vec<String> = ab
@@ -825,7 +808,7 @@ impl<'a> Dump<'a> {
             Type::Reference(r) => {
                 let inner = self.ty(&r.elem);
                 let m = if r.mutability.is_some() { "mut" } else { "" };
-                self.node("TyRef", &[Self::lit(m), inner])
+                self.node("TyRef", &[quoted(m), inner])
             }
             Type::Slice(s) => {
                 let inner = self.ty(&s.elem);
@@ -980,7 +963,7 @@ fn generics_tag(g: &Generics) -> String {
 pub fn struct_canon(item: &ItemStruct) -> String {
     let mut d = Dump::new(None);
     let fields = fields_canon(&mut d, &item.fields);
-    d.node("Struct", &[Dump::lit(&item.ident.to_string()), generics_tag(&item.generics), fields])
+    d.node("Struct", &[quoted(&item.ident.to_string()), generics_tag(&item.generics), fields])
 }
 
 #[must_use]
@@ -991,11 +974,11 @@ pub fn enum_canon(item: &ItemEnum) -> String {
         .iter()
         .map(|v| {
             let f = fields_canon(&mut d, &v.fields);
-            d.node("Variant", &[Dump::lit(&v.ident.to_string()), f])
+            d.node("Variant", &[quoted(&v.ident.to_string()), f])
         })
         .collect();
     let joined = variants.join(", ");
-    d.node("Enum", &[Dump::lit(&item.ident.to_string()), generics_tag(&item.generics), joined])
+    d.node("Enum", &[quoted(&item.ident.to_string()), generics_tag(&item.generics), joined])
 }
 
 #[must_use]
@@ -1008,11 +991,11 @@ pub fn union_canon(item: &ItemUnion) -> String {
         .map(|f| {
             let name = f.ident.as_ref().map_or_else(String::new, ToString::to_string);
             let ty = d.ty(&f.ty);
-            d.node("Field", &[Dump::lit(&name), ty])
+            d.node("Field", &[quoted(&name), ty])
         })
         .collect();
     let joined = items.join(", ");
-    d.node("Union", &[Dump::lit(&item.ident.to_string()), joined])
+    d.node("Union", &[quoted(&item.ident.to_string()), joined])
 }
 
 fn fields_canon(d: &mut Dump<'_>, fields: &syn::Fields) -> String {
@@ -1024,7 +1007,7 @@ fn fields_canon(d: &mut Dump<'_>, fields: &syn::Fields) -> String {
                 .map(|f| {
                     let name = f.ident.as_ref().map_or_else(String::new, ToString::to_string);
                     let ty = d.ty(&f.ty);
-                    d.node("Field", &[Dump::lit(&name), ty])
+                    d.node("Field", &[quoted(&name), ty])
                 })
                 .collect();
             d.list("Named", items)
@@ -1049,18 +1032,18 @@ pub fn trait_canon(item: &ItemTrait) -> String {
             TraitItem::Fn(f) => {
                 let params = d.params(&f.sig);
                 let output = d.ret_type(&f.sig.output);
-                d.node("TraitFn", &[Dump::lit(&f.sig.ident.to_string()), params, output])
+                d.node("TraitFn", &[quoted(&f.sig.ident.to_string()), params, output])
             }
             TraitItem::Const(c) => {
                 let ty = d.ty(&c.ty);
-                d.node("TraitConst", &[Dump::lit(&c.ident.to_string()), ty])
+                d.node("TraitConst", &[quoted(&c.ident.to_string()), ty])
             }
-            TraitItem::Type(t) => d.node("TraitType", &[Dump::lit(&t.ident.to_string())]),
+            TraitItem::Type(t) => d.node("TraitType", &[quoted(&t.ident.to_string())]),
             _ => d.node("TraitOther", &[]),
         })
         .collect();
     let joined = items.join(", ");
-    d.node("Trait", &[Dump::lit(&item.ident.to_string()), generics_tag(&item.generics), joined])
+    d.node("Trait", &[quoted(&item.ident.to_string()), generics_tag(&item.generics), joined])
 }
 
 // ───────────────────────────── callable analysis ─────────────────────────────

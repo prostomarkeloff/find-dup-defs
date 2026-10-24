@@ -3931,7 +3931,7 @@ mod tests {
 
     #[test]
     fn a_spliced_body_aligns_like_a_list() {
-        // Rust and TypeScript splice a body's statements as `Block`'s children. One statement more in
+        // Rust, TypeScript and Go splice a body's statements as `Block`'s children. One statement more in
         // the middle is one hole; read field by field, everything after it would be.
         let a = parse_term("Block(ExprStmt(Call(Path('log'))), ExprStmt(Call(Path('save'))), Tail(Path('_v0')))");
         let b = parse_term("Block(ExprStmt(Call(Path('log'))), Tail(Path('_v0')))");

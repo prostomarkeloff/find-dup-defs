@@ -140,7 +140,7 @@ fn is_slot(token: &str) -> bool {
 /// grammar.
 ///
 /// 🔴 This has to be dialect-aware, and getting it wrong is silent. Python's canonical is source-like:
-/// identifiers are bare and quoted runs are strings. The Rust and TypeScript canonicals are s-expr
+/// identifiers are bare and quoted runs are strings. The Rust, TypeScript and Go canonicals are s-expr
 /// dumps where it is the other way round — `Let(Bind('_v1'), Call(Path('open_session'), Path('_v0')))`
 /// — so the bare words are AST node tags and the identifiers live inside the quotes.
 ///

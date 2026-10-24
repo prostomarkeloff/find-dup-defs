@@ -78,6 +78,19 @@ const LOCAL_SPLIT: char = '~';
 /// Marks a path the frontend knows to name a value; see [`value_path`].
 const VALUE: &str = "@=";
 
+/// `head` with `rest` read off it, dotted: `a.b` and `["c"]` → `a.b.c`. An empty head is the root.
+#[must_use]
+pub fn dotted(head: &str, rest: &[&str]) -> String {
+    let mut out = head.to_owned();
+    for attr in rest {
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(attr);
+    }
+    out
+}
+
 /// A field reached from a hole: `_.a.b`.
 #[must_use]
 pub fn field(attrs: &[&str]) -> String {

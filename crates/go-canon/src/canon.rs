@@ -34,7 +34,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use dup_defs_core::uses::{site_ctx, Construct, Site, Within};
-use dup_defs_core::{AnalyzedFn, Statement, UNFILED};
+use dup_defs_core::{quoted, AnalyzedFn, Statement, UNFILED};
 use tree_sitter::Node;
 
 use crate::ir::{
@@ -416,23 +416,6 @@ impl<'a> Dump<'a> {
         self.node(tag, &[joined])
     }
 
-    pub(crate) fn lit(s: &str) -> String {
-        let mut out = String::with_capacity(s.len() + 2);
-        out.push('\'');
-        for c in s.chars() {
-            match c {
-                '\\' => out.push_str("\\\\"),
-                '\'' => out.push_str("\\'"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                c => out.push(c),
-            }
-        }
-        out.push('\'');
-        out
-    }
-
     /// A type's name: its `_T{n}` slot while writing the Type-3 lines (reported apart unless the
     /// definition declared it), as spelled otherwise.
     ///
@@ -446,7 +429,7 @@ impl<'a> Dump<'a> {
         if self.mention(bare) {
             return "_t0".to_owned();
         }
-        let Some(tmap) = self.tmap.as_mut() else { return Self::lit(name) };
+        let Some(tmap) = self.tmap.as_mut() else { return quoted(name) };
         if !self.declared_types.contains(name) {
             self.type_refs.push(name.to_owned());
         }
@@ -459,7 +442,7 @@ impl<'a> Dump<'a> {
             return self.node("Wild", &[]);
         }
         let renamed = self.rename(name);
-        self.node("Bind", &[Self::lit(&renamed)])
+        self.node("Bind", &[quoted(&renamed)])
     }
 
     /// A name read as a value.
@@ -468,13 +451,13 @@ impl<'a> Dump<'a> {
             return self.node("Wild", &[]);
         }
         if self.receiver == Some(name) {
-            return self.node("Path", &[Self::lit("self")]);
+            return self.node("Path", &[quoted("self")]);
         }
         if !self.bound.contains(name) && self.mention(name) {
-            return self.node("Path", &[Self::lit("_t0")]);
+            return self.node("Path", &[quoted("_t0")]);
         }
         let renamed = self.rename(name);
-        self.node("Path", &[Self::lit(&renamed)])
+        self.node("Path", &[quoted(&renamed)])
     }
 
     // ────── callables ──────
@@ -490,7 +473,7 @@ impl<'a> Dump<'a> {
         let params = self.params(&f.params, "Params");
         let results = self.results(&f.results);
         let body = if with_body { self.block(&f.body) } else { String::new() };
-        self.node("Func", &[Self::lit(&name), params, results, body])
+        self.node("Func", &[quoted(&name), params, results, body])
     }
 
     /// A parameter list, one `Param` per name — `a, b int` is two parameters of one type.
@@ -643,7 +626,7 @@ impl<'a> Dump<'a> {
                 if op == "=" {
                     self.node("Assign", &[left, right])
                 } else {
-                    self.node("Bin", &[left, Self::lit(op), right])
+                    self.node("Bin", &[left, quoted(op), right])
                 }
             }
             Stmt::IncDec { inc, target } => {
@@ -674,7 +657,7 @@ impl<'a> Dump<'a> {
                     Jump::Continue => "Continue",
                     Jump::Goto => "Goto",
                 };
-                let label = label.as_deref().map_or_else(String::new, Self::lit);
+                let label = label.as_deref().map_or_else(String::new, quoted);
                 self.node(tag, &[label])
             }
             Stmt::Fallthrough => self.node("Fallthrough", &[]),
@@ -776,7 +759,7 @@ impl<'a> Dump<'a> {
                 self.node("BlockExpr", &[body])
             }
             Stmt::Labeled { label, stmt } => {
-                let label = Self::lit(label);
+                let label = quoted(label);
                 let inner = self.stmt(stmt);
                 self.node("Labeled", &[label, inner])
             }
@@ -904,21 +887,21 @@ impl<'a> Dump<'a> {
     fn expr_inner(&mut self, e: &Expr) -> String {
         match e {
             Expr::Name(name) => self.ident(name),
-            Expr::Bool(b) => self.node("Bool", &[Self::lit(if *b { "true" } else { "false" })]),
+            Expr::Bool(b) => self.node("Bool", &[quoted(if *b { "true" } else { "false" })]),
             Expr::Nil => self.node("Nil", &[]),
             Expr::Iota => self.node("Iota", &[]),
-            Expr::Lit(tag, text) => self.node(tag, &[Self::lit(text)]),
+            Expr::Lit(tag, text) => self.node(tag, &[quoted(text)]),
             Expr::Binary { op, l, r } => {
                 let l = self.expr(l);
                 let r = self.expr(r);
-                self.node("Bin", &[l, Self::lit(op), r])
+                self.node("Bin", &[l, quoted(op), r])
             }
             Expr::Unary { op, e } => {
                 let inner = self.expr(e);
                 match op.as_str() {
                     "&" => self.node("Ref", &[inner]),
                     "<-" => self.node("Recv", &[inner]),
-                    op => self.node("Unary", &[Self::lit(op), inner]),
+                    op => self.node("Unary", &[quoted(op), inner]),
                 }
             }
             Expr::Paren(inner) => self.expr(inner),
@@ -926,10 +909,10 @@ impl<'a> Dump<'a> {
             Expr::Selector { operand, field } => {
                 if let Some(pkg) = self.package_of(operand) {
                     let path = if self.mention(field) { "_t0".to_owned() } else { format!("{pkg}.{field}") };
-                    return self.node("Path", &[Self::lit(&path)]);
+                    return self.node("Path", &[quoted(&path)]);
                 }
                 let base = self.expr(operand);
-                self.node("Field", &[base, Self::lit(field)])
+                self.node("Field", &[base, quoted(field)])
             }
             Expr::Index { e, i } => {
                 let base = self.expr(e);
@@ -997,7 +980,7 @@ impl<'a> Dump<'a> {
                 if self.known.is_some() {
                     self.calls.insert(format!(".{field}"));
                 }
-                return self.node("Method", &[recv, Self::lit(field), args]);
+                return self.node("Method", &[recv, quoted(field), args]);
             }
         }
         let callee = self.expr(f);
@@ -1013,7 +996,7 @@ impl<'a> Dump<'a> {
             .iter()
             .map(|el| match el {
                 Elem::Field(name, value) => {
-                    let key = if on_anchor { Self::lit(&format!("#{name}#")) } else { Self::lit(name) };
+                    let key = if on_anchor { quoted(&format!("#{name}#")) } else { quoted(name) };
                     let value = self.expr(value);
                     self.node("FieldVal", &[key, value])
                 }
@@ -1066,7 +1049,7 @@ impl<'a> Dump<'a> {
             }
             Type::Chan(dir, v) => {
                 let v = self.ty(v);
-                self.node("TyChan", &[Self::lit(dir), v])
+                self.node("TyChan", &[quoted(dir), v])
             }
             Type::Func(params, results) => {
                 let params = self.params(params, "Params");
@@ -1137,7 +1120,7 @@ fn struct_fields(d: &mut Dump<'_>, fields: &[FieldDecl]) -> String {
             continue;
         }
         for name in &decl.names {
-            let name = Dump::lit(name);
+            let name = quoted(name);
             items.push(d.node("Field", &[name, ty.clone()]));
         }
     }
@@ -1150,7 +1133,7 @@ fn interface_items(d: &mut Dump<'_>, items: &[IfaceItem]) -> String {
         .iter()
         .map(|item| match item {
             IfaceItem::Method { name, params, results } => {
-                let name = Dump::lit(name);
+                let name = quoted(name);
                 let params = d.params(params, "Params");
                 let results = d.results(results);
                 d.node("IfaceFn", &[name, params, results])
@@ -1177,7 +1160,7 @@ pub(crate) fn struct_canon(src: &str, name: &str, type_params: Option<Node<'_>>,
     let (imports, bound) = (HashMap::new(), HashSet::new());
     let mut d = Dump::new(&imports, &bound, None, None);
     let fields = struct_fields(&mut d, &lower_fields(struct_type, src));
-    d.node("Struct", &[Dump::lit(name), generics_tag(type_params), fields])
+    d.node("Struct", &[quoted(name), generics_tag(type_params), fields])
 }
 
 /// Names-preserved structural canonical of a `type X interface { … }` — the cluster pass's input for
@@ -1187,7 +1170,7 @@ pub(crate) fn interface_canon(src: &str, name: &str, type_params: Option<Node<'_
     let (imports, bound) = (HashMap::new(), HashSet::new());
     let mut d = Dump::new(&imports, &bound, None, None);
     let items = interface_items(&mut d, &lower_iface(iface, src));
-    d.node("Interface", &[Dump::lit(name), generics_tag(type_params), items])
+    d.node("Interface", &[quoted(name), generics_tag(type_params), items])
 }
 
 // ───────────────────────────── callable analysis ─────────────────────────────

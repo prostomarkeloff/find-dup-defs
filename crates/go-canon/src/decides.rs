@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use dup_defs_core::decide::{self, DecisionFacts};
+use dup_defs_core::decide::{self, dotted, DecisionFacts};
 use tree_sitter::Node;
 
 use crate::canon::{for_each_child, Child};
@@ -61,17 +61,6 @@ const PREDICATE_FUNCS: &[(&str, &str)] = &[
     ("bytes", "ContainsFunc"),
     ("bytes", "IndexFunc"),
 ];
-
-fn dotted(head: &str, rest: &[&str]) -> String {
-    let mut out = head.to_owned();
-    for attr in rest {
-        if !out.is_empty() {
-            out.push('.');
-        }
-        out.push_str(attr);
-    }
-    out
-}
 
 fn normal_segments(p: &Path) -> Vec<String> {
     p.components()
