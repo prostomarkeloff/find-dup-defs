@@ -9,6 +9,35 @@ use std::collections::{HashMap, HashSet};
 /// guards against a rule pair that would disagree.
 pub const MAX_ROUNDS: usize = 12;
 
+/// The ordering a comparison's negation is: `!(a < b)` is `a >= b`. `None` for any other operator.
+///
+/// The form is compared, never run, so a NaN's opinion of `!(a < b)` does not enter into it.
+#[must_use]
+pub fn complement(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "<" => ">=",
+        ">=" => "<",
+        ">" => "<=",
+        "<=" => ">",
+        _ => return None,
+    })
+}
+
+/// The operator a comparison becomes with its operands swapped: `a < b` is `b > a`; `==` and `!=` are
+/// their own mirrors. `None` for an operator that has none.
+#[must_use]
+pub fn mirror(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "==" => "==",
+        "!=" => "!=",
+        "<" => ">",
+        ">" => "<",
+        "<=" => ">=",
+        ">=" => "<=",
+        _ => return None,
+    })
+}
+
 /// What a definition binds and reads, counted once per round of the rewrite.
 #[derive(Default)]
 pub struct Scope {

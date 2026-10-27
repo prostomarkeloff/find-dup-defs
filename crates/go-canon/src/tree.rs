@@ -29,22 +29,7 @@ pub(crate) fn parse(src: &str) -> Option<Tree> {
     })
 }
 
-/// The named children of `n`, comments dropped.
-pub(crate) fn kids(n: Node<'_>) -> Vec<Node<'_>> {
-    let mut cursor = n.walk();
-    n.named_children(&mut cursor).filter(|k| k.kind() != "comment").collect()
-}
-
-/// The child stored under a grammar field.
-pub(crate) fn field<'t>(n: Node<'t>, name: &str) -> Option<Node<'t>> {
-    n.child_by_field_name(name)
-}
-
-/// Every named child stored under a grammar field (`name` repeats in `a, b int`).
-pub(crate) fn fields<'t>(n: Node<'t>, name: &str) -> Vec<Node<'t>> {
-    let mut cursor = n.walk();
-    n.children_by_field_name(name, &mut cursor).filter(|k| k.is_named() && k.kind() != "comment").collect()
-}
+pub(crate) use dup_defs_core::tree::{field, fields, kids, text, unquote};
 
 /// Whether `n` holds an anonymous token spelled `tok` — how the grammar tells `for k := range` from
 /// `for k = range`, and `case v := <-ch` from `case v = <-ch`: the operator is not a field.
@@ -52,11 +37,6 @@ pub(crate) fn has_token(n: Node<'_>, tok: &str) -> bool {
     let mut cursor = n.walk();
     let found = n.children(&mut cursor).any(|k| !k.is_named() && k.kind() == tok);
     found
-}
-
-/// The source text a node spans.
-pub(crate) fn text<'s>(n: Node<'_>, src: &'s str) -> &'s str {
-    src.get(n.start_byte()..n.end_byte()).unwrap_or("")
 }
 
 /// The statements a block or a `case` clause holds — through its `statement_list` — with empty
@@ -68,13 +48,4 @@ pub(crate) fn statements(n: Node<'_>) -> Vec<Node<'_>> {
         .flat_map(kids)
         .filter(|k| k.kind() != "empty_statement")
         .collect()
-}
-
-/// A literal's contents without its delimiters (`"a"` → `a`, `` `a` `` → `a`, `'a'` → `a`).
-pub(crate) fn unquote(s: &str) -> &str {
-    let mut chars = s.chars();
-    match (chars.next(), chars.next_back()) {
-        (Some(open @ ('"' | '`' | '\'')), Some(close)) if open == close && s.len() >= 2 => &s[1..s.len() - 1],
-        _ => s,
-    }
 }

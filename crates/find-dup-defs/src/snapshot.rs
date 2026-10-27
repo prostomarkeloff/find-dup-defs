@@ -54,6 +54,7 @@ fn dialect_tag(d: CanonDialect) -> &'static str {
         CanonDialect::CPythonAst => "cpython_ast",
         CanonDialect::Rust => "rust",
         CanonDialect::Go => "go",
+        CanonDialect::C => "c",
         _ => "", // `Other` and any future not-yet-serialized dialect
     }
 }
@@ -64,6 +65,7 @@ fn dialect_from(tag: &str, legacy_cpython_ast: bool) -> CanonDialect {
         "cpython_ast" => CanonDialect::CPythonAst,
         "rust" => CanonDialect::Rust,
         "go" => CanonDialect::Go,
+        "c" => CanonDialect::C,
         "" if legacy_cpython_ast => CanonDialect::CPythonAst,
         _ => CanonDialect::Other,
     }

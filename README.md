@@ -20,8 +20,8 @@ becomes the default.
 **find-dup-defs is the gate that catches it.**
 
 - 🔍 Clusters duplicate and near-duplicate **definitions** — functions, methods, classes,
-  constants, `type` aliases, TS and Go interfaces, Rust traits — across **Python, TypeScript, Rust
-  and Go**.
+  constants, `type` aliases, TS and Go interfaces, Rust traits, C method tables — across **Python,
+  TypeScript, Rust, Go and C**.
 - 🧬 Matches through **renames and edits**, not token streams: everything is compared as an
   alpha-renamed AST canonical.
 - 🎯 **Grades** each cluster by how much a refactor would actually pay off, so the biggest win is
@@ -188,8 +188,9 @@ Two refinements keep those shapes honest:
   alpha-renamed canonical turns every type reference in an annotation into a `_T{n}` slot. The
   renaming is consistent, not an erasure, so `f(a: X, b: X)` and `f(a: X, b: Y)` still differ. A call
   inside an annotation (`Annotated[T, Depends(f)]`) is a value read at runtime, so it stays as
-  written. A Rust or Go type is not inert — it picks the trait implementation, or the method set,
-  that runs — so their exact canonicals keep types as written and only their Type-3 lines slot them.
+  written. A Rust, Go or C type is not inert — it picks the trait implementation, the method set,
+  or the arithmetic and the layout that runs — so their exact canonicals keep types as written and
+  only their Type-3 lines slot them.
 - **A Type-3 unit depends on itself alone.** Slots are renumbered within each line, so one added
   parameter no longer rewrites every later line. The types an annotation names ride as units of
   their own: a shared type still counts, and a different one costs only its own weight. Type-3
@@ -202,7 +203,7 @@ Type-3 pairs went +172 / −30. In a hand-labelled sample, 57 of 61 added pairs 
 
 Two more take the comparison from how a definition is written to what it does:
 
-- **A normal form first.** Every function — Python, TypeScript, Rust or Go — is rewritten to one
+- **A normal form first.** Every function — Python, TypeScript, Rust, Go or C — is rewritten to one
   representative of its equivalence class under a fixed set of oriented rules before the
   name-agnostic canonicals are taken: negation normal form, a fixed orientation for comparisons and
   for the branches of an `if`, guard form instead of nesting, `if`/`else` statements in place of
@@ -225,6 +226,12 @@ Two more take the comparison from how a definition is written to what it does:
   guard an `if` peels off is the lighter branch, then the one that fails — returns an error last,
   or panics — and only then the positive test: picked by polarity alone, either every
   `if err != nil` or every positive guard (`if x < lower { return lower }`) came out inside out.
+  In C a truth test is its operand — `if (p != NULL)` is `if (p)`, `x == 0` is `!x` — since C defines
+  the one as the other; `T x; x = e;` is `T x = e;` and `int a = 1, b = 2;` two declarations;
+  `do { … } while (0)` is its body and `while (1)` is `for (;;)`; a `switch` is its ladder when every
+  case ends in its own `break` or leaves the function, the empty cases that share the next one's body
+  read as one test; and the guard is picked as in Go, C's failing branch being a `goto` to the cleanup,
+  a negative or `NULL` return, an error code, or a call that does not return.
 - **Statements agree in part.** Type-3 scores a pair by the *soft cosine* of its line vectors
   (Sidorov et al. 2014): two lines contribute by the Jaccard of their parts — the line and every
   sub-expression inside it — so a token changed deep in a long statement costs the parts it sits
@@ -276,6 +283,14 @@ clusters in the first place:
   warning on a line of its own) contribute nothing; and a name two build alternatives of one package declare
   (`binding.go` under `//go:build !nomsgpack`, `binding_nomsgpack.go` under `nomsgpack`, or a
   `_windows.go` beside a `_linux.go`) is one definition, as Rust's `cfg` siblings are.
+- **C** — bodies that only `return` a name, a literal or a negative code, or only call `abort` /
+  `exit` (a `(void)x;` marking a parameter unused is not a statement); files that declare themselves
+  generated (a `DO NOT EDIT`, a Bison or flex banner before the first line of code); a name one file
+  defines under `#if` and again under `#else`, and a name two platform alternatives define
+  (`os/unix/` and `os/win32/`, `x86/` and `arm/`, `ae_epoll.c` and `ae_kqueue.c`) — one definition,
+  and a portable one beside its overrides (`bswap.h` beside `arm/bswap.h`) is it; and a `#define` that
+  is a template's argument rather than a constant — taken back by `#undef`, or one of the run written
+  just before `#include "dsp_template.c"`.
 
 Each surviving cluster lands in a tier: **ERROR** gates CI, **WARNING** is for review, **INFO** is
 hidden unless you ask (`--show-info`, or `--json` where it's always present).
@@ -397,6 +412,15 @@ both again in a copy of that file kept under the code generator's tests; `gin-go
 lines) 19 → 0. In both, the inferred directive that does most of the cutting is Go's own
 convention: tests live beside the code, in `*_test.go`, and are table-test candidates rather than
 refactors.
+
+Five C trees, same method: `redis/redis` **246 → 99 ERROR**, `libgit2/libgit2` 303 → 62,
+`curl/curl` 172 → 86. The directive that does the cutting is C's own convention again: C has no package
+manager, so a dependency is a directory of its source — redis carries jemalloc, Lua, hiredis and four
+more under `deps/` — and their duplication is upstream's. Two trees barely move, and should not:
+`nginx/nginx` stays at 158, every one of them a near-copy across its `http/`, `stream/` and `mail/`
+modules (`ngx_http_validate_host`/`ngx_stream_validate_host`, 163 lines, on top), and FFmpeg's
+codec libraries (1.4M lines, scanned in 3.5 s) stay at 608 — decoder/encoder pairs, and SIMD kernels
+written once per instruction set.
 
 **What's left at the top is the kind of thing a human reviewer would also flag.** `pip`'s Version
 `__lt__…__gt__` ×6 collapse into one `_compare` helper, −130 lines. `scipy`'s `dct/dst/idct/idst`
@@ -564,14 +588,17 @@ Then the template has to *survive*, and most don't. A candidate is kept only if 
 
 What's left is a motif that genuinely collapses into one clean, reflection-free helper. The
 proposed body is rendered as readable pseudo-source (`def …:` for Python, `fn …` for Rust,
-`func …` for Go, the matching shape for TS), and the finding carries its parameter count and an
-estimated LOC saved.
+`func …` for Go, `type name(…) { … }` for C, the matching shape for TS), and the finding carries its
+parameter count and an estimated LOC saved.
 
 The dialect seam is a `Dialect` trait — slot classification plus a pseudo-source renderer — with
-`PyDialect`, `RustDialect`, `TsDialect` and `GoDialect` behind it. A run partitions defs by language
-and folds each group with its own dialect; functions of two languages never anti-unify against each
-other. In Go a struct literal's field name is a selector — a varying one would need reflection, so
-it is never a hole — while a map literal's key is a value and may be.
+`PyDialect`, `RustDialect`, `TsDialect`, `GoDialect` and `CDialect` behind it. A run partitions defs
+by language and folds each group with its own dialect; functions of two languages never anti-unify
+against each other. In Go a struct literal's field name is a selector — a varying one would need
+reflection, so it is never a hole — while a map literal's key is a value and may be. C reads the same
+way: a designated initializer's member (`.port = 80`) is a selector and an indexed one's index
+(`[3] = x`) a value, and a call through a member (`dev->ops->open(dev)`) is C's method call, the
+member it calls a selector like a method's name.
 </details>
 
 <details>
@@ -639,7 +666,7 @@ Ten lenses, each answering one question:
 | `scope` | what does its body do? | the body with every name its module introduced erased |
 | `use` | how is it handled? | the statements elsewhere in the tree that mention it |
 
-Opt in with `--kinds lenses` — Python, Rust, TypeScript and Go. Directives address it like any other
+Opt in with `--kinds lenses` — Python, Rust, TypeScript, Go and C. Directives address it like any other
 kind: `-D 'suppress:<lenses>*@*/legacy/*=deliberate parallel port'`. The kind exists exactly when
 asked for, so the section list, the default report and the default JSON are byte-identical without
 it.
@@ -707,6 +734,16 @@ or tests for (`ErrNotFound`, `errors.Is(err, sql.ErrNoRows)`), `panic`, and
 `if err != nil { return …, err }` — Go's spelling of Rust's `?`, recorded as the same fact. And Go
 has no decorators, so that lens stays silent; `schema` reads a struct's fields as a set, each with
 its tag's keys (`json`, `db`) as the field's options.
+
+C answers the same three differently again. It has no scope guard at all — a release is a call — so
+`resources` reads what a release-like call (`free`, `fclose`, `*_unref`, `*_unlock`, …) is handed and
+reports what acquired it: `p = malloc(n); … free(p)` holds `malloc`, and a release of something not
+bound here (`pthread_mutex_unlock(&s->lock)`) is the release itself. C fails by returning a code, so
+`failures` reads the codes a body returns or tests for — an errno constant (`-EINVAL`), a project's
+own (`NGX_ERROR`, `AVERROR(ENOMEM)`), a negative number, `NULL` — the calls that do not return, and
+`if (ret < 0) return ret;`, recorded as the same fact as Go's `if err != nil` and Rust's `?`. And C
+does answer `decorators`: the storage class and function specifiers a definition carries (`static`,
+`inline`, `_Noreturn`).
 </details>
 
 ---
@@ -785,6 +822,13 @@ are not reported as reached: calling one is speaking the language, not turning t
 fifty Go libraries, a pair whose only anchor was such a package was noise seventeen times in
 eighteen; leaving them out cut the pairs anchored on a subject alone from 589 to 469 across the
 libraries' top fifties, with the decisions and name passes byte-identical.
+
+C names no module where it uses one: `av_malloc(n)` says only that something the file `#include`d
+declares `av_malloc`. So the frontend reads every header of the run once, for the names it declares,
+and follows each file's includes through them — beside the file, then up its directories, then to the
+one header of the run whose path ends as the include is written — and a definition reaches the nearest
+header that declares a name it uses. Go's exception falls out by itself here: a system header
+(`<stdio.h>`) is in none of those places, so the C library is never a subject.
 
 | anchor | agreement | divergence | reads as |
 |---|---|---|---|
@@ -901,6 +945,10 @@ for a test and its negation.
   wrapping, the predicate handed to `slices.ContainsFunc` and kin a test, and each `testify`
   assertion the relation it asserts. `x == nil` is `None = x`, the atom every other language's
   absence test writes.
+- **In C** a `switch` compares its value with each case; the comparison functions are the relation they
+  compute — `strcmp(a, b) == 0` and `!strcmp(a, b)` are `a = b`, `strcmp(a, b) < 0` is `a < b`, and
+  `strstr(s, x)` tested is `x in s`; what `assert`, `av_assert0` or `BUG_ON` asserts is a truth position,
+  and `likely(…)` / `unlikely(…)` are transparent. `p == NULL` is `None = p`.
 - **What a term is:** a name the definition binds is a hole (its spelling is the writer's); an imported
   name is the path it was imported from; a name the module defines is a local path, named the way the
   rest of the tree imports that module — under the source root the corpus's own imports attest, not
@@ -912,7 +960,9 @@ for a test and its negation.
   they stand, a file under a package's `src/` named by its place there under the package directory's
   name — so `use actix_web::…` in one crate and the definition in another meet as one path. A Go
   package is its import path — the module `go.mod` declares and the directory under it — so a call
-  from another package and the definition meet the same way.
+  from another package and the definition meet the same way. A C name is the program's: C has one
+  namespace for everything with external linkage, so a function and a call to it meet by name alone —
+  save a `static` one, which is its file's and is qualified by the file's path.
 - **What is not a fact:** a filter. `Order.shop_id == shop_id` selects rows by a key the caller chose,
   `Order.id == Line.order_id` joins two tables, `Post.date < since` bounds a range — each compares an
   attribute of a class (a column, in a query) with a value the text does not fix, and says nothing about
@@ -921,7 +971,8 @@ for a test and its negation.
   against another attribute of the same class (`Task.attempts < Task.max_attempts`). Go spells its
   constants like its types (`StatusOpen`, `http.StatusOK`), so no casing tells one from a class there;
   the grammar does — an operand of a comparison can only be a value — and the frontend writes a
-  package-level name it compares with as one. A field read off a value is not held to this:
+  package-level name it compares with as one; C's frontend does the same with a file-scope name. A
+  field read off a value is not held to this:
   `a.id == b.id` and `latest.revision == revision` relate two records, and whether they agree is the
   decision.
 
@@ -976,7 +1027,9 @@ method or a function an attribute registers (`#[get("/")]`, `#[tokio::main]`) is
 corpus, so nothing is inferred for its parameters. In Go a struct is a record too — its literal, keyed
 or positional, is the constructor — and a method (dispatched through whatever interface its type
 satisfies) or a function the toolchain calls (`init`, `main`, `Test…`, `Benchmark…`, `Fuzz…`,
-`Example…`) is called from outside it; a variadic parameter is never one call's argument. These guards
+`Example…`) is called from outside it; a variadic parameter is never one call's argument. In C a
+`struct` is a record, its brace initializer — designated or positional — the constructor; `main` is
+called from outside the corpus, and a variadic function's parameters are no one call's. These guards
 catch what the text shows — not reflection, dispatch by string, or callers outside the scanned tree.
 That is why it is off by default: true of an application, mostly false of a library. A finding that
 leans on it says so next to the fact that needed it.
@@ -1028,7 +1081,12 @@ in the Rust sample is two methods that each match over all of one enum's variant
 pass reads as a decision both make (see [Limitations](#limitations)). On Go's go-zero (≈4.4k
 definitions that test anything) it reports 448 in 44 ms, and a random 25 read 22 — fourteen of them
 tests asserting the same things; the three false ones are type switches over one interface's
-implementations, the same dispatch.
+implementations, the same dispatch. On redis (its own code, ≈5.2k definitions that test anything) it
+reports 2808 in 0.33 s, and a random 25 read 12 relevant — one precondition re-tested in every command
+that needs it (a key opened for writing, the same three expiry flags), two near-twin overlap checks.
+Twelve of the thirteen false are the same dispatch again, more of it than anywhere: C has no
+polymorphism, so every serializer, every iterator and every command switches on `o->type` or
+`o->encoding`.
 </details>
 
 ## For agents
@@ -1057,15 +1115,15 @@ find-dup-defs ./repo \
 
 ## Architecture
 
-Six crates, layered so the engine never depends on a language:
+Seven crates, layered so the engine never depends on a language:
 
 ```
-                 dup-defs-core         ← the shared ground: the Def / KindSpec / Facets / Frontend
-                      ▲                  contract, the kind vocabulary, the alpha-rename, the lens
-        ┌─────┬─────┬─┴───┬─────┐       machinery and the dotted-path form.  No deps.
-      py-   rs-   ts-   go-   find-dup-defs
-     canon canon canon canon  (engine + CLI: the 3 passes + patternology + converge + decisions +
-        └─────┴─────┴─────┴────▲         severity + directives + calibration + reports)
+                    dup-defs-core            ← the shared ground: the Def / KindSpec / Facets / Frontend
+                         ▲                     contract, the kind vocabulary, the alpha-rename, the lens
+        ┌─────┬─────┬────┴┬─────┬─────┐       machinery and the dotted-path form.  No deps but rayon.
+      py-   rs-   ts-   go-    c-    find-dup-defs
+     canon canon canon canon canon  (engine + CLI: the 3 passes + patternology + converge + decisions +
+        └─────┴─────┴─────┴─────┴────▲         severity + directives + calibration + reports)
                                │
                     the engine depends on the contract and on each frontend,
                     and on no frontend's internals
@@ -1076,9 +1134,11 @@ names a language. [`dup-defs-core`](crates/dup-defs-core) is everything both sid
 contract (`Def`, `Facets`, `KindSpec`, `Analysis`, the `Frontend` trait), and the pieces the
 frontends would otherwise each keep a copy of — the kind vocabulary, `alpha_rename`, `count_loc`,
 the lens vocabulary and stitching, the `use` lens's site logic, the dotted-path form and its prefix
-walk, the decision-atom grammar and the facts record, the normal form's round bound and name counts.
-[`py-canon`](crates/py-canon), [`ts-canon`](crates/ts-canon), [`rs-canon`](crates/rs-canon) and
-[`go-canon`](crates/go-canon) are the frontends (Ruff, oxc, syn, tree-sitter).
+walk, the decision-atom grammar and the facts record, the normal form's round bound, name counts and
+operator tables, and — behind a feature, for the frontends that parse with it — the tree-sitter node
+accessors. [`py-canon`](crates/py-canon), [`ts-canon`](crates/ts-canon), [`rs-canon`](crates/rs-canon),
+[`go-canon`](crates/go-canon) and [`c-canon`](crates/c-canon) are the frontends (Ruff, oxc, syn, and
+tree-sitter for the last two).
 
 **Adding a language is one more `<lang>-canon` crate implementing `Frontend`** — plus a `Dialect`
 impl if it wants patternology — and no engine changes.
@@ -1121,9 +1181,9 @@ helpers that `type3` and `patternology` had each copied — so they were extract
 USAGE:  find-dup-defs [OPTIONS] <PATHS>...
 
 LANGUAGES
-  --only <CODES>            Restrict to frontends (py,ts,rs,go). Default: all found in PATHS.
+  --only <CODES>            Restrict to frontends (py,ts,rs,go,c). Default: all found in PATHS.
   --kinds <K,…>             functions,methods,classes,interfaces,constants,type-aliases
-                            + `lenses` (opt-in; py, rs, ts, go) — see Lenses.
+                            + `lenses` (opt-in; py, rs, ts, go, c) — see Lenses.
                             Closed vocabulary: an unknown name exits non-zero.
 
 SEVERITY (thickness ladder)
@@ -1137,7 +1197,7 @@ SIMILARITY
   --type3-theta <F>         Type-3 cosine floor        (default 0.7)
   --max-name-group <N>      Skip name-gated clustering for (kind,name) groups > N
 
-LENSES (opt-in · py, rs, ts, go)
+LENSES (opt-in · py, rs, ts, go, c)
   --kinds lenses            Cluster by perspectives other than the body; each finding reports
                             which lenses agreed (`votes[n]: control×3 outgoing×2 …`)
 
@@ -1146,12 +1206,12 @@ PATTERNOLOGY (opt-in · advisory, never ERROR)
   --pattern-theta <F>       Whole-fn structural cosine floor (default 0.85)
   --pattern-support <N>     Sub-block idiom support floor     (default 3)
 
-CONVERGE (opt-in · advisory, never ERROR · py, rs, ts, go)
+CONVERGE (opt-in · advisory, never ERROR · py, rs, ts, go, c)
   --converge                Where two definitions about the same thing stop agreeing, and the
                             families of many that do the same thing around one subject
   --converge-top <N>        Keep the strongest N of each kind (default 50; 0 = every one)
 
-DECISIONS (opt-in · advisory, never ERROR · py, rs, ts, go)
+DECISIONS (opt-in · advisory, never ERROR · py, rs, ts, go, c)
   --decisions               Definitions that decide on the same facts, however they are written;
                             pairs and families, validated under the bipartite configuration model
 
@@ -1182,12 +1242,19 @@ SETTINGS (via -D 'settings:KEY=VALUE')
 
 The honest ledger:
 
-- **Languages.** Python, TypeScript, Rust and Go today. A new language is a `<lang>-canon` sibling
+- **Languages.** Python, TypeScript, Rust, Go and C today. A new language is a `<lang>-canon` sibling
   crate.
 - **Go is read without a type checker.** A method call is named by the value it is read off, not by
   the type that value has, so the closed world sees no call site through a variable; and build
   constraints are read only to tell alternatives apart — every `.go` file is scanned, whichever
   platform it builds for.
+- **C is read before preprocessing**, without a build configuration. Every branch of a conditional is
+  read; a macro is never expanded — a function-like one reads as the call it looks like, its own body
+  as nothing at all — except the attribute macros erased before parsing, which are learned from the
+  corpus's own `#define`s (every definition of the name expands to an attribute, a specifier or
+  nothing). A function whose body the parser cannot read for a quarter or more is skipped: on five
+  large trees, 2–5% of function bodies hold some parse error, most of them a macro used where the
+  grammar wants something else, and those are read around it.
 - **Rust macros** are read when their arguments are comma-separated expressions (`vec![a, b]`,
   `assert_eq!(x, y)`, `format!(…)`); one that takes anything else (`vec![0; n]`, a DSL) is opaque
   to every pass.
@@ -1200,8 +1267,9 @@ The honest ledger:
   test the same facts, whatever form the tests take.
 - **Dispatch reads as a decision.** Two methods that each `match` over every variant of one enum share
   every variant test, and the decisions pass reports them — in Rust, where a trait implementation over
-  an enum is the commonest shape there is, that is most of its false findings, and in Go the type
-  switch over one interface's implementations is the same shape. Telling an exhaustive dispatch from
+  an enum is the commonest shape there is, that is most of its false findings; in Go the type
+  switch over one interface's implementations is the same shape, and in C, which has no polymorphism,
+  the `switch` on a tag field is how every object is handled. Telling an exhaustive dispatch from
   a decision written twice would drop the real ones too (two functions that both decide on
   `Status::Open` and `Status::Closed`), so it is left to the reader.
 - **Rust crate names** are read from the package directory (`actix-web` is `actix_web`, the name

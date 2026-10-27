@@ -127,6 +127,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "c-canon"
+version = "0.1.0"
+dependencies = [
+ "dup-defs-core",
+ "rayon",
+ "tree-sitter",
+ "tree-sitter-c",
+]
+
+[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -310,9 +320,10 @@ checksum = "fd8e701084c37e7ef62d3f9e453b618130cbc0ef3573847785952a3ac3f746bf"
 
 [[package]]
 name = "dup-defs-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "rayon",
+ "tree-sitter",
 ]
 
 [[package]]
@@ -335,8 +346,9 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "find-dup-defs"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
+ "c-canon",
  "clap",
  "difflib-fast",
  "directiva",
@@ -429,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "go-canon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dup-defs-core",
  "rayon",
@@ -1369,6 +1381,16 @@ dependencies = [
  "regex",
  "serde_json",
  "streaming-iterator",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-c"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9b2eb57a55fed6b00812912e730b7a275cf4fe98bfd6a5d76263d4438371728"
+dependencies = [
+ "cc",
  "tree-sitter-language",
 ]
 

@@ -52,7 +52,7 @@
 
 use std::collections::HashSet;
 
-use dup_defs_core::normal::{Scope, MAX_ROUNDS};
+use dup_defs_core::normal::{complement, mirror, Scope, MAX_ROUNDS};
 
 use crate::canon::{for_each_child, Child};
 use crate::ir::{Case, Elem, Else, Expr, ForHead, Func, Jump, ParamDecl, Results, Spec, Stmt, Target};
@@ -661,15 +661,6 @@ fn negate(e: Expr) -> Expr {
     }
 }
 
-fn complement(op: &str) -> Option<&'static str> {
-    Some(match op {
-        "<" => ">=",
-        ">=" => "<",
-        ">" => "<=",
-        "<=" => ">",
-        _ => return None,
-    })
-}
 
 /// The operands of a chain of one `&&` or `||`, left to right.
 fn operands(e: &Expr) -> Vec<&Expr> {
@@ -784,17 +775,6 @@ fn guard_should_swap(guard: &[Stmt], other: &[Stmt], test: &Expr, locals: &HashS
     prefer_flip(test, locals)
 }
 
-fn mirror(op: &str) -> Option<&'static str> {
-    Some(match op {
-        "==" => "==",
-        "!=" => "!=",
-        "<" => ">",
-        ">" => "<",
-        "<=" => ">=",
-        ">=" => "<=",
-        _ => return None,
-    })
-}
 
 /// Apply the expression rules to every expression of the body, innermost first.
 fn expressions(stmts: &mut [Stmt], scope: &Scope) -> bool {

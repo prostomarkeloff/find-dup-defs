@@ -1688,8 +1688,11 @@ fn go_blank(t: Option<&Term>) -> bool {
     }
 }
 
+/// A dialect's renderer, for the helpers below that the Go and C dialects share.
+type Render = fn(&Term, &mut String, &mut usize);
+
 /// Render a `Block` node's statements joined with `; ` (a bare body, no braces).
-fn go_block_inner(t: Option<&Term>, out: &mut String, b: &mut usize) {
+fn block_inner(t: Option<&Term>, out: &mut String, b: &mut usize, render: Render) {
     match t {
         Some(Term::Node(tag, ch)) if tag == "Block" => {
             for (i, s) in ch.iter().enumerate() {
@@ -1700,27 +1703,30 @@ fn go_block_inner(t: Option<&Term>, out: &mut String, b: &mut usize) {
                     out.push('…');
                     return;
                 }
-                go_render(s, out, b);
+                render(s, out, b);
             }
         }
-        Some(other) if !go_blank(Some(other)) => go_render(other, out, b),
+        Some(other) if !go_blank(Some(other)) => render(other, out, b),
         _ => {}
     }
 }
 
 /// `{ body }` of a construct.
-fn go_braced(t: Option<&Term>, out: &mut String, b: &mut usize) {
+fn braced(t: Option<&Term>, out: &mut String, b: &mut usize, render: Render) {
     out.push_str("{ ");
-    go_block_inner(t, out, b);
+    block_inner(t, out, b, render);
     out.push_str(" }");
 }
 
 /// A child, or nothing when the field is blank.
-fn go_opt(t: Option<&Term>, out: &mut String, b: &mut usize) {
+fn opt(t: Option<&Term>, out: &mut String, b: &mut usize, render: Render) {
     if let Some(t) = t.filter(|t| !go_blank(Some(t))) {
-        go_render(t, out, b);
+        render(t, out, b);
     }
 }
+
+
+
 
 /// Render a folded Go term as one line of pseudo-source. Mirrors [`rs_render`]: bounded by `b`, holes
 /// `?`, unknown tags fall back to the raw `Tag(child, …)` form.
@@ -1770,7 +1776,7 @@ fn go_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
                 go_render(at(skip + 1), out, b);
             }
             out.push(' ');
-            go_braced(ch.get(skip + 2), out, b);
+            braced(ch.get(skip + 2), out, b, go_render);
         }
         "Params" | "Tuple" | "PatTuple" | "Decls" | "TypeArgs" => seq(ch, 0, out, b, go_render),
         "Results" => {
@@ -1785,7 +1791,7 @@ fn go_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             }
             go_render(at(1), out, b);
         }
-        "Block" => go_braced(Some(&Term::Node(tag.to_owned(), ch.to_vec())), out, b),
+        "Block" => braced(Some(&Term::Node(tag.to_owned(), ch.to_vec())), out, b, go_render),
         "Let" => {
             if let Some(Term::Node(t, tch)) = ch.first() {
                 if t == "PatType" {
@@ -1864,24 +1870,24 @@ fn go_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             }
             go_render(at(1), out, b);
             out.push(' ');
-            go_braced(ch.get(2), out, b);
+            braced(ch.get(2), out, b, go_render);
             if !go_blank(ch.get(3)) {
                 out.push_str(" else ");
                 match at(3) {
                     Term::Node(t, _) if t == "If" => go_render(at(3), out, b),
-                    other => go_braced(Some(other), out, b),
+                    other => braced(Some(other), out, b, go_render),
                 }
             }
         }
         "Loop" => {
             out.push_str("for ");
-            go_braced(ch.first(), out, b);
+            braced(ch.first(), out, b, go_render);
         }
         "While" => {
             out.push_str("for ");
             go_render(at(0), out, b);
             out.push(' ');
-            go_braced(ch.get(1), out, b);
+            braced(ch.get(1), out, b, go_render);
         }
         "For" => {
             out.push_str("for ");
@@ -1892,17 +1898,17 @@ fn go_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             out.push_str("range ");
             go_render(at(1), out, b);
             out.push(' ');
-            go_braced(ch.get(2), out, b);
+            braced(ch.get(2), out, b, go_render);
         }
         "ForC" => {
             out.push_str("for ");
-            go_opt(ch.first(), out, b);
+            opt(ch.first(), out, b, go_render);
             out.push_str("; ");
-            go_opt(ch.get(1), out, b);
+            opt(ch.get(1), out, b, go_render);
             out.push_str("; ");
-            go_opt(ch.get(2), out, b);
+            opt(ch.get(2), out, b, go_render);
             out.push(' ');
-            go_braced(ch.get(3), out, b);
+            braced(ch.get(3), out, b, go_render);
         }
         "Switch" | "TypeSwitch" => {
             // `Switch(init, value, cases…)`, `TypeSwitch(init, alias, value, cases…)`.
@@ -1917,7 +1923,7 @@ fn go_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
                 out.push_str(" := ");
             }
             let value = if type_switch { 2 } else { 1 };
-            go_opt(ch.get(value), out, b);
+            opt(ch.get(value), out, b, go_render);
             if type_switch {
                 out.push_str(".(type)");
             }
@@ -1949,7 +1955,7 @@ fn go_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
                 seq(&ch[..ch.len().saturating_sub(1)], 0, out, b, go_render);
             }
             out.push_str(": ");
-            go_block_inner(ch.last(), out, b);
+            block_inner(ch.last(), out, b, go_render);
         }
         "Labeled" => {
             out.push_str(&ident(ch.first()));
@@ -2014,9 +2020,9 @@ fn go_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
         "Slice" => {
             go_render(at(0), out, b);
             out.push('[');
-            go_opt(ch.get(1), out, b);
+            opt(ch.get(1), out, b, go_render);
             out.push(':');
-            go_opt(ch.get(2), out, b);
+            opt(ch.get(2), out, b, go_render);
             if !go_blank(ch.get(3)) {
                 out.push(':');
                 go_render(at(3), out, b);
@@ -2036,7 +2042,7 @@ fn go_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             out.push(')');
         }
         "Composite" => {
-            go_opt(ch.first(), out, b);
+            opt(ch.first(), out, b, go_render);
             out.push('{');
             seq(ch, 1, out, b, go_render);
             out.push('}');
@@ -2089,6 +2095,353 @@ fn go_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             if !ch.is_empty() {
                 out.push('(');
                 seq(ch, 0, out, b, go_render);
+                out.push(')');
+            }
+        }
+    }
+}
+
+// ── C dialect ────────────────────────────────────────────────────────────────
+
+/// The C dialect — `c-canon`'s tree-sitter-derived structural dump. It lays a function out as Go's
+/// does — `Func(name, Params(…), return type, Block(…))`, the body at slot 3, read by the same borrow
+/// ([`go_parse_function_body`]) — and speaks the shared tags wherever the construct is the same one,
+/// adding C's own (`DoWhile`, `ForC`, `Goto`/`Labeled`, `PreIf`, `MacroLoop`, `SizeOf`, `StmtExpr`).
+/// Selectors are the `Method`/`Field` member slots, a designated initializer's member (`FieldVal`), an
+/// `offsetof`'s member and a `goto`'s label; an indexed initializer's index (`KV`) is a value like any
+/// other. Parameter types and the return type are signature material.
+pub(crate) struct CDialect;
+
+impl Dialect for CDialect {
+    fn slot_ctx(&self, tag: &str, k: usize) -> Ctx {
+        match (tag, k) {
+            // Every child of a `Block` is a statement; every body (`If`/`While`/`Case`/…) is a `Block`.
+            ("Block", _) => Ctx::Stmt,
+            ("Method" | "Field" | "OffsetOf", 1) | ("FieldVal" | "Goto" | "Labeled", 0) => Ctx::Selector,
+            ("Param" | "PatType", 1) | ("Func", 0 | 2) => Ctx::Anno,
+            _ => Ctx::Expr,
+        }
+    }
+
+    fn parse_function_body(&self, canon: &str) -> Vec<Term> {
+        go_parse_function_body(canon)
+    }
+
+    fn render(&self, t: &Term, out: &mut String, budget: &mut usize) {
+        c_render(t, out, budget);
+    }
+
+    fn is_sequence(&self, tag: &str) -> bool {
+        matches!(tag, "Block" | "Params" | "Named" | "Decls" | "PreIf" | "Variants")
+    }
+}
+
+
+
+
+/// Render a folded C term as one line of pseudo-source. Mirrors [`go_render`]: bounded by `b`, holes
+/// `?`, unknown tags fall back to the raw `Tag(child, …)` form.
+fn c_render(t: &Term, out: &mut String, b: &mut usize) {
+    if *b == 0 {
+        out.push('…');
+        return;
+    }
+    *b -= 1;
+    match t {
+        Term::Hole => out.push('?'),
+        Term::Atom(s) => out.push_str(unq(s)),
+        Term::List(items) => {
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                c_render(it, out, b);
+            }
+        }
+        Term::Node(tag, ch) => c_node(tag, ch, out, b),
+    }
+}
+
+#[allow(clippy::too_many_lines)] // one arm per construct reads better straight-through
+fn c_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
+    let hole = &Term::Hole;
+    let at = |i: usize| ch.get(i).unwrap_or(hole);
+    match tag {
+        "Func" => {
+            // `Func(name, Params, ret, Block)` → `ret name(params) { … }`.
+            opt(ch.get(2), out, b, c_render);
+            out.push(' ');
+            out.push_str(&ident(ch.first()));
+            out.push('(');
+            if let Some(Term::Node(pt, pch)) = ch.get(1) {
+                if pt == "Params" {
+                    seq(pch, 0, out, b, c_render);
+                }
+            }
+            out.push_str(") ");
+            braced(ch.get(3), out, b, c_render);
+        }
+        "Params" | "Decls" | "Seq" => seq(ch, 0, out, b, c_render),
+        "Param" | "PatType" => {
+            // C writes the type first: `int x`.
+            c_render(at(1), out, b);
+            if !go_blank(ch.first()) {
+                out.push(' ');
+                c_render(at(0), out, b);
+            }
+        }
+        "Block" => braced(Some(&Term::Node(tag.to_owned(), ch.to_vec())), out, b, c_render),
+        "Let" => {
+            c_render(at(0), out, b);
+            if !go_blank(ch.get(1)) {
+                out.push_str(" = ");
+                c_render(at(1), out, b);
+            }
+        }
+        "Assign" => {
+            c_render(at(0), out, b);
+            out.push_str(" = ");
+            c_render(at(1), out, b);
+        }
+        "Bin" | "AssignExpr" => {
+            c_render(at(0), out, b);
+            out.push(' ');
+            out.push_str(&ident(ch.get(1)));
+            out.push(' ');
+            c_render(at(2), out, b);
+        }
+        "Inc" | "Dec" => {
+            c_render(at(0), out, b);
+            out.push_str(if tag == "Inc" { "++" } else { "--" });
+        }
+        "PreInc" | "PreDec" => {
+            out.push_str(if tag == "PreInc" { "++" } else { "--" });
+            c_render(at(0), out, b);
+        }
+        "ExprStmt" | "BlockExpr" => c_render(at(0), out, b),
+        "Return" | "Break" | "Continue" | "Goto" => {
+            out.push_str(match tag {
+                "Return" => "return",
+                "Break" => "break",
+                "Continue" => "continue",
+                _ => "goto",
+            });
+            if !go_blank(ch.first()) {
+                out.push(' ');
+                c_render(at(0), out, b);
+            }
+        }
+        "If" => {
+            // `If(cond, Block, else)`
+            out.push_str("if (");
+            c_render(at(0), out, b);
+            out.push_str(") ");
+            braced(ch.get(1), out, b, c_render);
+            if !go_blank(ch.get(2)) {
+                out.push_str(" else ");
+                match at(2) {
+                    Term::Node(t, _) if t == "If" => c_render(at(2), out, b),
+                    other => braced(Some(other), out, b, c_render),
+                }
+            }
+        }
+        "While" => {
+            out.push_str("while (");
+            c_render(at(0), out, b);
+            out.push_str(") ");
+            braced(ch.get(1), out, b, c_render);
+        }
+        "DoWhile" => {
+            out.push_str("do ");
+            braced(ch.first(), out, b, c_render);
+            out.push_str(" while (");
+            c_render(at(1), out, b);
+            out.push(')');
+        }
+        "ForC" => {
+            out.push_str("for (");
+            opt(ch.first(), out, b, c_render);
+            out.push_str("; ");
+            opt(ch.get(1), out, b, c_render);
+            out.push_str("; ");
+            opt(ch.get(2), out, b, c_render);
+            out.push_str(") ");
+            braced(ch.get(3), out, b, c_render);
+        }
+        "Switch" => {
+            out.push_str("switch (");
+            c_render(at(0), out, b);
+            out.push_str(") { ");
+            for (i, case) in ch.iter().enumerate().skip(1) {
+                if i > 1 {
+                    out.push_str("; ");
+                }
+                c_render(case, out, b);
+            }
+            out.push_str(" }");
+        }
+        // `Case(value, Block)`, `Default(Block)`.
+        "Case" | "Default" => {
+            if tag == "Default" {
+                out.push_str("default");
+            } else {
+                out.push_str("case ");
+                c_render(at(0), out, b);
+            }
+            out.push_str(": ");
+            block_inner(ch.last(), out, b, c_render);
+        }
+        "Labeled" => {
+            out.push_str(&ident(ch.first()));
+            out.push_str(": ");
+            opt(ch.get(1), out, b, c_render);
+        }
+        "PreIf" => {
+            for (i, branch) in ch.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                c_render(branch, out, b);
+            }
+            out.push_str(" #endif");
+        }
+        "Branch" => {
+            out.push('#');
+            out.push_str(&ident(ch.first()));
+            out.push(' ');
+            braced(ch.get(1), out, b, c_render);
+        }
+        "MacroLoop" => {
+            c_render(at(0), out, b);
+            out.push(' ');
+            braced(ch.get(1), out, b, c_render);
+        }
+        "Path" | "Bind" | "Int" | "Float" | "Bool" | "Ty" => out.push_str(&ident(ch.first())),
+        "Nil" => out.push_str("NULL"),
+        "Str" => {
+            out.push('"');
+            out.push_str(&ident(ch.first()));
+            out.push('"');
+        }
+        "Char" => {
+            out.push('\'');
+            out.push_str(&ident(ch.first()));
+            out.push('\'');
+        }
+        "Unary" => {
+            out.push_str(&ident(ch.first()));
+            c_render(at(1), out, b);
+        }
+        "Ref" => {
+            out.push('&');
+            c_render(at(0), out, b);
+        }
+        "Cond" => {
+            c_render(at(0), out, b);
+            out.push_str(" ? ");
+            opt(ch.get(1), out, b, c_render);
+            out.push_str(" : ");
+            c_render(at(2), out, b);
+        }
+        "Call" => {
+            c_render(at(0), out, b);
+            out.push('(');
+            seq(ch, 1, out, b, c_render);
+            out.push(')');
+        }
+        "Method" => {
+            c_render(at(0), out, b);
+            out.push_str("->");
+            out.push_str(&ident(ch.get(1)));
+            out.push('(');
+            seq(ch, 2, out, b, c_render);
+            out.push(')');
+        }
+        "Field" => {
+            c_render(at(0), out, b);
+            out.push_str("->");
+            out.push_str(&ident(ch.get(1)));
+        }
+        "Index" => {
+            c_render(at(0), out, b);
+            out.push('[');
+            c_render(at(1), out, b);
+            out.push(']');
+        }
+        "Cast" => {
+            out.push('(');
+            c_render(at(1), out, b);
+            out.push(')');
+            c_render(at(0), out, b);
+        }
+        "SizeOf" | "AlignOf" | "Generic" => {
+            out.push_str(match tag {
+                "SizeOf" => "sizeof(",
+                "AlignOf" => "alignof(",
+                _ => "_Generic(",
+            });
+            c_render(at(0), out, b);
+            out.push(')');
+        }
+        "OffsetOf" => {
+            out.push_str("offsetof(");
+            c_render(at(0), out, b);
+            out.push_str(", ");
+            out.push_str(&ident(ch.get(1)));
+            out.push(')');
+        }
+        "Composite" => {
+            if !go_blank(ch.first()) {
+                out.push('(');
+                c_render(at(0), out, b);
+                out.push(')');
+            }
+            out.push('{');
+            seq(ch, 1, out, b, c_render);
+            out.push('}');
+        }
+        "FieldVal" => {
+            out.push('.');
+            out.push_str(&ident(ch.first()));
+            out.push_str(" = ");
+            c_render(at(1), out, b);
+        }
+        "KV" => {
+            out.push('[');
+            c_render(at(0), out, b);
+            out.push_str("] = ");
+            c_render(at(1), out, b);
+        }
+        "StmtExpr" => {
+            out.push_str("({ ");
+            block_inner(ch.first(), out, b, c_render);
+            out.push_str(" })");
+        }
+        "TyPtr" => {
+            c_render(at(0), out, b);
+            out.push_str(" *");
+        }
+        "TyArray" => {
+            c_render(at(0), out, b);
+            out.push('[');
+            opt(ch.get(1), out, b, c_render);
+            out.push(']');
+        }
+        "TyVariadic" => out.push_str("..."),
+        "TyFn" => out.push_str("fn(?)"),
+        "TyRecord" => {
+            out.push_str(&ident(ch.first()));
+            out.push_str(" {…}");
+        }
+        "TyEnum" => out.push_str("enum {…}"),
+        "Asm" => out.push_str("asm(…)"),
+        "NestedItem" => out.push_str("/* nested type */"),
+        // Unknown / unhandled node: compact `Tag(child, …)` fallback (keeps holes visible).
+        _ => {
+            out.push_str(tag);
+            if !ch.is_empty() {
+                out.push('(');
+                seq(ch, 0, out, b, c_render);
                 out.push(')');
             }
         }
@@ -4445,5 +4798,72 @@ mod tests {
             "func _fn(_v0 *Conf) *Srv { return &Srv{Name: _v0.Name, Port: ?, Tags: map[string]int{\"?\": 1}} }"
         );
         assert_eq!(cands[0].params, 2);
+    }
+
+    // ── C dialect (the `c-canon` tree-sitter shape) ──────────────────────────
+    //
+    // As for Go: the canonicals come from `c-canon` itself, so a change to its output that the dialect
+    // does not read breaks these here.
+
+    fn c_xname(src: &str, name: &str) -> String {
+        let file: std::sync::Arc<str> = std::sync::Arc::from("t.c");
+        c_canon::scan_source(src, &file, &dup_defs_core::ScanOpts::default())
+            .into_iter()
+            .find(|d| d.name == name)
+            .and_then(|d| d.analysis)
+            .map_or_else(|| panic!("no analysis for {name}"), |a| a.xname_canonical)
+    }
+
+    #[test]
+    fn c_parse_function_body_matches_full_parse() {
+        for src in [
+            "struct user *make(int id) {\n\tstruct user *v = new_user(id);\n\tstore_add(v);\n\treturn v;\n}\n",
+            "void make(int id) {\n\tstruct user *v = new_user(id);\n\tstore_add(v);\n}\n",
+        ] {
+            let canon = c_xname(src, "make");
+            let full = match parse_term(&canon) {
+                Term::Node(_, ch) => match ch.get(3) {
+                    Some(Term::Node(tag, stmts)) if tag == "Block" => stmts.clone(),
+                    other => panic!("slot 3 is not the body: {other:?} in {canon}"),
+                },
+                other => panic!("not a node: {other:?}"),
+            };
+            assert_eq!(CDialect.parse_function_body(&canon), full, "{canon}");
+        }
+    }
+
+    #[test]
+    fn c_whole_fn_emits_factory_helper() {
+        // Two builders differing in the constructor they call and the type they return.
+        let a = c_xname("struct user *make_user(int id) {\n\tstruct user *v = new_user(id);\n\tstore_add(registry, v);\n\treturn v;\n}\n", "make_user");
+        let b = c_xname("struct order *make_order(int id) {\n\tstruct order *v = new_order(id);\n\tstore_add(registry, v);\n\treturn v;\n}\n", "make_order");
+        let cands = whole_fn_helpers(&CDialect, &[a, b], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert_eq!(cands.len(), 1, "exactly the factory helper");
+        let c = &cands[0];
+        assert_eq!(c.granularity, "whole-fn");
+        assert_eq!(c.body, "? * _fn(int _v0) { ? * _v1 = ?(_v0); store_add(registry, _v1); return _v1 }", "body: {}", c.body);
+    }
+
+    #[test]
+    fn c_subblock_mines_the_check_or_bail_motif() {
+        // C's own idiom — call, check the code, bail to the cleanup — embedded in two functions whose
+        // first statements share nothing. The divergent string argument is the one parameter.
+        let a = c_xname("int a(const char *k) {\n\tlog_line(\"a\");\n\tint ret = db_load(k, \"users\");\n\tif (ret < 0)\n\t\tgoto fail;\n\treturn ret;\nfail:\n\treturn -1;\n}\n", "a");
+        let b = c_xname("int b(const char *k) {\n\tcount = count + 1;\n\tint ret = db_load(k, \"orders\");\n\tif (ret < 0)\n\t\tgoto fail;\n\treturn ret;\nfail:\n\treturn -1;\n}\n", "b");
+        let cands = subblock_helpers(&CDialect, &[a, b], 2, &ExtractCfg::default());
+        assert_eq!(cands.len(), 1, "exactly the load-or-bail motif: {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.members, vec![0, 1]);
+        assert!(c.body.contains("db_load(_v0, \"?\")") && c.body.contains("goto fail"), "body: {}", c.body);
+        assert_eq!(c.params, 1);
+    }
+
+    #[test]
+    fn c_a_varying_member_is_a_selector_and_an_index_a_value() {
+        // `r->price` vs `r->qty`: another member, reached only by reflection — not extractable.
+        let sum = c_xname("int sum(struct row *rows, int n) {\n\tint total = 0;\n\tfor (int i = 0; i < n; i++)\n\t\tif (rows[i].ok)\n\t\t\ttotal += rows[i].price;\n\treturn total;\n}\n", "sum");
+        let qty = c_xname("int count(struct row *rows, int n) {\n\tint total = 0;\n\tfor (int i = 0; i < n; i++)\n\t\tif (rows[i].ok)\n\t\t\ttotal += rows[i].qty;\n\treturn total;\n}\n", "count");
+        let none = whole_fn_helpers(&CDialect, &[sum, qty], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert!(none.is_empty(), "a varying member name must not extract, got: {none:?}");
     }
 }

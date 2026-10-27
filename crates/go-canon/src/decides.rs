@@ -239,28 +239,11 @@ fn chain(mut e: &Expr) -> (Option<&str>, Vec<&str>) {
     }
 }
 
-/// A Go integer literal as the number it is: `0x1F`, `0o17`, `017`, `1_000` are all their value.
-fn int_text(t: &str) -> String {
-    let clean: String = t.chars().filter(|c| *c != '_').collect();
-    let lower = clean.to_ascii_lowercase();
-    let parsed = if let Some(hex) = lower.strip_prefix("0x") {
-        i128::from_str_radix(hex, 16).ok()
-    } else if let Some(bin) = lower.strip_prefix("0b") {
-        i128::from_str_radix(bin, 2).ok()
-    } else if let Some(oct) = lower.strip_prefix("0o") {
-        i128::from_str_radix(oct, 8).ok()
-    } else if lower.len() > 1 && lower.starts_with('0') {
-        i128::from_str_radix(&lower[1..], 8).ok()
-    } else {
-        lower.parse::<i128>().ok()
-    };
-    parsed.map_or(clean, |v| v.to_string())
-}
 
 /// The text of a literal, `None` the absent value, or `None` for anything that is neither.
 fn literal(e: &Expr) -> Option<String> {
     Some(match e {
-        Expr::Lit("Int", t) => int_text(t),
+        Expr::Lit("Int", t) => decide::integer(t),
         Expr::Lit("Float", t) => t.replace('_', "").parse::<f64>().map_or_else(|_| decide::literal(t), decide::number),
         Expr::Lit(_, t) => decide::literal(t),
         Expr::Bool(b) => String::from(if *b { "True" } else { "False" }),
