@@ -16,7 +16,8 @@
 # the fixtures alone, which is why the claim of "0 ERROR" had quietly stopped being true.
 suppress:*@*/tests/fixtures/*=fixture duplication is the fixture
 
-# Per-frontend kind subset — Python declares 5 kinds, Rust/TS/Go 6 (interfaces). Different content.
+# Per-frontend kind subset — Python and C declare 5 kinds (no interfaces / no methods), Rust/TS/Go 6.
+# Different content.
 de-escalate:<constants>KINDS@*canon/src/frontend.rs=per-frontend kind subset, not duplication
 
 # Public per-crate batch wrappers — identical `par_iter().map(...).collect()` body, but each calls
@@ -36,6 +37,23 @@ de-escalate:<methods>*::scan@*canon/src/frontend.rs=Frontend trait impl, identic
 
 # The Collect visitor — same shape, but walks a different AST (Ruff/syn/oxc node types) per crate.
 de-escalate:<classes>Collect@*canon/src/canon.rs=per-language AST visitor, different node types
+de-escalate:<methods>Collect::{expr,stmts}@*canon/src/canon.rs=per-language AST visitor, different node types
+
+# The owned trees the Go and C frontends lower to. Where the two languages have the same construct the
+# trees have the same shape — an `else` that is a block or another `if`, a `case` with its body, the
+# three jumps, an expression's children, a statement's parts — and they are still two languages' types:
+# Go's `case` holds a list of values and C's one, Go's jumps take labels everywhere and C's only on
+# `goto`, and every walk matches on its own language's variants.
+de-escalate:<classes>{Case,Child,Else,Jump,Part,Ctx}@*canon/src/*=per-language owned tree, one shape where the languages agree
+de-escalate:<functions>is_wrapper@*canon/src/canon.rs=per-language expression shape over its own tree
+de-escalate:<functions>{boxed,opt_boxed}@*canon/src/ir.rs=per-language lowering into its own tree
+
+# The tree-sitter parser each such frontend keeps per thread. The node accessors are shared
+# (`dup_defs_core::tree`); the grammar a parser is built over is the crate's own.
+de-escalate:<functions>parse@*canon/src/tree.rs=per-language parser, the grammar is the crate's
+
+# The dev aid each tree-sitter frontend ships to print its grammar's tree.
+de-escalate:<functions>main@*canon/examples/*=per-crate dev aid over its own grammar
 
 # The perspective walks. Same shape four times over four parser ASTs — the same irreducibility as
 # `Collect` above, one rung up: each answers the ten lens questions from Ruff / syn / oxc /
@@ -45,11 +63,13 @@ de-escalate:<functions>used_names@*canon/src/canon.rs=per-language identifier wa
 de-escalate:<classes>Walked@*canon/src/lenses.rs=per-language fact record, different node types
 de-escalate:<methods>Walk::tag@*canon/src/lenses.rs=thin per-crate forwarder to dup_defs_core::lens::control_tag
 de-escalate:<methods>Walk::nested@*canon/src/lenses.rs=per-language depth guard
+de-escalate:<methods>Walk::stmts@*canon/src/lenses.rs=per-language list walk over its own statements
 de-escalate:<methods>FactWalk::nested@*canon/src/lenses.rs=per-language depth guard
 
 # The statement-stream walkers — one per language that has block structure to walk, over its own AST.
 de-escalate:<classes>StreamWalk@*canon/src/canon.rs=per-language statement walker, different node types
 de-escalate:<methods>StreamWalk::{push,stmts}@*canon/src/canon.rs=thin per-crate accumulator and list walk
+de-escalate:<methods>StreamWalk::if_chain@*canon/src/canon.rs=per-language else-if walk over its own tree
 
 # The opt-in `lenses` kind list and the trait method that selects it — per-frontend by construction,
 # same reason as `KINDS` above.
@@ -69,7 +89,7 @@ de-escalate:<functions>analyze_item_fn@*canon/src/canon.rs=per-syn-item-type ent
 de-escalate:<functions>type3_walk@*canon/src/canon.rs=per-language statement walker, different node types
 de-escalate:<classes>UseWalk@*canon/src/canon.rs=per-language site walker, different node types
 de-escalate:<methods>UseWalk::site@*canon/src/canon.rs=per-language site walker over its own Dump
-de-escalate:<methods>Dump::{expr,anchoring,hunting,block,mention}@*canon/src/canon.rs=thin per-crate Dump method
+de-escalate:<methods>Dump::{expr,anchoring,hunting,block,mention,type_name,elements}@*canon/src/canon.rs=thin per-crate Dump method
 
 # The normal forms. Each frontend rewrites a body over its own parser AST, so the rule walks — which
 # names a body reads, whether an expression can have effects, the substitution that inlines a
@@ -78,12 +98,20 @@ de-escalate:<methods>Dump::{expr,anchoring,hunting,block,mention}@*canon/src/can
 # counts) is `dup_defs_core::normal`'s.
 de-escalate:<functions>{has_effects,names_read,reads_of,names_read_count,operands,block_ends,placeholder}@*canon/src/normal.rs=per-language walk over its own AST
 de-escalate:<classes>{ScopeWalk,Subst}@*canon/src/normal.rs=per-language visitor over its own AST
+de-escalate:<methods>ScopeWalk::*@*canon/src/normal.rs=per-language visitor over its own AST
+
+# The rules the Go and C normal forms share, each over its own owned tree: the negation normal form,
+# the guard orientation and its weighing, the else-if nesting, the temporary inlining, the compound
+# expansion. The rules are one; the trees they rewrite are two languages' types. What does not depend
+# on the tree — the operator tables, the round bound — is `dup_defs_core::normal`'s.
+de-escalate:<functions>{negate,leans_negative,guard_should_swap,weight,strip_parens,strip_parens_stmts,nest_else_ifs,flatten_else_ifs,rewrite,rewrite_tree,substitute,expand_compound,all_exprs}@*canon/src/normal.rs=one rule over each language's own tree
 
 # The decisions frontends. One reading of propositions, four ASTs: the term a name stands for follows
 # each language's own binding rules, and the visitors that collect bindings, calls and reads walk its
 # own nodes. The atom grammar, the facts record and the typed-field chain are `dup_defs_core::decide`'s.
 de-escalate:<methods>Atoms::named@*canon/src/decides.rs=per-language binding rules
-de-escalate:<methods>Atoms::{push,typed}@*canon/src/decides.rs=thin per-crate forwarder
+de-escalate:<methods>Atoms::{push,typed,stmts,callee}@*canon/src/decides.rs=thin per-crate forwarder over its own tree
+de-escalate:<methods>Refs::stmts@*canon/src/decides.rs=per-language list walk over its own tree
 de-escalate:<methods>FileScope::module@*canon/src/decides.rs=thin per-crate getter
 de-escalate:<methods>Locals::*@*canon/src/decides.rs=per-language binding counter over its own AST
 de-escalate:<classes>Refs@*canon/src/decides.rs=per-language visitor over its own AST

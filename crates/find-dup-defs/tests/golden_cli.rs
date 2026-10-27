@@ -122,6 +122,17 @@ fn converge_go_matches_golden() {
 }
 
 #[test]
+fn converge_c_matches_golden() {
+    // The batch pair once more, in C: the statements both write agree, the loop each fills parts them,
+    // and the subject is the header both reach through their `#include`.
+    assert_golden(
+        &run_in(FIX_CONVERGE, &["--converge", "--show-info", "--only", "c"]),
+        include_str!("golden/converge.c.txt"),
+        "converge.c.txt",
+    );
+}
+
+#[test]
 fn decisions_matches_golden() {
     // Locks the facts, the null and the cut together: the guard and the filter share no line and are
     // found; the forty definitions sharing a common fact or two are not.
@@ -141,6 +152,18 @@ fn decisions_go_matches_golden() {
         &run_at(&format!("{FIX_DECISIONS}/go"), FIX_DECISIONS, &["--decisions", "--show-info"]),
         include_str!("golden/decisions.go.txt"),
         "decisions.go.txt",
+    );
+}
+
+#[test]
+fn decisions_c_matches_golden() {
+    // The same corpus in C, and the rule C spells two ways: an `==` against two errno codes, and a
+    // `switch` over the same two. The constants a test compares with are facts whatever their spelling,
+    // and an enumerator is the program's, wherever it is tested.
+    assert_golden(
+        &run_at(&format!("{FIX_DECISIONS}/c"), FIX_DECISIONS, &["--decisions", "--show-info"]),
+        include_str!("golden/decisions.c.txt"),
+        "decisions.c.txt",
     );
 }
 

@@ -98,6 +98,7 @@ struct Cli {
     ///   `ts` — TypeScript via `ts-canon` (oxc parser)
     ///   `rs` — Rust via `rs-canon` (syn parser)
     ///   `go` — Go via `go-canon` (tree-sitter parser)
+    ///   `c`  — C via `c-canon` (tree-sitter parser)
     /// Unknown codes exit non-zero. Useful in mixed-language repos where you only care about
     /// one frontend per CI job (`--only py`, `--only ts`), or when a frontend's parser is
     /// crashing on bad input and you need to scan around it.
@@ -328,6 +329,16 @@ mod directive_helper_tests {
     }
 
     #[test]
+    fn a_vendored_dependency_is_read_off_its_directory() {
+        use super::path_is_vendored_dependency;
+        assert!(path_is_vendored_dependency("deps/jemalloc/src/arena.c"));
+        assert!(path_is_vendored_dependency("/repo/third_party/zlib/inflate.c"));
+        assert!(path_is_vendored_dependency("src/3rdparty/lua/lapi.c"));
+        assert!(!path_is_vendored_dependency("src/dependencies.c"));
+        assert!(!path_is_vendored_dependency("src/server.c"));
+    }
+
+    #[test]
     fn vendored_score_marks_known_snapshot_paths() {
         // Strong markers — pair should produce a vendored directive.
         assert!(vendored_score("extensions/copilot/src/util/vs/base/common") > 0);
@@ -444,8 +455,8 @@ fn main() {
     // Frontend registry — the binary is the composition root that knows every language; the
     // engine itself is frontend-agnostic. Bound to locals so the `&dyn Frontend` refs outlive
     // the whole run.
-    let (py, ts, rs, go) = (py_canon::Python, ts_canon::TypeScript, rs_canon::Rust, go_canon::Go);
-    let registry: Vec<&dyn Frontend> = vec![&py, &ts, &rs, &go];
+    let (py, ts, rs, go, c) = (py_canon::Python, ts_canon::TypeScript, rs_canon::Rust, go_canon::Go, c_canon::C);
+    let registry: Vec<&dyn Frontend> = vec![&py, &ts, &rs, &go, &c];
     // `--only` selects a subset by language code. Unknown codes are an error (exit 2) rather
     // than a silent no-op — a typo'd `--only py,rs` should fail loud so a CI job that meant to
     // include Rust doesn't ship an empty report.
@@ -970,6 +981,15 @@ fn path_is_generated(p: &str) -> bool {
         || p.contains("/generated/")
         || p.contains("/__generated__/")
 }
+/// Third-party source vendored into the tree. C has no package manager, so a C project's
+/// dependency is a directory of its source (`deps/jemalloc`, `third_party/zlib`, `3rdparty/lua`), and
+/// the duplication inside it is upstream's to fix, not the project's.
+fn path_is_vendored_dependency(p: &str) -> bool {
+    let lo = format!("/{}", p.to_ascii_lowercase());
+    ["/deps/", "/third_party/", "/third-party/", "/thirdparty/", "/3rdparty/", "/vendor/", "/external/", "/extern/"]
+        .iter()
+        .any(|marker| lo.contains(marker))
+}
 fn path_is_migration(p: &str) -> bool {
     p.contains("/migrations/") || p.contains("/alembic/versions/")
 }
@@ -1375,6 +1395,16 @@ fn infer_directives(
         3,
         "de-escalate:*@*_test.go=Go test files — table-test candidates",
         |n| format!("{n} clusters live entirely in `*_test.go` files"),
+    ) {
+        out.push(s);
+    }
+    // Vendored dependencies — what a C tree carries in place of a package manager's cache.
+    if let Some(s) = build_suggestion(
+        findings,
+        |f| f.members.iter().all(|(p, _, _)| path_is_vendored_dependency(p)),
+        3,
+        "suppress:*@*/{deps,third_party,third-party,thirdparty,3rdparty,vendor,external,extern}/*=vendored third-party source — its duplication is upstream's",
+        |n| format!("{n} clusters live entirely in vendored dependency directories"),
     ) {
         out.push(s);
     }

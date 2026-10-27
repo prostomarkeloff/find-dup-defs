@@ -236,6 +236,29 @@ pub fn number(value: f64) -> String {
     }
 }
 
+/// An integer literal as the number it is, whichever of the C-family spellings wrote it: `0x1F`,
+/// `0b1`, `0o17`, `017`, `31u`, `31UL`, and the digit separators `1_000` (Go) and `1'000` (C). Two
+/// definitions comparing with `0x10` and with `16` test one fact. Text that is no integer stays as
+/// written.
+#[must_use]
+pub fn integer(text: &str) -> String {
+    let clean: String = text.chars().filter(|c| *c != '_' && *c != '\'').collect();
+    let clean = clean.trim_end_matches(['u', 'U', 'l', 'L']);
+    let lower = clean.to_ascii_lowercase();
+    let parsed = if let Some(hex) = lower.strip_prefix("0x") {
+        i128::from_str_radix(hex, 16).ok()
+    } else if let Some(bin) = lower.strip_prefix("0b") {
+        i128::from_str_radix(bin, 2).ok()
+    } else if let Some(oct) = lower.strip_prefix("0o") {
+        i128::from_str_radix(oct, 8).ok()
+    } else if lower.len() > 1 && lower.starts_with('0') {
+        i128::from_str_radix(&lower[1..], 8).ok()
+    } else {
+        lower.parse::<i128>().ok()
+    };
+    parsed.map_or_else(|| clean.to_owned(), |v| v.to_string())
+}
+
 /// A name resolved to the dotted path it stands for.
 #[must_use]
 pub fn path(dotted: &str) -> String {
@@ -632,6 +655,16 @@ mod tests {
         call, container, equal, field, has_identity, literal, local, local_modules, member, order, parts, path,
         render, rewrite_locals, truth, HOLE,
     };
+
+    #[test]
+    fn an_integer_is_its_value_however_it_is_spelled() {
+        use super::integer;
+        for spelled in ["16", "0x10", "0X10", "0b10000", "0o20", "020", "16u", "16UL", "1_6", "1'6"] {
+            assert_eq!(integer(spelled), "16", "{spelled}");
+        }
+        assert_eq!(integer("0"), "0");
+        assert_eq!(integer("not a number"), "not a number");
+    }
 
     #[test]
     fn negation_and_operand_order_do_not_change_the_atom() {

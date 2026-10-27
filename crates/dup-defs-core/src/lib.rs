@@ -26,6 +26,8 @@ pub mod decide;
 pub mod lens;
 pub mod normal;
 pub mod reach;
+#[cfg(feature = "tree-sitter")]
+pub mod tree;
 pub mod uses;
 
 pub use canon::{alpha_rename, count_loc, is_upper_snake, quoted, type_slot, AnalyzedFn, TYPE_SLOT_PREFIX, UNFILED};

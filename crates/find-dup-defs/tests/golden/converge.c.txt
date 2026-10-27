@@ -1,0 +1,26 @@
+--- duplicate constants (cross-file, by name) ---
+
+--- duplicate functions (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate functions (cross-name, exact AST-normalized) ---
+
+--- duplicate functions (cross-name Type-3, IDF-weighted cosine) ---
+DUPLICATE FUNCTION [WARNING]: expel_members/revoke_admins  [ast sim 0.88, T=0.42, n=2, loc=10, args=3]  # evidence: p = 1.0e0 under the bipartite configuration model
+  c/batch.c:7
+  c/batch.c:18
+
+
+--- duplicate classes (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate interfaces (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate type aliases (cross-file, by name) ---
+
+--- divergences in functions (converge — one thing done twice, and where they part) ---
+DUPLICATE FUNCTION [INFO]: revoke_admins / expel_members  [T=0.05, n=2, loc=10, args=3]  votes[4]: text×11 shape×3 subject×0 fork×2  # agreed on 5 statement(s):;   = Let(PatType(Bind('_v3'), TyPtr(Ty('struct session', ))), Call(Path('session_open'), Path('_v0')));   = Let(PatType(Bind('_v4'), TyPtr(Ty('struct chat', ))), Call(Path('session_resolve'), Path('_v3'), Path('_v0')));   = Let(PatType(Bind('_v5'), Ty('long', )), Call(Path('chat_identifier'), Path('_v4')));   = Let(PatType(Bind('_v6'), TyPtr(Ty('struct result', ))), Call(Path('calloc'), Path('_v2'), SizeOf(Unary('*', Path('_v6')))));   = ForC(Let(PatType(Bind('_v7'), Ty('int', )), Int('0')), Bin(Path('_v7'), '<', Path('_v2')), Inc(Path('_v7'))); parted:;   Assign(Index(Path('_v6'), Path('_v7')), Call(Path('demote_one'), Path('_v3'), Path('_v5'), Index(Path('_v1'), Path('_v7'))));   by: demote_one;   Assign(Index(Path('_v6'), Path('_v7')), Call(Path('kick_one'), Path('_v3'), Path('_v5'), Index(Path('_v1'), Path('_v7'))));   by: kick_one; and agreed again; subject: session (reached by 2 definitions)
+  c/batch.c:7
+  c/batch.c:18
+
+
+--- families of functions (converge — many places, one subject, one shape) ---
+# summary: 0 ERROR, 2 WARNING groups

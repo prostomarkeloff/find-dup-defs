@@ -1,6 +1,6 @@
 [package]
 name = "dup-defs-core"
-version = "0.4.1"
+version = "0.4.2"
 description = "The find-dup-defs frontend↔engine contract — Def / KindSpec / Analysis / the Frontend trait (+ LineMap). Frontend-agnostic; every frontend depends on it."
 keywords = ["ast", "canonicalize", "parsing", "clone", "duplicate"]
 categories = ["development-tools"]
@@ -16,6 +16,11 @@ name = "dup_defs_core"
 # The corpus-relative lens scoring folds a document-frequency table over every lens record and
 # scores each against it; both halves are per record and run on the pool.
 rayon = "1"
+# The node accessors every tree-sitter frontend walks with — only for the frontends that ask.
+tree-sitter = { version = "0.27", optional = true }
+
+[features]
+tree-sitter = ["dep:tree-sitter"]
 
 [lints]
 workspace = true
