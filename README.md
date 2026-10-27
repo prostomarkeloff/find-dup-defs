@@ -20,8 +20,8 @@ becomes the default.
 **find-dup-defs is the gate that catches it.**
 
 - 🔍 Clusters duplicate and near-duplicate **definitions** — functions, methods, classes,
-  constants, `type` aliases, TS and Go interfaces, Rust traits, C method tables — across **Python,
-  TypeScript, Rust, Go and C**.
+  constants, `type` aliases, TS, Go and PHP interfaces, Rust traits, C method tables — across
+  **Python, TypeScript, Rust, Go, C and PHP**.
 - 🧬 Matches through **renames and edits**, not token streams: everything is compared as an
   alpha-renamed AST canonical.
 - 🎯 **Grades** each cluster by how much a refactor would actually pay off, so the biggest win is
@@ -188,9 +188,9 @@ Two refinements keep those shapes honest:
   alpha-renamed canonical turns every type reference in an annotation into a `_T{n}` slot. The
   renaming is consistent, not an erasure, so `f(a: X, b: X)` and `f(a: X, b: Y)` still differ. A call
   inside an annotation (`Annotated[T, Depends(f)]`) is a value read at runtime, so it stays as
-  written. A Rust, Go or C type is not inert — it picks the trait implementation, the method set,
-  or the arithmetic and the layout that runs — so their exact canonicals keep types as written and
-  only their Type-3 lines slot them.
+  written. A Rust, Go, C or PHP type is not inert — it picks the trait implementation, the method
+  set, or the arithmetic and the layout that runs, and PHP checks a declared type at every call — so
+  their exact canonicals keep types as written and only their Type-3 lines slot them.
 - **A Type-3 unit depends on itself alone.** Slots are renumbered within each line, so one added
   parameter no longer rewrites every later line. The types an annotation names ride as units of
   their own: a shared type still counts, and a different one costs only its own weight. Type-3
@@ -203,7 +203,7 @@ Type-3 pairs went +172 / −30. In a hand-labelled sample, 57 of 61 added pairs 
 
 Two more take the comparison from how a definition is written to what it does:
 
-- **A normal form first.** Every function — Python, TypeScript, Rust, Go or C — is rewritten to one
+- **A normal form first.** Every function — Python, TypeScript, Rust, Go, C or PHP — is rewritten to one
   representative of its equivalence class under a fixed set of oriented rules before the
   name-agnostic canonicals are taken: negation normal form, a fixed orientation for comparisons and
   for the branches of an `if`, guard form instead of nesting, `if`/`else` statements in place of
@@ -232,6 +232,14 @@ Two more take the comparison from how a definition is written to what it does:
   case ends in its own `break` or leaves the function, the empty cases that share the next one's body
   read as one test; and the guard is picked as in Go, C's failing branch being a `goto` to the cleanup,
   a negative or `NULL` return, an error code, or a call that does not return.
+  PHP spells many things twice in its grammar, and each pair is one shape before anything compares
+  it: `elseif` and `else if`, the `if (…): … endif;` syntax and braces, `array(…)` and `[…]`, `and`
+  and `&&`, `die` and `exit`. Then the rules: a Yoda condition (`'open' === $status`) meets the test
+  written the other way round, `isset($x)` is `$x !== null` and `is_null($x)` is `$x === null`,
+  `$s .= 'x'` is `$s = $s . 'x'`, a final `return;` is falling off the end (both hand back `null`),
+  a `switch` is its ladder — of loose `==` tests, as `switch` compares — and the guard holds the
+  failing branch: a `throw`, a `return false` / `null`, an error object, an `exit`. A body that reads
+  its variables by name (`compact`, `extract`, `$$name`) keeps every temporary.
 - **Statements agree in part.** Type-3 scores a pair by the *soft cosine* of its line vectors
   (Sidorov et al. 2014): two lines contribute by the Jaccard of their parts — the line and every
   sub-expression inside it — so a token changed deep in a long statement costs the parts it sits
@@ -291,6 +299,16 @@ clusters in the first place:
   and a portable one beside its overrides (`bswap.h` beside `arm/bswap.h`) is it; and a `#define` that
   is a template's argument rather than a constant — taken back by `#undef`, or one of the run written
   just before `#include "dsp_template.c"`.
+- **PHP** — the accessors a class is mostly made of (a getter `return $this->x;`, a setter, a
+  constructor that only hands its arguments to `parent::__construct` and stores the rest), bodies
+  that only `return` a variable, a literal or a constant, only `throw` an exception built from
+  literals, or only announce a deprecation (`_deprecated_function(__FUNCTION__, '4.3.0')`); a class
+  or interface with no members — an exception type, a marker interface — which is a name, not a body;
+  files that declare themselves generated (`@generated`, `DO NOT EDIT`), Composer's own runtime
+  (`ClassLoader.php`, `InstalledVersions.php`) wherever a tree commits its vendor directory, and a
+  Drupal `*.api.php`, which documents hooks and is never loaded; and a function a file declares twice
+  — `if (PHP_VERSION_ID >= 80000) { function f() … } else { function f() … }` — is one definition.
+  `$this` is `self`, as a receiver is everywhere else.
 
 Each surviving cluster lands in a tier: **ERROR** gates CI, **WARNING** is for review, **INFO** is
 hidden unless you ask (`--show-info`, or `--json` where it's always present).
@@ -421,6 +439,15 @@ more under `deps/` — and their duplication is upstream's. Two trees barely mov
 modules (`ngx_http_validate_host`/`ngx_stream_validate_host`, 163 lines, on top), and FFmpeg's
 codec libraries (1.4M lines, scanned in 3.5 s) stay at 608 — decoder/encoder pairs, and SIMD kernels
 written once per instruction set.
+
+Five PHP trees, same method: `laravel/framework` **770 → 206 ERROR**, `drupal/drupal` 755 → 239,
+`nextcloud/server` 624 → 278, `owncloud/core` 411 → 110 — the directive that cuts is the test tree
+again, where a PHP project keeps a mirror of its classes — and `WordPress` stays at 205, having no tests
+in its repository to cut. What is left on top: Drupal's `Xss::attributes` and `AttributeXss::attributes`,
+one 114-line attribute parser written twice for two XSS filters; Nextcloud's `IUserConfig`, 757 lines
+kept once under `lib/public` and again under `lib/unstable`; Laravel's twenty-three
+`*MakeCommand::resolveStubPath`; WordPress's twenty-eight template conditionals `is_404 … is_year`,
+each a forward to the query it reads. Drupal — 10.5k files, 49 MB — scans in about 2 s.
 
 **What's left at the top is the kind of thing a human reviewer would also flag.** `pip`'s Version
 `__lt__…__gt__` ×6 collapse into one `_compare` helper, −130 lines. `scipy`'s `dct/dst/idct/idst`
@@ -588,17 +615,19 @@ Then the template has to *survive*, and most don't. A candidate is kept only if 
 
 What's left is a motif that genuinely collapses into one clean, reflection-free helper. The
 proposed body is rendered as readable pseudo-source (`def …:` for Python, `fn …` for Rust,
-`func …` for Go, `type name(…) { … }` for C, the matching shape for TS), and the finding carries its
-parameter count and an estimated LOC saved.
+`func …` for Go, `type name(…) { … }` for C, `function name(…) { … }` for PHP, the matching shape for
+TS), and the finding carries its parameter count and an estimated LOC saved.
 
 The dialect seam is a `Dialect` trait — slot classification plus a pseudo-source renderer — with
-`PyDialect`, `RustDialect`, `TsDialect`, `GoDialect` and `CDialect` behind it. A run partitions defs
-by language and folds each group with its own dialect; functions of two languages never anti-unify
-against each other. In Go a struct literal's field name is a selector — a varying one would need
-reflection, so it is never a hole — while a map literal's key is a value and may be. C reads the same
-way: a designated initializer's member (`.port = 80`) is a selector and an indexed one's index
+`PyDialect`, `RustDialect`, `TsDialect`, `GoDialect`, `CDialect` and `PhpDialect` behind it. A run
+partitions defs by language and folds each group with its own dialect; functions of two languages never
+anti-unify against each other. In Go a struct literal's field name is a selector — a varying one would
+need reflection, so it is never a hole — while a map literal's key is a value and may be. C reads the
+same way: a designated initializer's member (`.port = 80`) is a selector and an indexed one's index
 (`[3] = x`) a value, and a call through a member (`dev->ops->open(dev)`) is C's method call, the
-member it calls a selector like a method's name.
+member it calls a selector like a method's name. In PHP every member slot is a selector — a method, a
+property, `Scope::CONST`, `Scope::$static`, a named argument's name — and a method named by a variable
+(`$node->$operation('')`) is not a hole at all but the same call in every copy.
 </details>
 
 <details>
@@ -666,7 +695,7 @@ Ten lenses, each answering one question:
 | `scope` | what does its body do? | the body with every name its module introduced erased |
 | `use` | how is it handled? | the statements elsewhere in the tree that mention it |
 
-Opt in with `--kinds lenses` — Python, Rust, TypeScript, Go and C. Directives address it like any other
+Opt in with `--kinds lenses` — Python, Rust, TypeScript, Go, C and PHP. Directives address it like any other
 kind: `-D 'suppress:<lenses>*@*/legacy/*=deliberate parallel port'`. The kind exists exactly when
 asked for, so the section list, the default report and the default JSON are byte-identical without
 it.
@@ -744,6 +773,14 @@ own (`NGX_ERROR`, `AVERROR(ENOMEM)`), a negative number, `NULL` — the calls th
 `if (ret < 0) return ret;`, recorded as the same fact as Go's `if err != nil` and Rust's `?`. And C
 does answer `decorators`: the storage class and function specifiers a definition carries (`static`,
 `inline`, `_Noreturn`).
+
+PHP fails both ways, and a body may use both. It throws, so `failures` reads the classes it throws and
+catches as Python's are read — and a rethrow of what a `catch` bound is `?`, the failure handed on.
+And it returns a failure value, the convention older PHP and every plugin API built on it keep:
+`false`, `null`, an error object (`new WP_Error(…)`); `exit`, `die` and `wp_die` stop the request.
+Its resources are released by a call, as C's are — `$f = fopen(…); … fclose($f)` holds `fopen`,
+`ob_start` is what `ob_get_clean` releases — and `decorators` reads a definition's modifiers
+(`public`, `static`, `final`) and its attributes (`#[Route('/x')]`).
 </details>
 
 ---
@@ -829,6 +866,15 @@ and follows each file's includes through them — beside the file, then up its d
 one header of the run whose path ends as the include is written — and a definition reaches the nearest
 header that declares a name it uses. Go's exception falls out by itself here: a system header
 (`<stdio.h>`) is in none of those places, so the C library is never a subject.
+
+PHP says what a file is about in its `use` statements, read by the language's own rules — a class
+through its alias or under the file's namespace, a function or constant through `use function` /
+`use const` or else the global one — and a definition reaches every name it uses that the file
+imported or wrote fully qualified (`\App\Models\Order`). Go's exception falls out by itself again: the
+language's library is global and never imported. One addition is PHP's own: a class handed its
+dependencies keeps them in properties, so a method reaches the class of every property it reads off
+`$this` — `private LoggerInterface $log` or a promoted constructor parameter — the dependency it
+turns to, though its body names nothing but `$this->log`.
 
 | anchor | agreement | divergence | reads as |
 |---|---|---|---|
@@ -949,6 +995,13 @@ for a test and its negation.
   compute — `strcmp(a, b) == 0` and `!strcmp(a, b)` are `a = b`, `strcmp(a, b) < 0` is `a < b`, and
   `strstr(s, x)` tested is `x in s`; what `assert`, `av_assert0` or `BUG_ON` asserts is a truth position,
   and `likely(…)` / `unlikely(…)` are transparent. `p == NULL` is `None = p`.
+- **In PHP** `==` and `===` are one relation, as their negations are; a `switch` compares its value
+  with each case and a `match` with each arm — `match (true)` tests each arm; the library's tests are
+  the relation they compute — `isset($x)`, `is_null($x)` and `$x === null` are `None = x`, `empty($x)`
+  a truth test, `in_array($x, [A, B])` the two equalities it abbreviates and `in_array` over anything
+  else, `array_key_exists`, `str_contains` and `strpos(…) !== false` membership, `strcmp(…) === 0`
+  equality; and `$x instanceof C` and `is_string($x)` are membership in a type, as Python's `isinstance`
+  is.
 - **What a term is:** a name the definition binds is a hole (its spelling is the writer's); an imported
   name is the path it was imported from; a name the module defines is a local path, named the way the
   rest of the tree imports that module — under the source root the corpus's own imports attest, not
@@ -962,7 +1015,10 @@ for a test and its negation.
   package is its import path — the module `go.mod` declares and the directory under it — so a call
   from another package and the definition meet the same way. A C name is the program's: C has one
   namespace for everything with external linkage, so a function and a call to it meet by name alone —
-  save a `static` one, which is its file's and is qualified by the file's path.
+  save a `static` one, which is its file's and is qualified by the file's path. A PHP name is resolved
+  through its file's namespace and `use` statements, as the interpreter resolves it, and
+  `self::OPEN` is the class the body is in; every variable a function names is its own, and a
+  property read off `$this` is a field of the value the method is read off, as a Go receiver's is.
 - **What is not a fact:** a filter. `Order.shop_id == shop_id` selects rows by a key the caller chose,
   `Order.id == Line.order_id` joins two tables, `Post.date < since` bounds a range — each compares an
   attribute of a class (a column, in a query) with a value the text does not fix, and says nothing about
@@ -971,7 +1027,8 @@ for a test and its negation.
   against another attribute of the same class (`Task.attempts < Task.max_attempts`). Go spells its
   constants like its types (`StatusOpen`, `http.StatusOK`), so no casing tells one from a class there;
   the grammar does — an operand of a comparison can only be a value — and the frontend writes a
-  package-level name it compares with as one; C's frontend does the same with a file-scope name. A
+  package-level name it compares with as one; C's frontend does the same with a file-scope name, and
+  PHP's with a constant, a class constant included. A
   field read off a value is not held to this:
   `a.id == b.id` and `latest.revision == revision` relate two records, and whether they agree is the
   decision.
@@ -1029,7 +1086,10 @@ or positional, is the constructor — and a method (dispatched through whatever 
 satisfies) or a function the toolchain calls (`init`, `main`, `Test…`, `Benchmark…`, `Fuzz…`,
 `Example…`) is called from outside it; a variadic parameter is never one call's argument. In C a
 `struct` is a record, its brace initializer — designated or positional — the constructor; `main` is
-called from outside the corpus, and a variadic function's parameters are no one call's. These guards
+called from outside the corpus, and a variadic function's parameters are no one call's. In PHP a class
+is called with what its `__construct` takes, by `new`; a method is dispatched through every class that
+inherits it and a magic one (`__get`, `__call`) by the runtime, so neither's parameters are one call's;
+and `$this->helper()` calls the method of the class the body is in. These guards
 catch what the text shows — not reflection, dispatch by string, or callers outside the scanned tree.
 That is why it is off by default: true of an application, mostly false of a library. A finding that
 leans on it says so next to the fact that needed it.
@@ -1086,7 +1146,12 @@ reports 2808 in 0.33 s, and a random 25 read 12 relevant — one precondition re
 that needs it (a key opened for writing, the same three expiry flags), two near-twin overlap checks.
 Twelve of the thirteen false are the same dispatch again, more of it than anywhere: C has no
 polymorphism, so every serializer, every iterator and every command switches on `o->type` or
-`o->encoding`.
+`o->encoding`. On WordPress (≈7.8k definitions that test anything) it reports 2654 in 1.2 s, and a
+random 25 read 18 relevant — the plugin-activation permission rule written in the AJAX handler, the REST
+controller and the installer skin; the same twelve-hour throttle on checking for core and for plugin
+updates; the same draft-or-autosave test before an edit. Four of the seven false are the framework's own
+idioms — a REST response checking `_links` and `_embedded`, a list table reading `orderby`, `order` and
+`s` — and one is the dispatch again, an HTML parser's insertion modes each switching on the token.
 </details>
 
 ## For agents
@@ -1115,15 +1180,15 @@ find-dup-defs ./repo \
 
 ## Architecture
 
-Seven crates, layered so the engine never depends on a language:
+Eight crates, layered so the engine never depends on a language:
 
 ```
-                    dup-defs-core            ← the shared ground: the Def / KindSpec / Facets / Frontend
-                         ▲                     contract, the kind vocabulary, the alpha-rename, the lens
-        ┌─────┬─────┬────┴┬─────┬─────┐       machinery and the dotted-path form.  No deps but rayon.
-      py-   rs-   ts-   go-    c-    find-dup-defs
-     canon canon canon canon canon  (engine + CLI: the 3 passes + patternology + converge + decisions +
-        └─────┴─────┴─────┴─────┴────▲         severity + directives + calibration + reports)
+                       dup-defs-core            ← the shared ground: the Def / KindSpec / Facets / Frontend
+                            ▲                     contract, the kind vocabulary, the alpha-rename, the lens
+        ┌─────┬─────┬─────┬─┴───┬─────┬─────┐     machinery and the dotted-path form.  No deps but rayon.
+      py-   rs-   ts-   go-    c-   php-   find-dup-defs
+     canon canon canon canon canon canon  (engine + CLI: the 3 passes + patternology + converge +
+        └─────┴─────┴─────┴─────┴─────┴────▲       decisions + severity + directives + calibration + reports)
                                │
                     the engine depends on the contract and on each frontend,
                     and on no frontend's internals
@@ -1136,9 +1201,10 @@ frontends would otherwise each keep a copy of — the kind vocabulary, `alpha_re
 the lens vocabulary and stitching, the `use` lens's site logic, the dotted-path form and its prefix
 walk, the decision-atom grammar and the facts record, the normal form's round bound, name counts and
 operator tables, and — behind a feature, for the frontends that parse with it — the tree-sitter node
-accessors. [`py-canon`](crates/py-canon), [`ts-canon`](crates/ts-canon), [`rs-canon`](crates/rs-canon),
-[`go-canon`](crates/go-canon) and [`c-canon`](crates/c-canon) are the frontends (Ruff, oxc, syn, and
-tree-sitter for the last two).
+accessors, the lowering depth limit and the deep-stack pool. [`py-canon`](crates/py-canon),
+[`ts-canon`](crates/ts-canon), [`rs-canon`](crates/rs-canon), [`go-canon`](crates/go-canon),
+[`c-canon`](crates/c-canon) and [`php-canon`](crates/php-canon) are the frontends (Ruff, oxc, syn, and
+tree-sitter for the last three).
 
 **Adding a language is one more `<lang>-canon` crate implementing `Frontend`** — plus a `Dialect`
 impl if it wants patternology — and no engine changes.
@@ -1181,9 +1247,9 @@ helpers that `type3` and `patternology` had each copied — so they were extract
 USAGE:  find-dup-defs [OPTIONS] <PATHS>...
 
 LANGUAGES
-  --only <CODES>            Restrict to frontends (py,ts,rs,go,c). Default: all found in PATHS.
+  --only <CODES>            Restrict to frontends (py,ts,rs,go,c,php). Default: all found in PATHS.
   --kinds <K,…>             functions,methods,classes,interfaces,constants,type-aliases
-                            + `lenses` (opt-in; py, rs, ts, go, c) — see Lenses.
+                            + `lenses` (opt-in; py, rs, ts, go, c, php) — see Lenses.
                             Closed vocabulary: an unknown name exits non-zero.
 
 SEVERITY (thickness ladder)
@@ -1197,7 +1263,7 @@ SIMILARITY
   --type3-theta <F>         Type-3 cosine floor        (default 0.7)
   --max-name-group <N>      Skip name-gated clustering for (kind,name) groups > N
 
-LENSES (opt-in · py, rs, ts, go, c)
+LENSES (opt-in · py, rs, ts, go, c, php)
   --kinds lenses            Cluster by perspectives other than the body; each finding reports
                             which lenses agreed (`votes[n]: control×3 outgoing×2 …`)
 
@@ -1206,12 +1272,12 @@ PATTERNOLOGY (opt-in · advisory, never ERROR)
   --pattern-theta <F>       Whole-fn structural cosine floor (default 0.85)
   --pattern-support <N>     Sub-block idiom support floor     (default 3)
 
-CONVERGE (opt-in · advisory, never ERROR · py, rs, ts, go, c)
+CONVERGE (opt-in · advisory, never ERROR · py, rs, ts, go, c, php)
   --converge                Where two definitions about the same thing stop agreeing, and the
                             families of many that do the same thing around one subject
   --converge-top <N>        Keep the strongest N of each kind (default 50; 0 = every one)
 
-DECISIONS (opt-in · advisory, never ERROR · py, rs, ts, go, c)
+DECISIONS (opt-in · advisory, never ERROR · py, rs, ts, go, c, php)
   --decisions               Definitions that decide on the same facts, however they are written;
                             pairs and families, validated under the bipartite configuration model
 
@@ -1242,7 +1308,7 @@ SETTINGS (via -D 'settings:KEY=VALUE')
 
 The honest ledger:
 
-- **Languages.** Python, TypeScript, Rust, Go and C today. A new language is a `<lang>-canon` sibling
+- **Languages.** Python, TypeScript, Rust, Go, C and PHP today. A new language is a `<lang>-canon` sibling
   crate.
 - **Go is read without a type checker.** A method call is named by the value it is read off, not by
   the type that value has, so the closed world sees no call site through a variable; and build
@@ -1255,6 +1321,13 @@ The honest ledger:
   nothing). A function whose body the parser cannot read for a quarter or more is skipped: on five
   large trees, 2–5% of function bodies hold some parse error, most of them a macro used where the
   grammar wants something else, and those are read around it.
+- **PHP is read file by file, as the interpreter compiles it**, with nothing it would only learn by
+  running: a name resolves through its file's `use` statements and namespace, never through an
+  autoloader, so `\App\Models\Order` and an `Order` imported from elsewhere meet only when the imports
+  say so; a call made by name in a string (`add_action('init', 'boot')`, `call_user_func('f')`) is not
+  read as a call; and an unqualified function a namespace declares is read as the global one PHP falls
+  back to when no import says otherwise. Of 156k function and method bodies across five large trees,
+  two hold a parse error.
 - **Rust macros** are read when their arguments are comma-separated expressions (`vec![a, b]`,
   `assert_eq!(x, y)`, `format!(…)`); one that takes anything else (`vec![0; n]`, a DSL) is opaque
   to every pass.
@@ -1268,8 +1341,9 @@ The honest ledger:
 - **Dispatch reads as a decision.** Two methods that each `match` over every variant of one enum share
   every variant test, and the decisions pass reports them — in Rust, where a trait implementation over
   an enum is the commonest shape there is, that is most of its false findings; in Go the type
-  switch over one interface's implementations is the same shape, and in C, which has no polymorphism,
-  the `switch` on a tag field is how every object is handled. Telling an exhaustive dispatch from
+  switch over one interface's implementations is the same shape, in C, which has no polymorphism,
+  the `switch` on a tag field is how every object is handled, and in PHP a state machine's states each
+  switch on the same token kinds. Telling an exhaustive dispatch from
   a decision written twice would drop the real ones too (two functions that both decide on
   `Status::Open` and `Status::Closed`), so it is left to the reader.
 - **Rust crate names** are read from the package directory (`actix-web` is `actix_web`, the name

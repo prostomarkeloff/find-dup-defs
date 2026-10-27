@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "c-canon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dup-defs-core",
  "rayon",
@@ -320,7 +320,7 @@ checksum = "fd8e701084c37e7ef62d3f9e453b618130cbc0ef3573847785952a3ac3f746bf"
 
 [[package]]
 name = "dup-defs-core"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "rayon",
  "tree-sitter",
@@ -346,7 +346,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "find-dup-defs"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "c-canon",
  "clap",
@@ -355,6 +355,7 @@ dependencies = [
  "dup-defs-core",
  "go-canon",
  "mimalloc",
+ "php-canon",
  "py-canon",
  "rayon",
  "rs-canon",
@@ -1032,6 +1033,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "php-canon"
+version = "0.1.0"
+dependencies = [
+ "dup-defs-core",
+ "rayon",
+ "tree-sitter",
+ "tree-sitter-php",
+]
+
+[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1409,6 +1420,16 @@ name = "tree-sitter-language"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0af592be68c579aa78a16846bd19422978c3c52e438523d45ff5d1bff1f9d4a"
+
+[[package]]
+name = "tree-sitter-php"
+version = "0.25.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9779e392d38af4254f48be0e57b7eed4d50ec7a6e55a7e5e2e74df8f8f032d3"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
 
 [[package]]
 name = "ts-canon"

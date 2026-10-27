@@ -16,45 +16,14 @@
 //!   had to end with an invented `;`, followed by a block. Read as written that is a call and an
 //!   unrelated block; it is a loop, [`Stmt::MacroLoop`].
 //!
-//! Lowering is depth-limited ([`MAX_DEPTH`]): machine-written C nests an expression thousands of levels
+//! Lowering is depth-limited ([`dup_defs_core::tree::MAX_DEPTH`]): machine-written C nests an expression thousands of levels
 //! deep (a table's sum, an `else if` ladder of every opcode), and every walk downstream — this one,
 //! the canonicals, the engine reading them — recurses. A subtree past the limit is one `Unknown`.
 
-use std::cell::Cell;
-
+use dup_defs_core::tree::Level;
 use tree_sitter::Node;
 
 use crate::tree::{field, fields, kids, missing_semicolon, squashed, text, unquote};
-
-/// How deep lowering follows nested statements and expressions before writing the rest as one
-/// opaque node.
-pub(crate) const MAX_DEPTH: usize = 200;
-
-thread_local! {
-    static DEPTH: Cell<usize> = const { Cell::new(0) };
-}
-
-/// One level of lowering depth, released when dropped; `None` past [`MAX_DEPTH`].
-struct Level;
-
-impl Level {
-    fn enter() -> Option<Self> {
-        DEPTH.with(|d| {
-            if d.get() >= MAX_DEPTH {
-                None
-            } else {
-                d.set(d.get() + 1);
-                Some(Level)
-            }
-        })
-    }
-}
-
-impl Drop for Level {
-    fn drop(&mut self) {
-        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-    }
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Type {

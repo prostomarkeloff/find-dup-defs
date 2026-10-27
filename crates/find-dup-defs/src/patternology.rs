@@ -2448,6 +2448,497 @@ fn c_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
     }
 }
 
+// ── PHP dialect ──────────────────────────────────────────────────────────────
+
+/// The PHP dialect — `php-canon`'s tree-sitter-derived structural dump. It lays a function out as Go's
+/// and C's do — `Func(name, Params(…), return type, Block(…))`, the body at slot 3, read by the same
+/// borrow ([`go_parse_function_body`]) — and speaks the shared tags wherever the construct is the same
+/// one, adding PHP's own (`StaticCall`/`StaticField`/`ClassConst`, `Echo`, `Interp`, `Arr`, `Closure`,
+/// `Arrow`, `Match`, `Try`/`Catch`). Selectors are the member slots of a call or a read — instance or
+/// static — a named argument's name and a `goto`'s label; a parameter's type, a promoted parameter's
+/// visibility and the return type are signature material.
+pub(crate) struct PhpDialect;
+
+impl Dialect for PhpDialect {
+    fn slot_ctx(&self, tag: &str, k: usize) -> Ctx {
+        match (tag, k) {
+            // Every child of a `Block` is a statement; every body (`If`/`For`/`Case`/`Catch`/…) is a `Block`.
+            ("Block", _) => Ctx::Stmt,
+            ("Method" | "NullsafeMethod" | "Field" | "NullsafeField" | "StaticCall" | "StaticField" | "ClassConst", 1)
+            | ("Kw" | "Goto" | "Labeled", 0) => Ctx::Selector,
+            ("Param" | "RefParam" | "Variadic", 1 | 3) | ("Func", 0 | 2) => Ctx::Anno,
+            _ => Ctx::Expr,
+        }
+    }
+
+    fn parse_function_body(&self, canon: &str) -> Vec<Term> {
+        go_parse_function_body(canon)
+    }
+
+    fn render(&self, t: &Term, out: &mut String, budget: &mut usize) {
+        php_render(t, out, budget);
+    }
+
+    fn is_sequence(&self, tag: &str) -> bool {
+        matches!(tag, "Block" | "Params" | "Seq" | "Arr" | "ArrTarget" | "Uses" | "Conds" | "Interp" | "Echo" | "TyUnion" | "TyInter" | "StaticVars")
+    }
+}
+
+/// A variable as PHP spells it: the renamed slots and `self` take their `$` back.
+fn php_var(name: &str) -> String {
+    match name {
+        "self" => "$this".to_owned(),
+        n if n.starts_with("_v") && n[2..].chars().all(|c| c.is_ascii_digit()) => format!("${n}"),
+        n => n.to_owned(),
+    }
+}
+
+/// Render a folded PHP term as one line of pseudo-source. Mirrors [`c_render`]: bounded by `b`, holes
+/// `?`, unknown tags fall back to the raw `Tag(child, …)` form.
+fn php_render(t: &Term, out: &mut String, b: &mut usize) {
+    if *b == 0 {
+        out.push('…');
+        return;
+    }
+    *b -= 1;
+    match t {
+        Term::Hole => out.push('?'),
+        Term::Atom(s) => out.push_str(unq(s)),
+        Term::List(items) => {
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                php_render(it, out, b);
+            }
+        }
+        Term::Node(tag, ch) => php_node(tag, ch, out, b),
+    }
+}
+
+/// A member's name: as written, or the variable or expression that computes it (`$obj->$name`,
+/// `$obj->{$a . $b}`).
+fn php_member(t: Option<&Term>, out: &mut String, b: &mut usize) {
+    match t {
+        Some(Term::Node(tag, ch)) if tag == "DynName" => match ch.first() {
+            Some(Term::Node(inner, _)) if inner == "Path" => php_render(&ch[0], out, b),
+            other => {
+                out.push('{');
+                opt(other, out, b, php_render);
+                out.push('}');
+            }
+        },
+        other => out.push_str(&ident(other)),
+    }
+}
+
+#[allow(clippy::too_many_lines)] // one arm per construct reads better straight-through
+fn php_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
+    let hole = &Term::Hole;
+    let at = |i: usize| ch.get(i).unwrap_or(hole);
+    match tag {
+        "Func" => {
+            // `Func(name, Params, ret, Block)` → `function name(params): ret { … }`.
+            out.push_str("function ");
+            out.push_str(&ident(ch.first()));
+            out.push('(');
+            if let Some(Term::Node(pt, pch)) = ch.get(1) {
+                if pt == "Params" {
+                    seq(pch, 0, out, b, php_render);
+                }
+            }
+            out.push(')');
+            if !go_blank(ch.get(2)) {
+                out.push_str(": ");
+                php_render(at(2), out, b);
+            }
+            out.push(' ');
+            braced(ch.get(3), out, b, php_render);
+        }
+        "Params" | "Seq" | "Conds" => seq(ch, 0, out, b, php_render),
+        "Param" | "RefParam" | "Variadic" => {
+            // `Param(Bind, type, default[, visibility])` → `type $x = default`.
+            if !go_blank(ch.get(1)) {
+                php_render(at(1), out, b);
+                out.push(' ');
+            }
+            out.push_str(match tag {
+                "RefParam" => "&",
+                "Variadic" => "...",
+                _ => "",
+            });
+            php_render(at(0), out, b);
+            if !go_blank(ch.get(2)) {
+                out.push_str(" = ");
+                php_render(at(2), out, b);
+            }
+        }
+        "Block" => braced(Some(&Term::Node(tag.to_owned(), ch.to_vec())), out, b, php_render),
+        "Assign" | "AssignRef" => {
+            php_render(at(0), out, b);
+            out.push_str(if tag == "AssignRef" { " =& " } else { " = " });
+            php_render(at(1), out, b);
+        }
+        "Bin" | "AssignExpr" => {
+            php_render(at(0), out, b);
+            out.push(' ');
+            out.push_str(&ident(ch.get(1)));
+            out.push(' ');
+            php_render(at(2), out, b);
+        }
+        "Inc" | "Dec" => {
+            php_render(at(0), out, b);
+            out.push_str(if tag == "Inc" { "++" } else { "--" });
+        }
+        "PreInc" | "PreDec" => {
+            out.push_str(if tag == "PreInc" { "++" } else { "--" });
+            php_render(at(0), out, b);
+        }
+        "ExprStmt" | "BlockExpr" => php_render(at(0), out, b),
+        "Echo" | "Unset" | "Global" => {
+            out.push_str(match tag {
+                "Echo" => "echo ",
+                "Unset" => "unset(",
+                _ => "global ",
+            });
+            seq(ch, 0, out, b, php_render);
+            if tag == "Unset" {
+                out.push(')');
+            }
+        }
+        "Return" | "Throw" | "Break" | "Continue" | "Goto" | "YieldFrom" | "Print" | "Clone" => {
+            out.push_str(match tag {
+                "Return" => "return",
+                "Throw" => "throw",
+                "Break" => "break",
+                "Continue" => "continue",
+                "Goto" => "goto",
+                "YieldFrom" => "yield from",
+                "Print" => "print",
+                _ => "clone",
+            });
+            if !go_blank(ch.first()) {
+                out.push(' ');
+                php_render(at(0), out, b);
+            }
+        }
+        "If" => {
+            // `If(cond, Block, else)`
+            out.push_str("if (");
+            php_render(at(0), out, b);
+            out.push_str(") ");
+            braced(ch.get(1), out, b, php_render);
+            if !go_blank(ch.get(2)) {
+                out.push_str(" else ");
+                match at(2) {
+                    Term::Node(t, _) if t == "If" => php_render(at(2), out, b),
+                    other => braced(Some(other), out, b, php_render),
+                }
+            }
+        }
+        "While" => {
+            out.push_str("while (");
+            php_render(at(0), out, b);
+            out.push_str(") ");
+            braced(ch.get(1), out, b, php_render);
+        }
+        "DoWhile" => {
+            out.push_str("do ");
+            braced(ch.first(), out, b, php_render);
+            out.push_str(" while (");
+            php_render(at(1), out, b);
+            out.push(')');
+        }
+        "ForC" => {
+            out.push_str("for (");
+            opt(ch.first(), out, b, php_render);
+            out.push_str("; ");
+            opt(ch.get(1), out, b, php_render);
+            out.push_str("; ");
+            opt(ch.get(2), out, b, php_render);
+            out.push_str(") ");
+            braced(ch.get(3), out, b, php_render);
+        }
+        "For" => {
+            // `For(binding, subject, Block)` → `foreach (subject as binding) { … }`.
+            out.push_str("foreach (");
+            php_render(at(1), out, b);
+            out.push_str(" as ");
+            php_render(at(0), out, b);
+            out.push_str(") ");
+            braced(ch.get(2), out, b, php_render);
+        }
+        // `key => value`, and a `match` arm's `conditions => result`.
+        "KV" | "Arm" => {
+            php_render(at(0), out, b);
+            out.push_str(" => ");
+            php_render(at(1), out, b);
+        }
+        "Switch" => {
+            out.push_str("switch (");
+            php_render(at(0), out, b);
+            out.push_str(") { ");
+            for (i, case) in ch.iter().enumerate().skip(1) {
+                if i > 1 {
+                    out.push_str("; ");
+                }
+                php_render(case, out, b);
+            }
+            out.push_str(" }");
+        }
+        // `Case(value, Block)`, `Default(Block)` — and a `match`'s `Default(value)`.
+        "Case" | "Default" => {
+            if tag == "Default" {
+                out.push_str("default");
+            } else {
+                out.push_str("case ");
+                php_render(at(0), out, b);
+            }
+            match ch.last() {
+                Some(Term::Node(t, _)) if t == "Block" => {
+                    out.push_str(": ");
+                    block_inner(ch.last(), out, b, php_render);
+                }
+                Some(value) => {
+                    out.push_str(" => ");
+                    php_render(value, out, b);
+                }
+                None => {}
+            }
+        }
+        "Try" => {
+            // `Try(Block, Catch…, finally)`
+            out.push_str("try ");
+            braced(ch.first(), out, b, php_render);
+            let catches = ch.len().saturating_sub(1);
+            for c in ch.iter().take(catches).skip(1) {
+                out.push(' ');
+                php_render(c, out, b);
+            }
+            if !go_blank(ch.last()) && ch.len() > 1 {
+                out.push_str(" finally ");
+                braced(ch.last(), out, b, php_render);
+            }
+        }
+        "Catch" => {
+            // `Catch(Types(…), Bind, Block)`
+            out.push_str("catch (");
+            php_render(at(0), out, b);
+            if !go_blank(ch.get(1)) {
+                out.push(' ');
+                php_render(at(1), out, b);
+            }
+            out.push_str(") ");
+            braced(ch.last(), out, b, php_render);
+        }
+        "Types" => {
+            for (i, t) in ch.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(" | ");
+                }
+                php_render(t, out, b);
+            }
+        }
+        "Labeled" => {
+            out.push_str(&ident(ch.first()));
+            out.push(':');
+        }
+        "Path" | "Bind" => out.push_str(&php_var(&ident(ch.first()))),
+        "Int" | "Float" | "Bool" | "Ty" => out.push_str(&ident(ch.first())),
+        "Nil" => out.push_str("null"),
+        "Str" => {
+            out.push('\'');
+            out.push_str(&ident(ch.first()));
+            out.push('\'');
+        }
+        "Interp" | "Shell" => {
+            let quote = if tag == "Shell" { '`' } else { '"' };
+            out.push(quote);
+            for part in ch {
+                match part {
+                    Term::Node(t, pch) if t == "Str" => out.push_str(&ident(pch.first())),
+                    other => {
+                        out.push('{');
+                        php_render(other, out, b);
+                        out.push('}');
+                    }
+                }
+            }
+            out.push(quote);
+        }
+        "Unary" => {
+            out.push_str(&ident(ch.first()));
+            php_render(at(1), out, b);
+        }
+        "Ref" => {
+            out.push('&');
+            php_render(at(0), out, b);
+        }
+        "Spread" => {
+            out.push_str("...");
+            php_render(at(0), out, b);
+        }
+        "Silence" => {
+            out.push('@');
+            php_render(at(0), out, b);
+        }
+        "Cond" => {
+            php_render(at(0), out, b);
+            out.push_str(" ? ");
+            opt(ch.get(1), out, b, php_render);
+            out.push_str(" : ");
+            php_render(at(2), out, b);
+        }
+        "Call" => {
+            php_render(at(0), out, b);
+            out.push('(');
+            seq(ch, 1, out, b, php_render);
+            out.push(')');
+        }
+        "Method" | "NullsafeMethod" => {
+            php_render(at(0), out, b);
+            out.push_str(if tag == "Method" { "->" } else { "?->" });
+            php_member(ch.get(1), out, b);
+            out.push('(');
+            seq(ch, 2, out, b, php_render);
+            out.push(')');
+        }
+        "StaticCall" => {
+            php_render(at(0), out, b);
+            out.push_str("::");
+            php_member(ch.get(1), out, b);
+            out.push('(');
+            seq(ch, 2, out, b, php_render);
+            out.push(')');
+        }
+        "Field" | "NullsafeField" => {
+            php_render(at(0), out, b);
+            out.push_str(if tag == "Field" { "->" } else { "?->" });
+            php_member(ch.get(1), out, b);
+        }
+        "StaticField" => {
+            php_render(at(0), out, b);
+            out.push_str("::");
+            out.push('$');
+            out.push_str(&ident(ch.get(1)));
+        }
+        "ClassConst" => {
+            php_render(at(0), out, b);
+            out.push_str("::");
+            out.push_str(&ident(ch.get(1)));
+        }
+        "Index" => {
+            php_render(at(0), out, b);
+            out.push('[');
+            opt(ch.get(1), out, b, php_render);
+            out.push(']');
+        }
+        "Arr" | "ArrTarget" => {
+            out.push('[');
+            seq(ch, 0, out, b, php_render);
+            out.push(']');
+        }
+        "New" => {
+            out.push_str("new ");
+            php_render(at(0), out, b);
+            out.push('(');
+            seq(ch, 1, out, b, php_render);
+            out.push(')');
+        }
+        "Kw" => {
+            out.push_str(&ident(ch.first()));
+            out.push_str(": ");
+            php_render(at(1), out, b);
+        }
+        "Closure" => {
+            out.push_str("function (");
+            if let Some(Term::Node(pt, pch)) = ch.first() {
+                if pt == "Params" {
+                    seq(pch, 0, out, b, php_render);
+                }
+            }
+            out.push(')');
+            if let Some(Term::Node(ut, uch)) = ch.get(1) {
+                if ut == "Uses" && !uch.is_empty() {
+                    out.push_str(" use (");
+                    seq(uch, 0, out, b, php_render);
+                    out.push(')');
+                }
+            }
+            out.push(' ');
+            braced(ch.get(2), out, b, php_render);
+        }
+        "Arrow" => {
+            out.push_str("fn (");
+            if let Some(Term::Node(pt, pch)) = ch.first() {
+                if pt == "Params" {
+                    seq(pch, 0, out, b, php_render);
+                }
+            }
+            out.push_str(") => ");
+            php_render(at(1), out, b);
+        }
+        "Match" => {
+            out.push_str("match (");
+            php_render(at(0), out, b);
+            out.push_str(") { ");
+            seq(ch, 1, out, b, php_render);
+            out.push_str(" }");
+        }
+        "Cast" => {
+            out.push('(');
+            out.push_str(&ident(ch.get(1)));
+            out.push_str(") ");
+            php_render(at(0), out, b);
+        }
+        "Include" => {
+            out.push_str(&ident(ch.first()));
+            out.push(' ');
+            php_render(at(1), out, b);
+        }
+        "Yield" => {
+            out.push_str("yield");
+            if !go_blank(ch.first()) {
+                out.push(' ');
+                php_render(at(0), out, b);
+                out.push_str(" =>");
+            }
+            if !go_blank(ch.get(1)) {
+                out.push(' ');
+                php_render(at(1), out, b);
+            }
+        }
+        "DynVar" => {
+            out.push_str("${");
+            php_render(at(0), out, b);
+            out.push('}');
+        }
+        "TyOpt" => {
+            out.push('?');
+            php_render(at(0), out, b);
+        }
+        "TyUnion" | "TyInter" => {
+            for (i, t) in ch.iter().enumerate() {
+                if i > 0 {
+                    out.push(if tag == "TyUnion" { '|' } else { '&' });
+                }
+                php_render(t, out, b);
+            }
+        }
+        "AnonClass" => out.push_str("new class {…}"),
+        "NestedItem" => out.push_str("/* nested declaration */"),
+        // Unknown / unhandled node: compact `Tag(child, …)` fallback (keeps holes visible).
+        _ => {
+            out.push_str(tag);
+            if !ch.is_empty() {
+                out.push('(');
+                seq(ch, 0, out, b, php_render);
+                out.push(')');
+            }
+        }
+    }
+}
+
 // ── TypeScript dialect ───────────────────────────────────────────────────────
 
 /// The TypeScript dialect — `ts-canon`'s `oxc`-derived structural dump. Same `Tag(field, …)`
@@ -4865,5 +5356,83 @@ mod tests {
         let qty = c_xname("int count(struct row *rows, int n) {\n\tint total = 0;\n\tfor (int i = 0; i < n; i++)\n\t\tif (rows[i].ok)\n\t\t\ttotal += rows[i].qty;\n\treturn total;\n}\n", "count");
         let none = whole_fn_helpers(&CDialect, &[sum, qty], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
         assert!(none.is_empty(), "a varying member name must not extract, got: {none:?}");
+    }
+
+    // ── PHP dialect (the `php-canon` tree-sitter shape) ──────────────────────
+    //
+    // As for Go and C: the canonicals come from `php-canon` itself, so a change to its output that the
+    // dialect does not read breaks these here.
+
+    fn php_xname(src: &str, name: &str) -> String {
+        let file: std::sync::Arc<str> = std::sync::Arc::from("t.php");
+        php_canon::scan_source(&format!("<?php\n{src}"), &file, &dup_defs_core::ScanOpts::default())
+            .into_iter()
+            .find(|d| d.name == name)
+            .and_then(|d| d.analysis)
+            .map_or_else(|| panic!("no analysis for {name}"), |a| a.xname_canonical)
+    }
+
+    #[test]
+    fn php_parse_function_body_matches_full_parse() {
+        for src in [
+            "function make(int $id): User {\n\t$v = new User($id);\n\t$this->store->add($v);\n\treturn $v;\n}\n",
+            "function make($id) {\n\t$v = new User($id);\n\tstore_add($v);\n}\n",
+        ] {
+            let canon = php_xname(src, "make");
+            let full = match parse_term(&canon) {
+                Term::Node(_, ch) => match ch.get(3) {
+                    Some(Term::Node(tag, stmts)) if tag == "Block" => stmts.clone(),
+                    other => panic!("slot 3 is not the body: {other:?} in {canon}"),
+                },
+                other => panic!("not a node: {other:?}"),
+            };
+            assert_eq!(PhpDialect.parse_function_body(&canon), full, "{canon}");
+        }
+    }
+
+    #[test]
+    fn php_whole_fn_emits_factory_helper() {
+        // Two builders differing in the class they build: the class is a value (a name can be passed).
+        let a = php_xname("function make_user($id) {\n\t$v = new User($id);\n\tregistry_add('users', $v);\n\treturn $v;\n}\n", "make_user");
+        let b = php_xname("function make_order($id) {\n\t$v = new Order($id);\n\tregistry_add('users', $v);\n\treturn $v;\n}\n", "make_order");
+        let cands = whole_fn_helpers(&PhpDialect, &[a, b], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert_eq!(cands.len(), 1, "exactly the factory helper");
+        let c = &cands[0];
+        assert_eq!(c.granularity, "whole-fn");
+        assert_eq!(c.body, "function _fn($_v0) { $_v1 = new ?($_v0); registry_add('users', $_v1); return $_v1 }", "body: {}", c.body);
+    }
+
+    #[test]
+    fn php_subblock_mines_the_load_or_bail_motif() {
+        // PHP's own idiom — load, test the result, bail with `false` — embedded in two functions whose
+        // first statements share nothing. The divergent table name is the one parameter.
+        let a = php_xname("function a($k) {\n\tlog_line('a');\n\t$row = db_load($k, 'users');\n\tif (!$row) {\n\t\treturn false;\n\t}\n\treturn $row;\n}\n", "a");
+        let b = php_xname("function b($k) {\n\t$GLOBALS['count']++;\n\t$row = db_load($k, 'orders');\n\tif (!$row) {\n\t\treturn false;\n\t}\n\treturn $row;\n}\n", "b");
+        let cands = subblock_helpers(&PhpDialect, &[a, b], 2, &ExtractCfg::default());
+        assert_eq!(cands.len(), 1, "exactly the load-or-bail motif: {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.members, vec![0, 1]);
+        assert!(c.body.contains("db_load($_v0, '?')") && c.body.contains("return false"), "body: {}", c.body);
+        assert_eq!(c.params, 1);
+    }
+
+    #[test]
+    fn php_a_computed_method_name_renders_as_written() {
+        // `$node->$operation('')` is the same call in both copies — a method named by a variable, not a
+        // selector hole — and renders the way PHP spells it.
+        let a = php_xname("function a($operation) {\n\tensure_denied();\n\t$node = make_mock(FileNode::class);\n\t$node->$operation('');\n}\n", "a");
+        let b = php_xname("function b($operation) {\n\tensure_denied();\n\t$node = make_mock(FolderNode::class);\n\t$node->$operation('');\n}\n", "b");
+        let cands = whole_fn_helpers(&PhpDialect, &[a, b], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert_eq!(cands.len(), 1, "{cands:?}");
+        assert!(cands[0].body.contains("->$_v0('')"), "body: {}", cands[0].body);
+    }
+
+    #[test]
+    fn php_a_varying_property_is_a_selector() {
+        // `$r->price` vs `$r->qty`: another property, reached only by a variable name — not extractable.
+        let sum = php_xname("function sum($rows) {\n\t$total = 0;\n\tforeach ($rows as $r) {\n\t\tif ($r->ok) {\n\t\t\t$total += $r->price;\n\t\t}\n\t}\n\treturn $total;\n}\n", "sum");
+        let qty = php_xname("function count_all($rows) {\n\t$total = 0;\n\tforeach ($rows as $r) {\n\t\tif ($r->ok) {\n\t\t\t$total += $r->qty;\n\t\t}\n\t}\n\treturn $total;\n}\n", "count_all");
+        let none = whole_fn_helpers(&PhpDialect, &[sum, qty], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert!(none.is_empty(), "a varying property name must not extract, got: {none:?}");
     }
 }

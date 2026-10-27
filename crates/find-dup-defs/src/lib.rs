@@ -1017,15 +1017,16 @@ pub fn pass_patternology(defs: &[Def], theta: f64, support_min: usize, gpu: GpuM
     // are shaped per frontend). Partition the fn-like defs by `CanonDialect`, route each to its
     // `Dialect` impl, and run the engine once per group — never anti-unifying across languages. A
     // dialect the engine has no impl for is skipped rather than mis-walked.
-    let dialects: [(&dyn patternology::Dialect, &str); 5] = [
+    let dialects: [(&dyn patternology::Dialect, &str); 6] = [
         (&patternology::PyDialect, "py"),
         (&patternology::RustDialect, "rs"),
         (&patternology::TsDialect, "ts"),
         (&patternology::GoDialect, "go"),
         (&patternology::CDialect, "c"),
+        (&patternology::PhpDialect, "php"),
     ];
     // Per dialect above: its canonicals, and the group-local index → global `defs` index map.
-    let mut buckets: [(Vec<String>, Vec<usize>); 5] = Default::default();
+    let mut buckets: [(Vec<String>, Vec<usize>); 6] = Default::default();
     for (i, d) in defs.iter().enumerate() {
         if !d.kind.fn_like {
             continue;
@@ -1037,6 +1038,7 @@ pub fn pass_patternology(defs: &[Def], theta: f64, support_min: usize, gpu: GpuM
             CanonDialect::Other => 2, // the TypeScript frontend
             CanonDialect::Go => 3,
             CanonDialect::C => 4,
+            CanonDialect::Php => 5,
             // `CanonDialect` is `#[non_exhaustive]`: a future dialect without an engine impl is
             // skipped rather than mis-walked.
             _ => continue,

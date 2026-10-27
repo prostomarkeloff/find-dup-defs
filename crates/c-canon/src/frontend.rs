@@ -7,12 +7,12 @@
 //!
 //! A run reads its files twice: once together, for what they say about each other — the attribute
 //! macros the corpus defines, what its headers declare ([`crate::defs::Corpus`]) — and then each on its
-//! own. Both run on a pool of their own with deep stacks: lowering is depth-limited, but machine-written
-//! C still nests a statement or an expression far deeper than any hand-written code in the other
-//! languages, and a walk that recurses must have room to.
+//! own. Both run on threads with deep stacks ([`dup_defs_core::tree::on_deep_stacks`]): lowering is
+//! depth-limited, but machine-written C still nests a statement or an expression far deeper than any
+//! hand-written code in the other languages, and a walk that recurses must have room to.
 
 use std::fs;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use dup_defs_core::{Def, Frontend, KindSpec, ScanOpts};
 use rayon::prelude::*;
@@ -29,13 +29,6 @@ static KINDS: &[&KindSpec] = &[&FUNCTIONS, &CLASSES, &INTERFACES, &CONSTANTS, &T
 /// The kind list with the opt-in `lenses` kind appended — never in the default set, so the default
 /// run stays byte-identical (see the Rust frontend).
 static KINDS_WITH_LENSES: &[&KindSpec] = &[&FUNCTIONS, &CLASSES, &INTERFACES, &CONSTANTS, &TYPE_ALIASES, &LENSES];
-
-/// The stack each scanning thread gets.
-const STACK: usize = 64 << 20;
-
-/// The pool every C scan runs on — deep stacks, as many threads as the global pool.
-static POOL: LazyLock<Option<rayon::ThreadPool>> =
-    LazyLock::new(|| rayon::ThreadPoolBuilder::new().stack_size(STACK).thread_name(|i| format!("c-canon-{i}")).build().ok());
 
 /// C frontend over the tree-sitter C grammar.
 pub struct C;
@@ -70,10 +63,7 @@ impl Frontend for C {
             };
             collapse_alternatives(defs, alternative_unit)
         };
-        match POOL.as_ref() {
-            Some(pool) => pool.install(run),
-            None => run(),
-        }
+        dup_defs_core::tree::on_deep_stacks(run)
     }
 }
 

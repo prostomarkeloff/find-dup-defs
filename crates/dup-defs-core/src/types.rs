@@ -56,6 +56,11 @@ pub enum CanonDialect {
     /// C's own (`DoWhile`/`ForC`/`Goto`/`Labeled`/`PreIf`/`MacroLoop`/`SizeOf`/…), so the s-expr readers
     /// take it as they take the others'.
     C,
+    /// The PHP frontend's tree-sitter-derived structural dump. It lays a function out as the Go and C
+    /// dumps do (`Func(name, Params(…), return type, Block(…))`) and speaks the shared tags wherever the
+    /// construct is the same one (`Method`/`Field`/`Call`/`If`/`ForC`/`For`/`Switch`/`Try`/`Catch`/…),
+    /// adding PHP's own (`StaticCall`/`ClassConst`/`Echo`/`Interp`/`Arr`/`Closure`/`Match`/…).
+    Php,
     /// The TypeScript frontend's `oxc`-derived structural dump (`Func`/`Block`/`Var`/`Call`/… tags)
     /// — the patternology engine has a `TsDialect` for it. (Also the catch-all for any future
     /// frontend whose canonical the dialect-specific passes don't yet recognize.)
