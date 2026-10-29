@@ -133,6 +133,17 @@ fn converge_c_matches_golden() {
 }
 
 #[test]
+fn converge_php_matches_golden() {
+    // The batch pair in PHP: the statements both write agree, the loop each fills parts them, and the
+    // subject is the class both reach through their `use`.
+    assert_golden(
+        &run_in(FIX_CONVERGE, &["--converge", "--show-info", "--only", "php"]),
+        include_str!("golden/converge.php.txt"),
+        "converge.php.txt",
+    );
+}
+
+#[test]
 fn decisions_matches_golden() {
     // Locks the facts, the null and the cut together: the guard and the filter share no line and are
     // found; the forty definitions sharing a common fact or two are not.
@@ -164,6 +175,18 @@ fn decisions_c_matches_golden() {
         &run_at(&format!("{FIX_DECISIONS}/c"), FIX_DECISIONS, &["--decisions", "--show-info"]),
         include_str!("golden/decisions.c.txt"),
         "decisions.c.txt",
+    );
+}
+
+#[test]
+fn decisions_php_matches_golden() {
+    // The same corpus in PHP, and the rules PHP spells its own way: a guard that throws beside a filter
+    // written as a Yoda test, and `in_array` over a literal list beside a `switch` over the same two
+    // codes. A class constant is the program's wherever it is tested.
+    assert_golden(
+        &run_at(&format!("{FIX_DECISIONS}/php"), FIX_DECISIONS, &["--decisions", "--show-info"]),
+        include_str!("golden/decisions.php.txt"),
+        "decisions.php.txt",
     );
 }
 
