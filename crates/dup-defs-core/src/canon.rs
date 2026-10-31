@@ -79,6 +79,17 @@ impl AnalyzedFn {
 /// must quote alike.
 #[must_use]
 pub fn quoted(s: &str) -> String {
+    // Fast path: the overwhelmingly common input — an ASCII identifier or operator — needs no
+    // escape, so the body is one `push_str` memcpy instead of a per-char match. The byte scan is
+    // exact: only these five ASCII bytes are escaped, and no UTF-8 continuation byte collides with
+    // them.
+    if !s.bytes().any(|b| matches!(b, b'\\' | b'\'' | b'\n' | b'\r' | b'\t')) {
+        let mut out = String::with_capacity(s.len() + 2);
+        out.push('\'');
+        out.push_str(s);
+        out.push('\'');
+        return out;
+    }
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for c in s.chars() {
@@ -121,8 +132,13 @@ pub fn is_upper_snake(name: &str) -> bool {
 pub fn alpha_rename(map: &mut HashMap<String, u32>, locals: Option<&HashSet<String>>, name: &str) -> String {
     if let Some(locals) = locals {
         if locals.contains(name) {
-            let next = map.len() as u32;
-            let slot = *map.entry(name.to_owned()).or_insert(next);
+            // `get` then `insert` rather than `entry(name.to_owned())`: the entry form allocates
+            // the owned key on *every* call, and a bound local is usually referenced more than once.
+            if let Some(&slot) = map.get(name) {
+                return format!("_v{slot}");
+            }
+            let slot = map.len() as u32;
+            map.insert(name.to_owned(), slot);
             return format!("_v{slot}");
         }
     }
@@ -149,8 +165,13 @@ pub const TYPE_SLOT_PREFIX: &str = "_T";
 #[allow(clippy::cast_possible_truncation)] // a def's distinct type-reference count is far below u32::MAX
 #[allow(clippy::implicit_hasher)] // always called with the frontends' std-hasher maps
 pub fn type_slot(map: &mut HashMap<String, u32>, name: &str) -> String {
-    let next = map.len() as u32;
-    let slot = *map.entry(name.to_owned()).or_insert(next);
+    // Same `get`-then-`insert` shape as `alpha_rename`: type references repeat far more often than
+    // they are first seen.
+    if let Some(&slot) = map.get(name) {
+        return format!("{TYPE_SLOT_PREFIX}{slot}");
+    }
+    let slot = map.len() as u32;
+    map.insert(name.to_owned(), slot);
     format!("{TYPE_SLOT_PREFIX}{slot}")
 }
 

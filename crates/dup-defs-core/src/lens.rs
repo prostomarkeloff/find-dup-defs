@@ -118,6 +118,24 @@ impl Lens {
             Lens::Use,
         ]
     }
+
+    /// The stable slot this lens occupies in a [`LensFacts`] bucket array. One per variant, so a
+    /// fact push is an indexed store rather than a linear scan over the buckets built so far.
+    #[must_use]
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Lens::Outgoing => 0,
+            Lens::Effects => 1,
+            Lens::Control => 2,
+            Lens::Failures => 3,
+            Lens::Resources => 4,
+            Lens::Signature => 5,
+            Lens::Decorators => 6,
+            Lens::Schema => 7,
+            Lens::Scope => 8,
+            Lens::Use => 9,
+        }
+    }
 }
 
 /// Which lenses vote in this run.
@@ -145,7 +163,13 @@ pub fn enabled_lenses(opts: &ScanOpts) -> Vec<Lens> {
 #[must_use]
 pub fn control_tag(depth: usize, tag: &str) -> String {
     const MAX_MARKED_DEPTH: usize = 4;
-    format!("{}{tag}", "+".repeat(depth.min(MAX_MARKED_DEPTH)))
+    let depth = depth.min(MAX_MARKED_DEPTH);
+    let mut out = String::with_capacity(depth + tag.len());
+    for _ in 0..depth {
+        out.push('+');
+    }
+    out.push_str(tag);
+    out
 }
 
 /// One definition's answers, one bucket per lens.
@@ -155,7 +179,9 @@ pub fn control_tag(depth: usize, tag: &str) -> String {
 /// the order it saw is the order that happened.
 #[derive(Clone, Debug, Default)]
 pub struct LensFacts {
-    buckets: Vec<(Lens, Vec<String>)>,
+    /// One bucket per lens, indexed by [`Lens::index`] — a fact push is an indexed store, not a
+    /// linear scan over the buckets built so far. The array is ten slots for the ten variants.
+    buckets: [Vec<String>; 10],
 }
 
 impl LensFacts {
@@ -166,11 +192,7 @@ impl LensFacts {
 
     /// Record one fact under one lens. Facts are stored unprefixed; [`stitch`] applies the tag.
     pub fn push(&mut self, lens: Lens, fact: impl Into<String>) {
-        let fact = fact.into();
-        match self.buckets.iter_mut().find(|(l, _)| *l == lens) {
-            Some((_, out)) => out.push(fact),
-            None => self.buckets.push((lens, vec![fact])),
-        }
+        self.buckets[lens.index()].push(fact.into());
     }
 
     /// Record many facts under one lens, in the order given.
@@ -179,21 +201,19 @@ impl LensFacts {
         I: IntoIterator,
         I::Item: Into<String>,
     {
-        for fact in facts {
-            self.push(lens, fact);
-        }
+        self.buckets[lens.index()].extend(facts.into_iter().map(Into::into));
     }
 
     /// The facts one lens holds, in insertion order.
     #[must_use]
     pub fn get(&self, lens: Lens) -> &[String] {
-        self.buckets.iter().find(|(l, _)| *l == lens).map_or(&[], |(_, v)| v.as_slice())
+        &self.buckets[lens.index()]
     }
 
     /// Total facts across every lens.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.buckets.iter().map(|(_, v)| v.len()).sum()
+        self.buckets.iter().map(Vec::len).sum()
     }
 
     #[must_use]
@@ -205,10 +225,17 @@ impl LensFacts {
 /// The stitched record: every enabled lens's facts, each under its own prefix, in lens order.
 #[must_use]
 pub fn stitch(enabled: &[Lens], facts: &LensFacts) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(facts.len());
     for &lens in enabled {
         let tag = lens.tag();
-        out.extend(facts.get(lens).iter().map(|fact| format!("{tag}:{fact}")));
+        let bucket = facts.get(lens);
+        for fact in bucket {
+            let mut joined = String::with_capacity(tag.len() + 1 + fact.len());
+            joined.push_str(tag);
+            joined.push(':');
+            joined.push_str(fact);
+            out.push(joined);
+        }
     }
     out
 }

@@ -2734,7 +2734,7 @@ pub(crate) fn module_bound_names(module: &[Stmt]) -> HashSet<String> {
     collect.bound
 }
 
-fn analyze_one(text: &str) -> Option<AnalyzedFn> {
+pub(crate) fn analyze_one(text: &str) -> Option<AnalyzedFn> {
     let module = parse_module(text).ok()?.into_syntax();
     let stmt = module.body.first()?;
     analyze_stmt(stmt, text)

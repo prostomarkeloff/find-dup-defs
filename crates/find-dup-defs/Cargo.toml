@@ -1,6 +1,6 @@
 [package]
 name = "find-dup-defs"
-version = "0.19.0"
+version = "0.19.1"
 description = "Find duplicate / near-duplicate top-level definitions across a codebase via clone clustering — Python, Rust, TypeScript, Go, C, PHP and Java frontends, plus an opt-in structural helper-extraction pass."
 keywords = ["duplicate", "clone", "refactor", "lint", "ast"]
 categories = ["command-line-utilities", "development-tools"]
@@ -16,13 +16,13 @@ path = "src/main.rs"
 
 [dependencies]
 # The frontend↔engine contract (Def / KindSpec / Frontend) the engine clusters over.
-dup-defs-core = { path = "../dup-defs-core", version = "0.4.4" }
-py-canon = { path = "../py-canon", version = "0.6.0" }
+dup-defs-core = { path = "../dup-defs-core", version = "0.4.5" }
+py-canon = { path = "../py-canon", version = "0.6.1" }
 # TypeScript frontend — same contract as `py-canon`, oxc-based parser. `0.1.4` carries the
 # arrow-const name blanking the TS patternology dialect relies on, so pin the floor there.
-ts-canon = { path = "../ts-canon", version = "0.3.0" }
+ts-canon = { path = "../ts-canon", version = "0.3.1" }
 # Rust frontend — same contract as `py-canon`/`ts-canon`, over the `syn` parser.
-rs-canon = { path = "../rs-canon", version = "0.3.1" }
+rs-canon = { path = "../rs-canon", version = "0.3.2" }
 # Go frontend — same contract, over the tree-sitter Go grammar.
 go-canon = { path = "../go-canon", version = "0.1.1" }
 # C frontend — same contract, over the tree-sitter C grammar.

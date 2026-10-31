@@ -11,10 +11,12 @@
 //! * **functions / classes** — node-based via [`analyze_stmt`](crate::canon::analyze_stmt) /
 //!   [`cluster_canonical_node`](crate::canon::cluster_canonical_node) (byte-identical to
 //!   re-parsing the decorator-stripped def text, but with zero extra parses).
-//! * **methods** — the receiver (`self`/`cls`) is stripped at the *text* level (so a method's
-//!   canonical lines up with an equivalent free function) and the stripped text is re-parsed
-//!   once via [`analyze_functions`](crate::canon::analyze_functions); a node-level skip would
-//!   need surgery in the `ast.dump` emitter and mishandle the `self, /` edge.
+//! * **methods** — the receiver (`self`/`cls`) is stripped so a method's canonical lines up
+//!   with an equivalent free function. The common case (receiver is a plain positional, no
+//!   posonly params) strips it from the in-place AST node and runs [`analyze_stmt`] directly —
+//!   no re-parse. The rare shapes a node-level skip would mishandle (`self, /`, a posonly
+//!   receiver with trailing positionals) fall back to stripping at the *text* level and
+//!   re-parsing once, byte-identical to before.
 //! * **constants / type-aliases** — raw-text kinds; the engine clusters them on `text_orig`,
 //!   so no canonical is computed.
 //!
@@ -27,7 +29,7 @@ use dup_defs_core::{Analysis, CanonDialect, Def, Facets, KindSpec, LineMap, Scan
 use ruff_python_ast::{Expr, Parameters, Stmt};
 use ruff_python_parser::parse_module;
 
-use crate::canon::{analyze_functions, analyze_stmt, ast_canonical, cluster_canonical_node, used_names};
+use crate::canon::{analyze_one, analyze_stmt, ast_canonical, cluster_canonical_node, used_names};
 use crate::frontend::{enabled_lenses, kind_spec, METHODS};
 
 /// Total parameter count: posonly + args + kwonly + (`*args` if present) + (`**kwargs` if
@@ -281,15 +283,41 @@ fn top_def_canon(
     }
 }
 
-/// Canonicalize a method from its receiver-stripped text. One re-parse (`analyze_functions`)
-/// yields the cluster canonical (tuple `.0`, identical to `ast_canonical`) plus the analysis;
-/// on the rare unparseable-strip edge (`self, /`) it falls back to `ast_canonical`'s raw-text
-/// path with no analysis — byte-identical to the previous behavior.
+/// Canonicalize a method from its receiver-stripped text. One re-parse (`analyze_one`) yields the
+/// cluster canonical (tuple `.0`, identical to `ast_canonical`) plus the analysis; on the rare
+/// unparseable-strip edge (`self, /`) it falls back to `ast_canonical`'s raw-text path with no
+/// analysis — byte-identical to the previous behavior.
 fn method_canon(canon_text: &str) -> (Option<String>, Option<Analysis>, Vec<Statement>) {
-    match analyze_functions(&[canon_text.to_owned()]).into_iter().next().flatten() {
+    match analyze_one(canon_text) {
         Some(analyzed) => split_analysis(analyzed),
         None => (Some(ast_canonical(canon_text)), None, Vec::new()),
     }
+}
+
+/// Canonicalize a method straight from its module-parse AST node, receiver (`self`/`cls`)
+/// removed from the parameters — the shape the receiver-stripped text re-parse produced, without
+/// re-parsing. Only the shapes where the strip is provably safe take this path: no posonly params
+/// and a first positional that is `self`/`cls`. A posonly receiver (stripping it would leave a
+/// dangling `/`, which the text path degrades on as raw text) and a non-receiver first positional
+/// fall back to [`method_canon`]'s text path, byte-identical to before.
+fn method_canon_node(
+    source: &str,
+    func: &ruff_python_ast::StmtFunctionDef,
+    start: usize,
+    end: usize,
+) -> (Option<String>, Option<Analysis>, Vec<Statement>) {
+    let params = &func.parameters;
+    if params.posonlyargs.is_empty()
+        && params.args.first().is_some_and(|p| matches!(p.parameter.name.id.as_str(), "self" | "cls"))
+    {
+        let mut stripped = func.clone();
+        stripped.parameters.args.remove(0);
+        let stmt = Stmt::FunctionDef(stripped);
+        if let Some(analyzed) = analyze_stmt(&stmt, source) {
+            return split_analysis(analyzed);
+        }
+    }
+    method_canon(&apply_receiver_strip(source, start, end, params))
 }
 
 /// What one file's names stand for, read once and handed to every definition in it.
@@ -332,8 +360,8 @@ fn method_defs(
                 let text_orig = source[start..end].to_owned();
                 let loc = count_loc(&text_orig);
                 let args = count_args(&node.parameters);
-                let canon_text = apply_receiver_strip(source, start, end, &node.parameters);
-                let (cluster_canonical, analysis, statements) = method_canon(&canon_text);
+                let (cluster_canonical, analysis, statements) =
+                    method_canon_node(source, node, start, end);
                 let reaches = reached_paths(inner, names.reaches);
                 let decided = crate::decides::decides(inner, names.decides);
                 let identity = Some(Arc::from(dup_defs_core::decide::local(names.decides.module(), &name)));

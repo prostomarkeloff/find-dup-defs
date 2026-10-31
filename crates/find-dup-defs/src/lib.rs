@@ -363,12 +363,31 @@ type Twins = Vec<(Arc<str>, Arc<str>)>;
 /// the discovered order, which is sorted, so which one is parsed does not vary between runs. A file
 /// that cannot be read is kept as its own group and left to the frontend to fail on as before.
 fn one_per_content(files: &[Arc<str>]) -> (Vec<Arc<str>>, Twins) {
-    // Read and digested in parallel; the sequential pass below then compares CONTENT only against
-    // files that already agree on their digest — one comparison, where keying an ordered map by the
-    // bytes themselves meant a dozen full-file compares per lookup.
+    // 🔴 Size-bucket first. A file is only worth reading+digesting for twin detection when its
+    // byte count is shared with at least one other file — equal content implies equal size. A
+    // unique size cannot have a twin, so its bytes are not read here at all; the frontend reads it
+    // exactly once when parsing. A file whose stat fails is treated the same way (kept, no twin),
+    // matching the old read-failure behavior.
+    let sizes: Vec<Option<u64>> = files
+        .par_iter()
+        .map(|f| std::fs::metadata(f.as_ref()).ok().map(|m| m.len()))
+        .collect();
+    let mut size_count: rustc_hash::FxHashMap<u64, u32> = rustc_hash::FxHashMap::default();
+    for sz in sizes.iter().flatten() {
+        *size_count.entry(*sz).or_default() += 1;
+    }
+
+    // Read and digested in parallel (only the files that share a size); the sequential pass below
+    // then compares CONTENT only against files that already agree on their digest — one comparison,
+    // where keying an ordered map by the bytes themselves meant a dozen full-file compares per lookup.
     let read: Vec<Option<(u64, Vec<u8>)>> = files
         .par_iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(i, f)| {
+            let shared = sizes[i].is_some_and(|sz| size_count.get(&sz).copied().unwrap_or(0) >= 2);
+            if !shared {
+                return None;
+            }
             std::fs::read(f.as_ref()).ok().map(|bytes| {
                 use std::hash::{BuildHasher, Hasher};
                 let mut h = rustc_hash::FxBuildHasher.build_hasher();
@@ -610,22 +629,24 @@ fn cluster_distinct(
         }
     }
     reps.sort_unstable();
-    let chars: Vec<Vec<char>> = reps.iter().map(|&(pos, _)| canons[pos].chars().collect()).collect();
+    // The representatives' canonicals as borrowed `&str` — `candidates` reads lengths and counts
+    // straight off them (one histogram pass), so `Vec<char>` is only materialized for the strings
+    // that survive its bounds and actually reach the clusterer, never for the singletons the bounds
+    // rule out. A clone-and-sort plus an allocation each, saved on the hot path.
+    let rep_strs: Vec<&str> = reps.iter().map(|&(pos, _)| canons[pos]).collect();
 
-    // 🔴 Only the representatives that can be in an edge at all are handed to the clusterer. It
-    // builds a suffix automaton for EVERY string it is given before it looks at a single pair, and
-    // on long canonicals that build was half the pass's CPU — spent on strings that its own
-    // length and character-multiset bounds then rule out of every pair they are in. Those bounds
-    // are exact upper bounds on the ratio, so a string without a partner under them is a singleton
-    // whatever the clusterer computes, and leaving it out changes no edge, no cluster, no minimum.
-    let active = candidates(&chars, threshold);
-    let subset: Vec<Vec<char>>;
-    let clustered = if active.len() == chars.len() {
+    // 🔴 Only the representatives that can be in an edge at all are handed to the clusterer. Its
+    // bounds are exact upper bounds on the ratio, so a string without a partner under them is a
+    // singleton whatever the clusterer computes, and leaving it out changes no edge, no cluster, no
+    // minimum.
+    let active = candidates(&rep_strs, threshold);
+    let clustered = if active.len() == rep_strs.len() {
+        let chars: Vec<Vec<char>> = rep_strs.iter().map(|s| s.chars().collect()).collect();
         rationer.cluster_canonicals_chars(&chars, threshold)
     } else if active.len() < 2 {
         Vec::new()
     } else {
-        subset = active.iter().map(|&i| chars[i].clone()).collect();
+        let subset: Vec<Vec<char>> = active.iter().map(|&i| rep_strs[i].chars().collect()).collect();
         rationer
             .cluster_canonicals_chars(&subset, threshold)
             .into_iter()
@@ -663,32 +684,60 @@ fn cluster_distinct(
     out
 }
 
+/// Sorted `(char, count)` multiset of a canonical — the same shape the clusterer computes for its
+/// own `quick_ratio` bound. ASCII (canonical code, nearly always) is one histogram pass with no
+/// allocation; non-ASCII falls back to sort-and-count, byte-identical to the previous behavior.
+fn char_counts_str(s: &str) -> Vec<(char, u32)> {
+    let mut hist = [0u32; 128];
+    if s.chars().all(|c| {
+        let u = c as usize;
+        if u < 128 {
+            hist[u] += 1;
+            true
+        } else {
+            false
+        }
+    }) {
+        return hist
+            .iter()
+            .enumerate()
+            .filter(|&(_, &k)| k > 0)
+            .map(|(i, &k)| (char::from(u8::try_from(i).expect("ascii")), k))
+            .collect();
+    }
+    let mut v: Vec<char> = s.chars().collect();
+    v.sort_unstable();
+    let mut out: Vec<(char, u32)> = Vec::new();
+    for c in v {
+        match out.last_mut() {
+            Some(last) if last.0 == c => last.1 += 1,
+            _ => out.push((c, 1)),
+        }
+    }
+    out
+}
+
 /// The strings that have at least one partner under the two exact upper bounds the clusterer
 /// filters pairs by: `ratio ≤ 2·min(|a|,|b|)/(|a|+|b|)` (lengths) and
 /// `ratio ≤ 2·Σ min(count_a(c), count_b(c))/(|a|+|b|)` (character multisets). Same formulas, same
 /// floats; the pairs admitted are a superset of the clusterer's, never a subset. Length-sorted so
 /// each string only scans the window its length admits — the clusterer's own blocking.
-fn candidates(chars: &[Vec<char>], threshold: f64) -> Vec<usize> {
+///
+/// Reads the canonicals borrowed (no `Vec<char>`), counting each in one histogram pass instead of
+/// a clone-and-sort; the caller materializes `Vec<char>` only for the strings this admits.
+fn candidates(strings: &[&str], threshold: f64) -> Vec<usize> {
+    // `threshold ≤ 0` admits every pair (both bounds are `≥ 0`), so every string is a partner and
+    // the blocking below is pure overhead — skip it. Exactly what the loop would conclude.
+    if threshold <= 0.0 {
+        return (0..strings.len()).collect();
+    }
+    let lengths: Vec<usize> = strings.iter().map(|s| s.chars().count()).collect();
     #[allow(clippy::cast_precision_loss)]
     let length_bound = |a: usize, b: usize| -> f64 {
         let total = a + b;
         if total == 0 { 1.0 } else { 2.0 * (a.min(b) as f64) / (total as f64) }
     };
-    let counts: Vec<Vec<(char, u32)>> = chars
-        .par_iter()
-        .map(|c| {
-            let mut sorted = c.clone();
-            sorted.sort_unstable();
-            let mut out: Vec<(char, u32)> = Vec::new();
-            for ch in sorted {
-                match out.last_mut() {
-                    Some(last) if last.0 == ch => last.1 += 1,
-                    _ => out.push((ch, 1)),
-                }
-            }
-            out
-        })
-        .collect();
+    let counts: Vec<Vec<(char, u32)>> = strings.par_iter().map(|s| char_counts_str(s)).collect();
     #[allow(clippy::cast_precision_loss)]
     let multiset_bound = |i: usize, j: usize| -> f64 {
         let (ca, cb) = (&counts[i], &counts[j]);
@@ -704,15 +753,15 @@ fn candidates(chars: &[Vec<char>], threshold: f64) -> Vec<usize> {
                 }
             }
         }
-        let total = chars[i].len() + chars[j].len();
+        let total = lengths[i] + lengths[j];
         if total == 0 { 1.0 } else { 2.0 * f64::from(matches) / total as f64 }
     };
-    let mut order: Vec<usize> = (0..chars.len()).collect();
-    order.sort_by_key(|&i| chars[i].len());
-    let mut has_partner = vec![false; chars.len()];
+    let mut order: Vec<usize> = (0..strings.len()).collect();
+    order.sort_by_key(|&i| lengths[i]);
+    let mut has_partner = vec![false; strings.len()];
     for (p, &i) in order.iter().enumerate() {
         for &j in &order[p + 1..] {
-            if length_bound(chars[i].len(), chars[j].len()) < threshold {
+            if length_bound(lengths[i], lengths[j]) < threshold {
                 break; // lengths only grow: every remaining partner fails the bound too
             }
             if !(has_partner[i] && has_partner[j]) && multiset_bound(i, j) >= threshold {
@@ -721,7 +770,7 @@ fn candidates(chars: &[Vec<char>], threshold: f64) -> Vec<usize> {
             }
         }
     }
-    (0..chars.len()).filter(|&i| has_partner[i]).collect()
+    (0..strings.len()).filter(|&i| has_partner[i]).collect()
 }
 
 /// Pass 1 — name-gated: same-named body-kind defs clustered by structural-canonical
@@ -838,16 +887,22 @@ pub fn pass_cross_name(defs: &[Def], min_size: usize) -> Vec<Finding> {
             }
         }
     }
-    let mut qualifying: Vec<(&str, Vec<usize>)> = buckets
+    // The distinct-name set is built ONCE per bucket and carried through to the output, where the
+    // same set already spelled the `/`-joined `name` — the previous form rebuilt it per qualifying
+    // bucket (once to test `≥2` names, once to join them).
+    let mut qualifying: Vec<(&str, Vec<usize>, BTreeSet<&str>)> = buckets
         .into_iter()
-        .filter(|(_, ps)| {
-            ps.len() >= min_size && ps.iter().map(|&p| defs[p].name.as_str()).collect::<BTreeSet<_>>().len() >= 2
+        .filter_map(|(k, ps)| {
+            if ps.len() < min_size {
+                return None;
+            }
+            let names: BTreeSet<&str> = ps.iter().map(|&p| defs[p].name.as_str()).collect();
+            (names.len() >= 2).then_some((k, ps, names))
         })
         .collect();
     qualifying.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
     let mut out = Vec::new();
-    for (_, ps) in qualifying {
-        let names: BTreeSet<&str> = ps.iter().map(|&p| defs[p].name.as_str()).collect();
+    for (_, ps, names) in qualifying {
         let size = defs[ps[0]].analysis.as_ref().map_or(0, |a| a.size);
         let kind = callable_kind(defs, &ps);
         let loc = ps.iter().map(|&p| defs[p].loc).max().unwrap_or(0);

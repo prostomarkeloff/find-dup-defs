@@ -56,19 +56,29 @@ pub struct Scope {
 impl Scope {
     /// A binding of `name`: a local, stored once more.
     pub fn bind(&mut self, name: &str) {
-        self.locals.insert(name.to_owned());
+        if !self.locals.contains(name) {
+            self.locals.insert(name.to_owned());
+        }
         self.store(name);
     }
 
     /// A store to `name` that binds nothing new — an assignment.
     pub fn store(&mut self, name: &str) {
-        *self.stores.entry(name.to_owned()).or_insert(0) += 1;
+        if let Some(n) = self.stores.get_mut(name) {
+            *n += 1;
+        } else {
+            self.stores.insert(name.to_owned(), 1);
+        }
     }
 
     /// A read of `name`, from inside a nested function when `nested`.
     pub fn read(&mut self, name: &str, nested: bool) {
-        *self.reads.entry(name.to_owned()).or_insert(0) += 1;
-        if nested {
+        if let Some(n) = self.reads.get_mut(name) {
+            *n += 1;
+        } else {
+            self.reads.insert(name.to_owned(), 1);
+        }
+        if nested && !self.nested_reads.contains(name) {
             self.nested_reads.insert(name.to_owned());
         }
     }

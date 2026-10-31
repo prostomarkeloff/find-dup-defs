@@ -553,7 +553,21 @@ struct Shaped<'a> {
     name_text: Vec<String>,
     /// Line id → its text: the gap lines a fork is anti-unified over.
     line_text: Vec<&'a str>,
+    /// Distinct `(line id, vocabulary)` pairs, sorted — what `shape` lexed once into `unit_toks`.
+    units: Vec<(u32, Vocab)>,
+    /// The tokens of each unit, lexed once. [`line_pair_term`] reads these instead of re-lexing
+    /// the line's text for every distinct pair that touches it.
+    unit_toks: Vec<Vec<Tok<'a>>>,
     n_keys: usize,
+}
+
+impl<'a> Shaped<'a> {
+    /// The tokens of one line id read in one vocabulary, from the once-per-unit lexing — `None`
+    /// when this line id never occurs in this vocabulary (a cross-dialect pair), where the caller
+    /// falls back to lexing the text.
+    fn line_tokens(&self, line: u32, vocab: Vocab) -> Option<&[Tok<'a>]> {
+        self.units.binary_search(&(line, vocab)).ok().map(|unit| &self.unit_toks[unit][..])
+    }
 }
 
 fn body_of_def(def: &Def) -> &[Statement] {
@@ -749,23 +763,23 @@ fn shape(defs: &[Def]) -> Option<Shaped<'_>> {
     // "parted on nothing named". The pass returned no finding on any such tree; it only worked where
     // Python lines lent the corpus a name total. The anti-unifier already read quoted identifiers as
     // names, so the forks were always named this way — the corpus now counts the same names.
-    let derived: Vec<(String, String, Vec<&str>)> = units
+    let derived: Vec<(String, String, Vec<&str>, Vec<Tok<'_>>)> = units
         .par_iter()
         .map(|&(id, vocab)| {
             let line = line_text[id as usize];
             let toks = tokens(line, vocab);
             let names = toks.iter().filter_map(|tok| if let Tok::Name(n) = tok { Some(*n) } else { None }).collect();
-            (slot_normalize(&toks, line.len()), skeleton(&toks, line.len()), names)
+            (slot_normalize(&toks, line.len()), skeleton(&toks, line.len()), names, toks)
         })
         .collect();
-    let unit_keys: Vec<&str> = derived.iter().map(|(key, _, _)| key.as_str()).collect();
-    let unit_shapes: Vec<&str> = derived.iter().map(|(_, shape, _)| shape.as_str()).collect();
+    let unit_keys: Vec<&str> = derived.iter().map(|(key, _, _, _)| key.as_str()).collect();
+    let unit_shapes: Vec<&str> = derived.iter().map(|(_, shape, _, _)| shape.as_str()).collect();
     let (key_text, key_of_unit) = intern(&unit_keys, true);
     let (shape_text, shape_of_unit) = intern(&unit_shapes, true);
     let key_ids: Vec<u32> = unit_of_occ.par_iter().map(|&u| key_of_unit[u as usize]).collect();
     let shape_ids: Vec<u32> = unit_of_occ.par_iter().map(|&u| shape_of_unit[u as usize]).collect();
 
-    let unit_names: Vec<&[&str]> = derived.iter().map(|(_, _, names)| names.as_slice()).collect();
+    let unit_names: Vec<&[&str]> = derived.iter().map(|(_, _, names, _)| names.as_slice()).collect();
     let name_occ: Vec<&str> = unit_names.iter().flat_map(|names| names.iter().copied()).collect();
     let (name_text, name_occ_ids) = intern(&name_occ, false);
     let mut unit_name_start: Vec<usize> = Vec::with_capacity(units.len() + 1);
@@ -787,6 +801,11 @@ fn shape(defs: &[Def]) -> Option<Shaped<'_>> {
             (starts, ids)
         })
         .collect();
+
+    // The tokens of every unit, lexed once above — the subject anchor's line pairs read these
+    // rather than re-lexing the line text per pair. Cloned (not moved): `unit_keys` and `key_text`
+    // still borrow `derived` below, so it must outlive this extraction.
+    let unit_toks: Vec<Vec<Tok<'_>>> = derived.iter().map(|(_, _, _, toks)| toks.clone()).collect();
 
     // Interning the module tree is a shared table whose ORDER is load-bearing — the id doubles as
     // the tiebreak that decides which subject a pair is reported under, so it has to stay "first
@@ -893,6 +912,8 @@ fn shape(defs: &[Def]) -> Option<Shaped<'_>> {
         shape_text: shape_text.into_iter().map(str::to_owned).collect(),
         name_text: name_text.into_iter().map(str::to_owned).collect(),
         line_text,
+        units,
+        unit_toks,
         n_keys: key_text.len(),
     })
 }
@@ -1031,8 +1052,22 @@ fn fork_term(left: &[Tok<'_>], right: &[Tok<'_>], corpus: &Corpus) -> ForkTerm {
     let (rows, cols) = (left.len(), right.len());
     let stride = cols + 1;
     LCS_SCRATCH.with_borrow_mut(|table| {
-        table.clear();
-        table.resize((rows + 1) * stride, 0u16);
+        let size = (rows + 1) * stride;
+        if table.len() < size {
+            table.resize(size, 0u16);
+        }
+        // Only the bottom row and right column feed the DP from beyond the interior; every interior
+        // cell is written before it is read, so zeroing it — what `resize` does on the first grow —
+        // would be wasted work on every later call. Zero just the boundary.
+        {
+            let t = &mut table[..size];
+            for c in 0..=cols {
+                t[rows * stride + c] = 0;
+            }
+            for r in 0..rows {
+                t[r * stride + cols] = 0;
+            }
+        }
         for row in (0..rows).rev() {
             for col in (0..cols).rev() {
                 table[row * stride + col] = if left[row] == right[col] {
@@ -1742,9 +1777,12 @@ fn subject_line_pairs(bodies: &[Body<'_>], x: u32, y: u32, out: &mut Vec<(u32, u
 /// The fork term of one line against another, read in `vocab`.
 fn line_pair_term(s: &Shaped<'_>, a: u32, b: u32, vocab: Vocab, corpus: &Corpus) -> f64 {
     // A single line lexes as its lexed form by definition; the join concern does not arise. The
-    // text is only re-lexed when the other side's body was read in another vocabulary.
-    let (la, lb) = (&s.line_text[a as usize], &s.line_text[b as usize]);
-    fork_term_of_text(la, lb, vocab, vocab, corpus).peak
+    // tokens are read off the once-per-unit lexing; only a cross-dialect pair — a line id that
+    // never occurs in this vocabulary — falls back to lexing the text.
+    match (s.line_tokens(a, vocab), s.line_tokens(b, vocab)) {
+        (Some(left), Some(right)) => fork_term(left, right, corpus).peak,
+        _ => fork_term_of_text(s.line_text[a as usize], s.line_text[b as usize], vocab, vocab, corpus).peak,
+    }
 }
 
 /// The fork term of every distinct body pair — the rarest name among the holes where their shapes
@@ -1756,22 +1794,23 @@ fn line_pair_term(s: &Shaped<'_>, a: u32, b: u32, vocab: Vocab, corpus: &Corpus)
 /// taken over lookups.
 fn subject_peaks(s: &Shaped<'_>, corpus: &Corpus, body_pairs: &[(u32, u32)]) -> Vec<f64> {
     let bodies = &s.bodies;
-    let mut line_pairs: Vec<(u32, u32, Vocab)> = body_pairs
+    // The line pairs of every body pair, computed once — the second walk below only reads them,
+    // where it previously recomputed `subject_line_pairs` for every body pair a second time.
+    let pairs_of: Vec<Vec<(u32, u32, Vocab)>> = body_pairs
         .par_iter()
-        .flat_map_iter(|&(x, y)| {
+        .map(|&(x, y)| {
             let mut out = Vec::new();
             subject_line_pairs(bodies, x, y, &mut out);
             out
         })
         .collect();
+    let mut line_pairs: Vec<(u32, u32, Vocab)> = pairs_of.iter().flatten().copied().collect();
     line_pairs.par_sort_unstable();
     line_pairs.dedup();
     let peaks: Vec<f64> = line_pairs.par_iter().map(|&(a, b, vocab)| line_pair_term(s, a, b, vocab, corpus)).collect();
-    body_pairs
+    pairs_of
         .par_iter()
-        .map(|&(x, y)| {
-            let mut out = Vec::new();
-            subject_line_pairs(bodies, x, y, &mut out);
+        .map(|out| {
             out.iter()
                 .map(|pair| peaks[line_pairs.binary_search(pair).unwrap_or(0)])
                 .fold(0.0, f64::max)

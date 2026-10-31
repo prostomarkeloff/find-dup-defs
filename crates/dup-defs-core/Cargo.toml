@@ -1,6 +1,6 @@
 [package]
 name = "dup-defs-core"
-version = "0.4.4"
+version = "0.4.5"
 description = "The find-dup-defs frontend↔engine contract — Def / KindSpec / Analysis / the Frontend trait (+ LineMap). Frontend-agnostic; every frontend depends on it."
 keywords = ["ast", "canonicalize", "parsing", "clone", "duplicate"]
 categories = ["development-tools"]

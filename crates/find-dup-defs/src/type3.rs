@@ -164,8 +164,26 @@ fn jaccard(left: &[u32], right: &[u32]) -> f64 {
             }
         }
     }
+    // Two distinct lines usually share nothing; skip the division (and the `0.0/…` it would give).
+    if both == 0 {
+        return 0.0;
+    }
     let either = left.len() + right.len() - both;
-    if either == 0 { 0.0 } else { both as f64 / either as f64 }
+    both as f64 / either as f64
+}
+
+/// Do two sorted id slices share any element? A merge that stops at the first match — the whole
+/// of the step test, which only needs to know *whether* the two functions agree on a step.
+fn intersects(left: &[u32], right: &[u32]) -> bool {
+    let (mut li, mut ri) = (0usize, 0usize);
+    while li < left.len() && ri < right.len() {
+        match left[li].cmp(&right[ri]) {
+            std::cmp::Ordering::Less => li += 1,
+            std::cmp::Ordering::Greater => ri += 1,
+            std::cmp::Ordering::Equal => return true,
+        }
+    }
+    false
 }
 
 /// The line kernel: `1` for one line, the Jaccard of their parts (each line's sub-expressions and
@@ -277,8 +295,8 @@ impl Significance {
 /// What makes two functions indistinguishable to the pass: lines, parts, name, owner.
 type RepKey<'a> = (&'a [u32], &'a [(u32, u32)], &'a str, u32);
 
-/// A weighed candidate pair: the pair, its p-value, its soft cosine and whether it shares a step.
-type Scored = ((usize, usize), f64, (f64, bool));
+/// A surviving candidate pair: the pair, its p-value under the null, and its soft cosine.
+type Scored = ((usize, usize), f64, f64);
 
 /// One cluster of near-copies: its members (function indices), the least soft cosine among them,
 /// and the weakest evidence among its pairs.
@@ -492,12 +510,24 @@ pub fn type3_clusters(
     // The soft self-product of every line vector — the normalizer the soft cosine divides by.
     let self_soft: Vec<f64> =
         line_rows.par_iter().with_min_len(64).map(|row| soft_dot(row, row, line_parts)).collect();
-    // The steps alone — the lines that are neither the header nor a type — for the one question the
-    // similarity cannot answer: do the two agree on anything they *do*?
-    let body_rows: Vec<Vec<(u32, f64)>> = line_rows
+    // The steps alone — the lines that are neither the header nor a type — as one sorted set each:
+    // the line id itself and its sub-expressions, with zero-weight lines dropped. `soft_dot(body) > 0`
+    // holds exactly when two such sets intersect (every term of the soft product is non-negative, so
+    // a zero-weight line contributes nothing), and testing that is one early-exiting merge instead of
+    // an O(|body|²) double loop of Jaccards.
+    let body_parts: Vec<Vec<u32>> = line_rows
         .par_iter()
         .with_min_len(128)
-        .map(|row| row.iter().copied().filter(|&(id, _)| !context[id as usize]).collect())
+        .map(|row| {
+            let mut own: Vec<u32> = row
+                .iter()
+                .filter(|&&(id, w)| !context[id as usize] && w > 0.0)
+                .flat_map(|&(id, _)| line_parts[id as usize].iter().copied())
+                .collect();
+            own.sort_unstable();
+            own.dedup();
+            own
+        })
         .collect();
 
     // Exact all-pairs weighted-cosine joins — the candidates — on the selected backend: CPU, or
@@ -528,43 +558,54 @@ pub fn type3_clusters(
         let (ra, rb) = (sig.row_of[reps[j]], sig.row_of[reps[i]]);
         by_class.entry((ra.min(rb), ra.max(rb))).or_default().push((j, i));
     }
-    // The soft cosine, and whether the two agree on any step at all.
-    let soft = |a: usize, b: usize| -> (f64, bool) {
+    // The soft cosine of two line vectors, and the step test as two separate probes: the step test
+    // is an early-exiting merge over precomputed parts sets, and it is checked first, because the
+    // cosine — the only O(|a|·|b|) part of the score — is wasted on a pair that shares no step.
+    let soft_cos = |a: usize, b: usize| -> f64 {
         let dot = soft_dot(&line_rows[a], &line_rows[b], line_parts);
         let denom = (self_soft[a] * self_soft[b]).sqrt();
-        let steps = soft_dot(&body_rows[a], &body_rows[b], line_parts) > 0.0;
-        (if denom == 0.0 { 0.0 } else { dot / denom }, steps)
+        if denom == 0.0 { 0.0 } else { dot / denom }
     };
-    let (reps_ref, soft_ref) = (&reps, &soft);
+    let steps_of = |a: usize, b: usize| -> bool { intersects(&body_parts[a], &body_parts[b]) };
+    // The verdict — soft cosine over θ AND a shared step — decides before the null is consulted:
+    // the step test and the cosine are cheap (one early-exiting merge, one sparse dot product for
+    // the survivors), while the p-value is a saddlepoint tail whose every step loops the column
+    // classes (the phase's single hottest block, ~⅓ of its CPU). Fitting it for a pair the verdict
+    // drops is pure waste, so each pair is weighed only once it has already survived.
+    let (reps_ref, soft_cos_ref, steps_ref) = (&reps, &soft_cos, &steps_of);
     let scored: Vec<Scored> = by_class
         .into_par_iter()
         .flat_map_iter(|((ra, rb), group)| {
             let law = sig.law(ra, rb);
             group
                 .into_iter()
-                .map(move |(j, i)| ((j, i), sig.p_value(reps_ref[j], reps_ref[i], &law), soft_ref(j, i)))
+                .filter_map(move |(j, i)| {
+                    if !steps_ref(j, i) {
+                        return None;
+                    }
+                    let s = soft_cos_ref(j, i);
+                    (s > theta).then(|| ((j, i), sig.p_value(reps_ref[j], reps_ref[i], &law), s))
+                })
                 .collect::<Vec<_>>()
         })
         .collect();
     if std::env::var_os("FDD_TIMING").is_some() {
         eprintln!(
-            "[type-3] functions={n} reps={} candidates={} row classes={} fit residual={:.1e}",
+            "[type-3] functions={n} reps={} candidates={} survivors={} row classes={} fit residual={:.1e}",
             reps.len(),
+            pairs.len(),
             scored.len(),
             sig.model.row_classes(),
             sig.model.residual,
         );
     }
-    // The verdict: a pair is a near-copy when it is alike in proportion (soft cosine over θ) and
-    // shares a step. The p-value rides along as evidence; see the module doc for why it is not the
-    // verdict.
+    // The verdict was applied above; `scored` holds exactly the pairs that passed it. The p-value
+    // rides along as evidence; see the module doc for why it is not the verdict.
     let mut score: FxHashMap<(usize, usize), (f64, f64)> = FxHashMap::default();
     let mut edges: Vec<(usize, usize)> = Vec::new();
-    for &(key, p, (s, steps)) in &scored {
-        if s > theta && steps {
-            score.insert(key, (p, s));
-            edges.push(key);
-        }
+    for &(key, p, s) in &scored {
+        score.insert(key, (p, s));
+        edges.push(key);
     }
 
     // Components → exact min soft cosine and weakest p-value over ALL intra-component pairs
@@ -585,7 +626,7 @@ pub fn type3_clusters(
                     let key = (group[a], group[b]);
                     let (p, s) = score.get(&key).copied().unwrap_or_else(|| {
                         let (ra, rb) = (sig.row_of[reps[key.0]], sig.row_of[reps[key.1]]);
-                        (sig.p_value(reps[key.0], reps[key.1], &sig.law(ra.min(rb), ra.max(rb))), soft(key.0, key.1).0)
+                        (sig.p_value(reps[key.0], reps[key.1], &sig.law(ra.min(rb), ra.max(rb))), soft_cos(key.0, key.1))
                     });
                     min_sim = min_sim.min(s);
                     worst_p = worst_p.max(p);

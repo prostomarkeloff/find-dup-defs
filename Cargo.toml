@@ -17,3 +17,16 @@ pedantic = { level = "deny", priority = -1 }
 [profile.release]
 debug = "line-tables-only"
 strip = false
+# `strip = false` + line-tables-only is load-bearing: samply's symbolization needs the debug line
+# tables, so the binary stays unstripped. The rest is measured:
+#   codegen-units = 1 — one unit per crate; the engine's passes are all in this binary, and 1 CGU
+#                       lets LLVM see the whole pass before optimizing. Clean build got *faster*
+#                       than the default 16 units (less redundant per-unit work).
+#   lto = "thin"      — cross-crate inlining (the frontends' canon/defs code is hot in the scan)
+#                       at ~25% smaller binary; `"fat"` was measured at 16 min/build (a serialized
+#                       whole-program pass) for ~8% more size and no runtime gain, so thin wins.
+#   panic = "abort"   — no unwinding across the tree-sitter C FFI; a panic aborts instead of
+#                       unwinding through C frames. Tests still pass (no should_panic/catch_unwind).
+codegen-units = 1
+lto = "thin"
+panic = "abort"

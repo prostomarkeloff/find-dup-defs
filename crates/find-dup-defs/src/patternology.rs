@@ -434,7 +434,7 @@ pub(crate) fn whole_fn_helpers(
     concurrency: Concurrency,
 ) -> Vec<HelperCandidate> {
     pattern_families(d, xname_canonicals, theta, concurrency)
-        .into_iter()
+        .into_par_iter()
         .filter_map(|fam| {
             let shape = extractable(d, &fam.term, cfg)?;
             Some(HelperCandidate {
@@ -592,23 +592,30 @@ pub(crate) fn subblock_helpers(
     };
 
     // Window-keys with enough distinct-function support, largest window first (then support, then key
-    // for determinism) — so a maximal motif claims its statement cells before its sub-windows.
-    let mut keys: Vec<&[u32]> = groups
+    // for determinism) — so a maximal motif claims its statement cells before its sub-windows. The
+    // width/support/joined fields are precomputed once per key: `sort_by` runs O(n log n) comparisons,
+    // each of which would otherwise re-sort the instance list (`distinct_funcs`) and rebuild the
+    // joined-string tie-break.
+    let mut keys: Vec<(&[u32], usize, usize, String)> = groups
         .iter()
-        .filter(|(_, i)| distinct_funcs(i) >= support_min)
-        .map(|(k, _)| k.as_ref())
+        .filter_map(|(k, insts)| {
+            let support = distinct_funcs(insts);
+            if support >= support_min {
+                Some((k.as_ref(), insts[0].2 - insts[0].1, support, joined(k)))
+            } else {
+                None
+            }
+        })
         .collect();
     keys.sort_by(|a, b| {
-        let (ia, ib) = (&groups[*a], &groups[*b]);
-        let (wa, wb) = (ia[0].2 - ia[0].1, ib[0].2 - ib[0].1);
-        wb.cmp(&wa)
-            .then(distinct_funcs(ib).cmp(&distinct_funcs(ia)))
-            .then_with(|| joined(a).cmp(&joined(b)))
+        b.1.cmp(&a.1)
+            .then(b.2.cmp(&a.2))
+            .then_with(|| a.3.cmp(&b.3))
     });
 
     let mut claimed: FxHashSet<(usize, usize)> = FxHashSet::default();
     let mut out: Vec<HelperCandidate> = Vec::new();
-    for key in keys {
+    for (key, _, _, _) in keys {
         // Keep only instances whose every statement cell is still unclaimed by a larger motif.
         let fresh: Vec<WindowInst> = groups[key]
             .iter()

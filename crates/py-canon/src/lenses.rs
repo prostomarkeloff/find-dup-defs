@@ -355,32 +355,6 @@ fn schema_facts(stmt: &Stmt) -> Vec<String> {
     out
 }
 
-/// Project one definition through one lens. `scope_lines` is the module-scope rendering of the
-/// body, computed by the caller (it needs the shared canonicalizer); `Use` yields nothing here and
-/// is filled in later by [`merge_use_facts`].
-fn project(
-    lens: Lens,
-    stmt: &Stmt,
-    bound: &HashSet<String>,
-    facts: &Facts,
-    scope_lines: &[String],
-) -> Vec<String> {
-    match lens {
-        // A *set*: what it depends on, order irrelevant.
-        Lens::Outgoing => facts.effects.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect(),
-        // A *sequence*: the protocol it drives, order load-bearing.
-        Lens::Effects => facts.effects.clone(),
-        Lens::Control => facts.control.clone(),
-        Lens::Failures => facts.failures.iter().cloned().collect(),
-        Lens::Resources => facts.resources.clone(),
-        Lens::Signature => signature_facts(stmt, bound),
-        Lens::Decorators => decorator_facts(stmt, bound),
-        Lens::Schema => schema_facts(stmt),
-        Lens::Scope => scope_lines.to_vec(),
-        Lens::Use => Vec::new(),
-    }
-}
-
 // ── Entry point ────────────────────────────────────────────────────────────
 
 /// This definition's answers, one bucket per enabled lens — the whole of what a frontend
@@ -389,12 +363,40 @@ fn fill(
     lenses: &[Lens],
     stmt: &Stmt,
     bound: &HashSet<String>,
-    facts: &Facts,
+    facts: Facts,
     scope_lines: &[String],
 ) -> LensFacts {
     let mut out = LensFacts::new();
-    for &lens in lenses {
-        out.extend(lens, project(lens, stmt, bound, facts, scope_lines));
+    let Facts { effects, control, failures, resources } = facts;
+    // The walked facts move once each, into whichever lens asks for them. `effects` feeds two
+    // lenses — the ordered sequence and the deduped set — so the set is built from a borrowed view
+    // first and the owned vector moves into `Effects`: one clone, not two.
+    if lenses.contains(&Lens::Outgoing) {
+        out.extend(Lens::Outgoing, effects.iter().cloned().collect::<BTreeSet<_>>());
+    }
+    if lenses.contains(&Lens::Effects) {
+        out.extend(Lens::Effects, effects);
+    }
+    if lenses.contains(&Lens::Control) {
+        out.extend(Lens::Control, control);
+    }
+    if lenses.contains(&Lens::Failures) {
+        out.extend(Lens::Failures, failures);
+    }
+    if lenses.contains(&Lens::Resources) {
+        out.extend(Lens::Resources, resources);
+    }
+    if lenses.contains(&Lens::Signature) {
+        out.extend(Lens::Signature, signature_facts(stmt, bound));
+    }
+    if lenses.contains(&Lens::Decorators) {
+        out.extend(Lens::Decorators, decorator_facts(stmt, bound));
+    }
+    if lenses.contains(&Lens::Schema) {
+        out.extend(Lens::Schema, schema_facts(stmt));
+    }
+    if lenses.contains(&Lens::Scope) {
+        out.extend(Lens::Scope, scope_lines.iter().cloned());
     }
     out
 }
@@ -421,7 +423,7 @@ pub(crate) fn lens_def(
         return;
     }
     let facts = FactWalk::run(stmt, bound);
-    let filled = fill(lenses, stmt, bound, &facts, scope_lines);
+    let filled = fill(lenses, stmt, bound, facts, scope_lines);
     let site = DefSite { name, file, line, col, loc };
     if let Some(def) = shared_lens_def("py", CanonDialect::CPythonAst, &site, lenses, &filled) {
         out.push(def);
@@ -443,7 +445,7 @@ mod tests {
         for stmt in &module.body {
             let facts = super::FactWalk::run(stmt, &bound);
             let projected =
-                dup_defs_core::lens::stitch(&[lens], &super::fill(&[lens], stmt, &bound, &facts, &[]));
+                dup_defs_core::lens::stitch(&[lens], &super::fill(&[lens], stmt, &bound, facts, &[]));
             if !projected.is_empty() {
                 return projected;
             }

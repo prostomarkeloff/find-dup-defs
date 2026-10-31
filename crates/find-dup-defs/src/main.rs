@@ -1679,41 +1679,44 @@ fn report_paths<'f>(findings: impl Iterator<Item = &'f Finding>, repo_root: &Pat
     short_paths(&files, &canon_root)
 }
 
-/// The trailing marker on a `DUPLICATE` line: similarity / pass tag + thickness triage signals
-/// (`T=…`, `loc=…`, `args=…`). `args` is dropped when 0 (constants, type-aliases, classes) to
-/// keep the line scannable. Constants / type-aliases with no similarity tag still get a `loc`
-/// hint so the user can tell a multi-line constant from a one-line alias at a glance.
-fn group_suffix(f: &Finding) -> String {
+/// Append the trailing marker on a `DUPLICATE` line directly into `out`: similarity / pass tag +
+/// thickness triage signals (`T=…`, `loc=…`, `args=…`). `args` is dropped when 0 (constants,
+/// type-aliases, classes) to keep the line scannable. Constants / type-aliases with no similarity
+/// tag still get a `loc` hint so the user can tell a multi-line constant from a one-line alias at
+/// a glance.
+///
+/// 🔴 Written into the report buffer rather than built as a fresh `String`: the old form allocated
+/// up to five intermediate strings per finding (tag, metrics, `[tag, metrics]`, the joined votes
+/// and the joined notes), each of which was only ever copied into the output and dropped.
+fn group_suffix_into(out: &mut String, f: &Finding) {
     let tag: Option<String> = if is_cross_name(f.pass) && f.min_sim.is_none() {
         Some("normalized-exact".to_owned())
     } else {
         f.min_sim.map(|s| format!("ast sim {s:.2}"))
     };
     let n = f.members.len();
-    let metrics = if f.args > 0 {
-        format!("T={:.2}, n={}, loc={}, args={}", f.thickness, n, f.loc, f.args)
+    let _ = write!(out, "  [");
+    if let Some(t) = tag {
+        let _ = write!(out, "{t}, ");
+    }
+    if f.args > 0 {
+        let _ = write!(out, "T={:.2}, n={}, loc={}, args={}]", f.thickness, n, f.loc, f.args);
     } else {
-        format!("T={:.2}, n={}, loc={}", f.thickness, n, f.loc)
-    };
-    let base = match tag {
-        Some(t) => format!("  [{t}, {metrics}]"),
-        None => format!("  [{metrics}]"),
-    };
+        let _ = write!(out, "T={:.2}, n={}, loc={}]", f.thickness, n, f.loc);
+    }
     // Which perspectives agreed, and by how many facts each — the answer to "why did these
     // cluster", which the similarity score cannot give: it says how close, never through what.
-    let base = if f.facets.is_empty() {
-        base
-    } else {
-        let votes: Vec<String> = f.facets.iter().map(|(k, n)| format!("{k}×{n}")).collect();
-        format!("{base}  votes[{}]: {}", f.facets.len(), votes.join(" "))
-    };
+    if !f.facets.is_empty() {
+        let _ = write!(out, "  votes[{}]:", f.facets.len());
+        for (k, n) in &f.facets {
+            let _ = write!(out, " {k}×{n}");
+        }
+    }
     // Notes from matching directives — visible right next to the finding so the next reviewer
     // sees the override reason without grepping. Multiple notes join with `; ` to stay on one
     // line; the JSON form keeps them as a structured array.
-    if f.notes.is_empty() {
-        base
-    } else {
-        format!("{base}  # {}", f.notes.join("; "))
+    if !f.notes.is_empty() {
+        let _ = write!(out, "  # {}", f.notes.join("; "));
     }
 }
 
@@ -1801,6 +1804,16 @@ fn format_report(
 
     let pathmap = report_paths(findings.iter().copied(), repo_root);
 
+    // Bucket findings by section index ONCE, then emit each section's bucket in input order. The
+    // prior form re-scanned every finding for every section header (`S×N` `section_index` calls —
+    // a report with ~20 sections and tens of thousands of findings is ~half a million comparisons
+    // whose answer is the same every time), which is exactly the `BTreeMap`-in-a-hot-loop shape.
+    // The buckets hold the same `&Finding` refs in the same order, so the bytes are unchanged.
+    let mut buckets: BTreeMap<usize, Vec<&Finding>> = BTreeMap::new();
+    for f in findings.iter().copied() {
+        buckets.entry(section_index(f)).or_default().push(f);
+    }
+
     // Written into ONE buffer rather than a `Vec<String>` joined at the end: a report of this size is
     // a million-odd lines, and every one of them was an allocation whose only purpose was to be
     // copied into the join and dropped. The text is identical — `join("\n") + "\n"` and a `\n` after
@@ -1815,11 +1828,16 @@ fn format_report(
             out.push('\n');
         }
         line(&mut out, format_args!("--- {header} ---"));
-        for f in findings.iter().copied().filter(|f| section_index(f) == *sect) {
-            line(
-                &mut out,
-                format_args!("DUPLICATE {} [{}]: {}{}", f.kind.label, f.severity.label(), f.name, group_suffix(f)),
+        for f in buckets.get(sect).into_iter().flatten() {
+            let _ = write!(
+                out,
+                "DUPLICATE {} [{}]: {}",
+                f.kind.label,
+                f.severity.label(),
+                f.name
             );
+            group_suffix_into(&mut out, f);
+            out.push('\n');
             for (file, line_no, _col) in &f.members {
                 line(&mut out, format_args!("  {}:{}", pathmap[file.as_str()], line_no));
             }
@@ -1838,16 +1856,16 @@ fn format_report(
 }
 
 #[derive(Serialize)]
-struct JsonMember {
-    file: String,
+struct JsonMember<'a> {
+    file: &'a str,
     line: usize,
 }
 
 #[derive(Serialize)]
-struct JsonGroup {
-    kind: String,
-    name: String,
-    severity: String,
+struct JsonGroup<'a> {
+    kind: &'static str,
+    name: &'a str,
+    severity: &'static str,
     /// Проход, давший находку: `name` / `cross-name` / `type-3` / `pattern` / `converge` /
     /// `converge-family`.
     ///
@@ -1856,7 +1874,7 @@ struct JsonGroup {
     /// же `dup-function`, что у гейтящего прохода. Потребителю оставалось угадывать по косвенным
     /// признакам — скажем, по пустому `min_sim` вместе с наличием `facets`, — то есть строить
     /// свою модель того, чего инструмент про себя не сказал.
-    pass: String,
+    pass: &'static str,
     min_sim: Option<f64>,
     cross_name: bool,
     /// Composite [0,1] "fat function" score — see [`thickness`].
@@ -1865,7 +1883,7 @@ struct JsonGroup {
     loc: usize,
     /// Max parameter count across cluster members (0 for non-callable kinds).
     args: usize,
-    members: Vec<JsonMember>,
+    members: Vec<JsonMember<'a>>,
     allowlist_key: String,
     notes: Vec<String>,
     /// `(facet, shared facts)` per perspective the cluster agrees on, strongest first. Omitted
@@ -1925,8 +1943,8 @@ struct JsonDirective {
 }
 
 #[derive(Serialize)]
-struct JsonReport {
-    groups: Vec<JsonGroup>,
+struct JsonReport<'a> {
+    groups: Vec<JsonGroup<'a>>,
     summary: serde_json::Map<String, serde_json::Value>,
     /// Per-directive effect, in the order the directives were given. Omitted entirely when no `-D`
     /// was passed, so the default document is byte-identical to previous releases.
@@ -1936,12 +1954,11 @@ struct JsonReport {
 
 /// Stable identity of a finding for allowlists and directive reports.
 fn allowlist_key(f: &Finding) -> String {
-    let rule = if is_cross_name(f.pass) {
-        "dup-xname".to_owned()
+    if is_cross_name(f.pass) {
+        format!("dup-xname {}", f.name)
     } else {
-        format!("dup-{}", f.kind.label.to_ascii_lowercase())
-    };
-    format!("{rule} {}", f.name)
+        format!("dup-{} {}", f.kind.label.to_ascii_lowercase(), f.name)
+    }
 }
 
 /// Уникальные пути участников в порядке сортировки образуют файловую часть отпечатка.
@@ -2048,21 +2065,25 @@ fn directive_text(d: &directiva::Directive<LintAction>) -> String {
 /// Machine-readable groups + summary — byte-for-byte the Python `render_json` (indent=2).
 fn render_json(findings: &[Finding], repo_root: &Path, directives: Vec<JsonDirective>) -> String {
     let pathmap = report_paths(findings.iter(), repo_root);
-    let groups: Vec<JsonGroup> = findings
+    let groups: Vec<JsonGroup<'_>> = findings
         .iter()
         .map(|f| {
             let cross = is_cross_name(f.pass);
             JsonGroup {
-                kind: f.kind.label.to_owned(),
-                name: f.name.clone(),
-                severity: f.severity.label().to_owned(),
-                pass: f.pass.to_owned(),
+                kind: f.kind.label,
+                name: f.name.as_str(),
+                severity: f.severity.label(),
+                pass: f.pass,
                 min_sim: f.min_sim,
                 cross_name: cross,
                 thickness: f.thickness,
                 loc: f.loc,
                 args: f.args,
-                members: f.members.iter().map(|(file, line, _)| JsonMember { file: pathmap[file.as_str()].clone(), line: *line }).collect(),
+                members: f
+                    .members
+                    .iter()
+                    .map(|(file, line, _)| JsonMember { file: pathmap[file.as_str()].as_str(), line: *line })
+                    .collect(),
                 allowlist_key: allowlist_key(f),
                 notes: f.notes.clone(),
                 facets: f.facets.clone(),
