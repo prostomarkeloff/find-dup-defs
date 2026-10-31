@@ -411,7 +411,7 @@ fn render_bench(spec: &str, findings: &[Finding], selected: &[&dyn Frontend], cl
             cli.threshold,
             cli.error_threshold,
             &cli.repo_root,
-            &dup_defs_core::ScanOpts { kinds: cli.kinds.as_deref() },
+            &dup_defs_core::ScanOpts { kinds: cli.kinds.as_deref(), facets: true },
         );
         std::hint::black_box(&r);
         ms.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -568,7 +568,7 @@ fn main() {
 
     // One scan → defs. The cheap `(kind, name)` group sizes feed the directive-inferrer's
     // `settings:max-name-group` suggestion (independent of clustering and the cap); then cluster.
-    let defs = collect_defs(&selected, &opts.paths, &dup_defs_core::ScanOpts { kinds: opts.kinds.as_deref() });
+    let defs = collect_defs(&selected, &opts.paths, &dup_defs_core::ScanOpts { kinds: opts.kinds.as_deref(), facets: find_dup_defs::facets_needed(&opts) });
     // Dump the scanned defs for snapshot benches (see the FDD_SNAPSHOT path above).
     // Cheap: dump just the Type-3 inputs (scan → dump → exit), no 2.6GB defs.json.
     if let Ok(dir) = std::env::var("FDD_DUMP_T3") {
@@ -595,7 +595,7 @@ fn main() {
                 let d = collect_defs(
                     &selected,
                     &opts.paths,
-                    &dup_defs_core::ScanOpts { kinds: opts.kinds.as_deref() },
+                    &dup_defs_core::ScanOpts { kinds: opts.kinds.as_deref(), facets: find_dup_defs::facets_needed(&opts) },
                 );
                 std::hint::black_box(d.len());
                 ms.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -695,7 +695,7 @@ fn main() {
                 cli.threshold,
                 cli.error_threshold,
                 &cli.repo_root,
-                &dup_defs_core::ScanOpts { kinds: cli.kinds.as_deref() },
+                &dup_defs_core::ScanOpts { kinds: cli.kinds.as_deref(), facets: true },
             )
         }
     });

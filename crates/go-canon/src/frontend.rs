@@ -125,7 +125,7 @@ mod tests {
         // In lens mode a file whose bytes repeat another's is parsed once and replayed: the
         // alternatives still collapse.
         let kinds = vec!["lenses".to_owned()];
-        let lensed = Go.scan(&paths, &ScanOpts { kinds: Some(&kinds) });
+        let lensed = Go.scan(&paths, &ScanOpts { kinds: Some(&kinds), facets: true });
         assert_eq!(lensed.iter().filter(|d| d.kind.id == "functions" && d.name == "Default").count(), 1);
         assert_eq!(count("Twin"), 1);
         assert_eq!(lensed.iter().filter(|d| d.kind.id == "functions" && d.name == "Twin").count(), 1, "a replayed twin is an alternative too");

@@ -116,8 +116,10 @@ pub(crate) fn dotted(full: &str) -> String {
 
 /// The namespace blocks of a file in order, each with the top-level statements it holds: a braced
 /// `namespace X { … }` holds its body, a `namespace X;` everything up to the next one. Every block's
-/// imports are read before its definitions, so a definition sees them all.
-pub(crate) fn blocks<'t>(root: Node<'t>, src: &str) -> Vec<(Names, Vec<Node<'t>>)> {
+/// imports are read before its definitions, so a definition sees them all. `facets` false skips the
+/// import-table build: the `Names` tables are what the perspective passes read, so a run that never
+/// reads facets need not resolve a single `use`.
+pub(crate) fn blocks<'t>(root: Node<'t>, src: &str, facets: bool) -> Vec<(Names, Vec<Node<'t>>)> {
     let mut out: Vec<(Names, Vec<Node<'t>>)> = vec![(Names::default(), Vec::new())];
     for item in kids(root) {
         if matches!(item.kind(), "php_tag" | "php_end_tag" | "text" | "empty_statement") {
@@ -138,9 +140,11 @@ pub(crate) fn blocks<'t>(root: Node<'t>, src: &str) -> Vec<(Names, Vec<Node<'t>>
         }
     }
     out.retain(|(_, items)| !items.is_empty());
-    for (names, items) in &mut out {
-        for item in items.iter().filter(|i| i.kind() == "namespace_use_declaration") {
-            names.add_use(*item, src);
+    if facets {
+        for (names, items) in &mut out {
+            for item in items.iter().filter(|i| i.kind() == "namespace_use_declaration") {
+                names.add_use(*item, src);
+            }
         }
     }
     out
@@ -156,7 +160,7 @@ mod tests {
     fn a_name_is_read_through_the_file_s_imports_and_namespace() {
         let src = "<?php\nnamespace App\\Http;\nuse App\\Models\\{Order, User as Member};\nuse Psr\\Log;\nuse function App\\Support\\fmt;\nfunction f() {}\n";
         let tree = parse(src).expect("parse");
-        let found = blocks(tree.root_node(), src);
+        let found = blocks(tree.root_node(), src, true);
         let (names, _) = &found[0];
         assert_eq!(names.namespace, "App\\Http");
         assert_eq!(names.resolve(NameKind::Class, "Order"), ("App\\Models\\Order".to_owned(), true));

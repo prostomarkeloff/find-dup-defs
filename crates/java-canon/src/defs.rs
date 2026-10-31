@@ -264,6 +264,9 @@ struct Builder<'a> {
     file_names: HashSet<String>,
     /// What the file's names stand for, as the decisions pass writes them.
     scope: FileScope,
+    /// Whether the run's passes read per-definition facets (converge/decisions/lenses) — gates the
+    /// statement stream, decision facts, reached paths and identity when false.
+    facets: bool,
     out: Vec<Def>,
 }
 
@@ -328,8 +331,8 @@ impl Builder<'_> {
             Some(v) => text(v, self.source).to_owned(),
             None => text(field_node, self.source).to_owned(),
         };
-        let identity = self.scope.identity(&name);
-        let facets = Facets { identity: Some(identity), ..Default::default() };
+        let identity = if self.facets { Some(self.scope.identity(&name)) } else { None };
+        let facets = Facets { identity, ..Default::default() };
         self.emit(&CONSTANTS, name, declarator, 0, text_orig, None, None, facets);
     }
 
@@ -352,8 +355,8 @@ impl Builder<'_> {
         };
         // `FileScope::identity` prefixes the package itself, so it takes the package-less qualified
         // name (`Outer.Inner`) — the class's report name above is package-qualified, this is not.
-        let identity = self.scope.identity(&qclass);
-        let facets = Facets { identity: Some(identity), ..Default::default() };
+        let identity = if self.facets { Some(self.scope.identity(&qclass)) } else { None };
+        let facets = Facets { identity, ..Default::default() };
         let canon = DefCanon { cluster: Some(class_canon(&self.imports, &decl)), analysis: None, facets };
         self.push(kind, qualified, node, 0, canon);
 
@@ -399,9 +402,9 @@ impl Builder<'_> {
             self.push_lens(&name, m, &facts);
         }
 
-        let read = decides(&func, &self.scope, open);
+        let read = if self.facets { decides(&func, &self.scope, open) } else { dup_defs_core::decide::DecisionFacts::default() };
         let AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, type_refs, type3_units, statements, size } =
-            analyze(&self.imports, &name, &func);
+            analyze(&self.imports, &name, &func, self.facets);
         let canon = DefCanon {
             cluster: Some(cluster_canonical),
             analysis: Some(Analysis {
@@ -414,9 +417,9 @@ impl Builder<'_> {
             }),
             facets: Facets {
                 statements,
-                reaches: reached_paths(&func, &self.imports),
+                reaches: if self.facets { reached_paths(&func, &self.imports) } else { Vec::new() },
                 decides: read.atoms,
-                identity: Some(self.scope.identity(&name)),
+                identity: if self.facets { Some(self.scope.identity(&name)) } else { None },
                 params: read.params,
                 calls: read.calls,
                 mentions: read.mentions,
@@ -454,11 +457,14 @@ pub fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec<Def> {
     let root = tree.root_node();
     let lines = LineMap::new(source);
     let lenses = enabled_lenses(opts);
+    let facets = opts.facets;
     let file_names = if lenses.is_empty() { HashSet::new() } else { file_bound_names(root, source) };
+    // The import table feeds the canonicals (class names resolve through it) as well as the facets,
+    // so it is always read; only the facets that hang off it are gated.
     let imports = file_imports(root, source);
     let package = package_name(root, source);
     let scope = FileScope::new(&package, &imports);
-    let mut b = Builder { source, lines: &lines, file, package, imports, lenses, file_names, scope, out: Vec::new() };
+    let mut b = Builder { source, lines: &lines, file, package, imports, lenses, file_names, scope, facets, out: Vec::new() };
     for item in kids(root) {
         if item.has_error() {
             continue;

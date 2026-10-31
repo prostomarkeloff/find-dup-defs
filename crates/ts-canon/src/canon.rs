@@ -1923,7 +1923,7 @@ pub(crate) fn interface_canonical(interface: &ast::TSInterfaceDeclaration<'_>) -
 
 /// Full callable analysis — the cluster and xname canonicals, the Type-3 lines, the statement stream
 /// and the node count — or `None` for a callable with no body.
-pub(crate) fn analyze_node(node: &CallableNode<'_, '_>) -> Option<AnalyzedFn> {
+pub(crate) fn analyze_node(node: &CallableNode<'_, '_>, facets: bool) -> Option<AnalyzedFn> {
     let parts = node.parts()?;
     let cluster_canonical = callable_canonical(node);
     let locals_of = |parts: &Parts<'_, '_>| {
@@ -1936,8 +1936,9 @@ pub(crate) fn analyze_node(node: &CallableNode<'_, '_>) -> Option<AnalyzedFn> {
     };
 
     // The statement stream keeps the body as written: converge reads it to say where two definitions
-    // stop agreeing, and a rewritten line would point the reader at code that is not there.
-    let statements = statement_stream(&parts, &locals_of(&parts));
+    // stop agreeing, and a rewritten line would point the reader at code that is not there. A run
+    // that never reads facets skips the whole walk.
+    let statements = if facets { statement_stream(&parts, &locals_of(&parts)) } else { Vec::new() };
 
     // The name-agnostic canonicals are taken from the normal form (`normal.rs`): what the exact and
     // Type-3 passes compare is the meaning the rules reach, not the spelling. The Type-3 lines come
@@ -1976,7 +1977,7 @@ fn analyze_one(text: &str) -> Option<AnalyzedFn> {
         Statement::VariableDeclaration(v) => CallableNode::Bound(v.kind, v.declarations.first()?),
         _ => return None,
     };
-    analyze_node(&node)
+    analyze_node(&node, true)
 }
 
 #[must_use]

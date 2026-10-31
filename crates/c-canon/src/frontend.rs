@@ -113,7 +113,7 @@ mod tests {
         // In lens mode every file is handed over and read against the same corpus: the lens records
         // come out alongside the body definitions, scored against the tree.
         let kinds = vec!["lenses".to_owned()];
-        let lensed = C.scan(&paths, &ScanOpts { kinds: Some(&kinds) });
+        let lensed = C.scan(&paths, &ScanOpts { kinds: Some(&kinds), facets: true });
         let record = lensed.iter().find(|d| d.kind.id == "lenses" && d.name == "setup").expect("a lens record for setup");
         assert!(record.thickness.is_some(), "scored against the corpus");
         assert_eq!(lensed.iter().filter(|d| d.kind.id == "functions" && d.name == "open_file").count(), 1);

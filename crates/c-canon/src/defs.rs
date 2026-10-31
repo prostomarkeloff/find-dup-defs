@@ -30,6 +30,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use dup_defs_core::decide::DecisionFacts;
 use dup_defs_core::lens::{enabled_lenses, lens_def, DefSite, Lens, LensFacts};
 use dup_defs_core::{count_loc, Analysis, AnalyzedFn, CanonDialect, Def, Facets, KindSpec, LineMap, ScanOpts};
 use rayon::prelude::*;
@@ -321,6 +322,8 @@ struct Builder<'a> {
     file_names: HashSet<String>,
     /// What the file's names stand for, as the decisions pass writes them.
     decides: FileScope,
+    /// Whether any pass of this run reads the per-definition facets, so they are worth computing.
+    facets: bool,
     /// The kinds and names already reported: a second definition of one is another configuration's.
     seen: HashSet<(&'static str, String)>,
     /// The macros the file defines as parameters of something else rather than as constants: the ones
@@ -394,18 +397,28 @@ impl Builder<'_> {
             let facts = crate::lenses::function_facts(&func, &roles, &locals, &self.file_names, scope);
             self.push_lens(&parts.name, def, &facts);
         }
-        let read = decides(&func, &self.decides, parts.name == "main");
+        let read = if self.facets {
+            decides(&func, &self.decides, parts.name == "main")
+        } else {
+            DecisionFacts::default()
+        };
         let AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, type_refs, type3_units, statements, size } =
-            analyze(&parts.name, &func);
-        let names = free_names(&func);
+            analyze(&parts.name, &func, self.facets);
+        let reaches = if self.facets {
+            let names = free_names(&func);
+            self.corpus.headers.reaches(&self.closure, names.iter())
+        } else {
+            Vec::new()
+        };
+        let identity = self.facets.then(|| self.decides.identity(&parts.name));
         let canon = DefCanon {
             cluster: Some(cluster_canonical),
             analysis: Some(Analysis { xname_canonical, type3_lines, type_refs, type3_units, size, canon_dialect: CanonDialect::C }),
             facets: Facets {
                 statements,
-                reaches: self.corpus.headers.reaches(&self.closure, names.iter()),
+                reaches,
                 decides: read.atoms,
-                identity: Some(self.decides.identity(&parts.name)),
+                identity,
                 params: read.params,
                 calls: read.calls,
                 mentions: read.mentions,
@@ -432,7 +445,7 @@ impl Builder<'_> {
                     self.push_lens(&name, decl, &facts);
                 }
                 let mut canon = DefCanon::body(Some(record_canon(kind, &name, &fields)));
-                if !table {
+                if !table && self.facets {
                     // A record is constructed by its initializer, which sets its members.
                     canon.facets.identity = Some(self.decides.identity(&name));
                     if let Some(members) = self.decides.record(&name) {
@@ -563,7 +576,14 @@ pub(crate) fn scan_file(source: &str, file: &Arc<str>, opts: &ScanOpts, corpus: 
     let items = top_items(root);
     let facts = file_facts(&items, src);
     let lenses = enabled_lenses(opts);
-    let closure = corpus.headers.closure(Path::new(&**file), &Headers::includes_of(root, src));
+    let want_facets = opts.facets;
+    // The headers the file's includes reach, for a definition's reaches — facets-only data, so a run
+    // that reads no facets skips the walk that resolves them.
+    let closure = if want_facets {
+        corpus.headers.closure(Path::new(&**file), &Headers::includes_of(root, src))
+    } else {
+        Vec::new()
+    };
     let module = dotted_under(&corpus.root, Path::new(&**file));
     let mut b = Builder {
         source,
@@ -575,6 +595,7 @@ pub(crate) fn scan_file(source: &str, file: &Arc<str>, opts: &ScanOpts, corpus: 
         lenses,
         file_names: if opts.wants("lenses") { facts.names.clone() } else { HashSet::new() },
         decides: FileScope::new(module, facts.statics, &facts.records),
+        facets: want_facets,
         seen: HashSet::new(),
         parameters: parameter_macros(&items, src),
         out: Vec::new(),
@@ -799,7 +820,7 @@ int fetch(struct repo *r, int id) { char rec = r->store[id]; return rec + 1; }
     fn lens_record(src: &str, name: &str) -> Vec<String> {
         let f: Arc<str> = Arc::from("t.c");
         let kinds = vec!["lenses".to_owned()];
-        let opts = ScanOpts { kinds: Some(&kinds) };
+        let opts = ScanOpts { kinds: Some(&kinds), facets: true };
         scan_source(src, &f, &opts)
             .into_iter()
             .find(|d| d.kind.id == "lenses" && d.name == name)

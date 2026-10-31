@@ -955,11 +955,13 @@ pub(crate) fn enum_canon(name: &str, items: &[(String, Option<Expr>)]) -> String
 /// — a rewritten line would point the reader at code that is not there. The Type-3 lines read the
 /// normal form that keeps every statement, the exact canonical the one that also inlines single-use
 /// temporaries ([`crate::normal`]).
-pub(crate) fn analyze(name: &str, f: &Func) -> AnalyzedFn {
+pub(crate) fn analyze(name: &str, f: &Func, facets: bool) -> AnalyzedFn {
     let bound = locals_of(f);
     let cluster = Dump::new(&bound, None).func(name, f, true, true);
 
-    let statements = {
+    // The statement stream keeps the definition as written: converge reads it to say where two
+    // definitions stop agreeing. A run that never reads facets skips the whole walk.
+    let statements = if facets {
         let mut dump = Dump::new(&bound, Some(&bound));
         // The definition's own header opens the stream at depth 0 and the body starts at depth 1 — the
         // contract every frontend agrees on.
@@ -968,6 +970,8 @@ pub(crate) fn analyze(name: &str, f: &Func) -> AnalyzedFn {
         walk.push(0, head);
         walk.stmts(&f.body, 1);
         walk.out
+    } else {
+        Vec::new()
     };
 
     let statement_form = crate::normal::normal_form(f, false);

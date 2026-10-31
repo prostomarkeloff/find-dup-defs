@@ -168,8 +168,8 @@ impl Canon {
     }
 
     /// A callable: the full analysis, or only its cluster canonical when it has no body.
-    fn callable(node: &CallableNode<'_, '_>) -> Self {
-        match analyze_node(node) {
+    fn callable(node: &CallableNode<'_, '_>, facets: bool) -> Self {
+        match analyze_node(node, facets) {
             Some(a) => Canon {
                 cluster: Some(a.cluster_canonical),
                 analysis: Some(Analysis {
@@ -233,14 +233,19 @@ struct FileNames<'a> {
 /// Fill in what the decisions pass reads off a callable ([`dup_defs_core::Facets::decides`] and the
 /// closed-world facts beside it), with the definition's own identity: what the corpus's calls name it
 /// by. `decorated` — see [`crate::decides::decides`].
-fn decided(def: &mut Def, names: &FileNames<'_>, params: &FormalParameters<'_>, body: &[Statement<'_>], decorated: bool) {
-    let facts = crate::decides::decides(params, body, names.decides, decorated);
-    def.facets.decides = facts.atoms;
+fn decided(def: &mut Def, names: &FileNames<'_>, params: &FormalParameters<'_>, body: &[Statement<'_>], decorated: bool, facets: bool) {
+    // The decisions facts, the identity, and the params/calls/mentions/loose beside them are all
+    // facets-only: a run that never reads them leaves every one at its default.
+    if !facets {
+        return;
+    }
+    let decision = crate::decides::decides(params, body, names.decides, decorated);
+    def.facets.decides = decision.atoms;
     def.facets.identity = Some(Arc::from(dup_defs_core::decide::local(names.decides.module(), &def.name)));
-    def.facets.params = facts.params;
-    def.facets.calls = facts.calls;
-    def.facets.mentions = facts.mentions;
-    def.facets.loose_keywords = facts.loose;
+    def.facets.params = decision.params;
+    def.facets.calls = decision.calls;
+    def.facets.mentions = decision.mentions;
+    def.facets.loose_keywords = decision.loose;
 }
 
 /// Build a [`Def`] for the definition spanning `source[start..end]`, with the canonical strings
@@ -258,12 +263,13 @@ fn build_def(
     args: usize,
     names: &FileNames<'_>,
     canon: Canon,
+    facets: bool,
 ) -> Def {
     let text = source[start..end].to_owned();
     let loc = count_loc(&text);
     let (line, col) = lines.loc0(start);
     let Canon { cluster: cluster_canonical, analysis, statements } = canon;
-    let reaches = crate::canon::reached_paths(&statements, names.imports);
+    let reaches = if facets { crate::canon::reached_paths(&statements, names.imports) } else { Vec::new() };
     Def {
         lang: "ts",
         kind,
@@ -328,16 +334,16 @@ fn emit_callable_lens(
 }
 
 /// `function foo(...) { ... }` — top-level. Returns `None` for trivial-body / anonymous fns.
-fn function_def(f: &Function<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, _ctx: &LensCtx) -> Option<Def> {
+fn function_def(f: &Function<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, _ctx: &LensCtx, facets: bool) -> Option<Def> {
     let id = f.id.as_ref()?;
     if is_trivial_function_body(f.body.as_deref()) {
         return None;
     }
     let (start, end) = (u(f.span.start), u(f.span.end));
-    let canon = Canon::callable(&CallableNode::Function(f));
-    let mut def = build_def(&FUNCTIONS, id.name.to_string(), file, lines, source, (start, end), count_args(&f.params), names, canon);
+    let canon = Canon::callable(&CallableNode::Function(f), facets);
+    let mut def = build_def(&FUNCTIONS, id.name.to_string(), file, lines, source, (start, end), count_args(&f.params), names, canon, facets);
     if let Some(body) = &f.body {
-        decided(&mut def, names, &f.params, &body.statements, false);
+        decided(&mut def, names, &f.params, &body.statements, false, facets);
     }
     Some(def)
 }
@@ -364,11 +370,11 @@ fn emit_function_lens(
 }
 
 /// A class declaration as a whole — `class Foo { ... }`, decorators excluded.
-fn class_def(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, _ctx: &LensCtx) -> Option<Def> {
+fn class_def(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, _ctx: &LensCtx, facets: bool) -> Option<Def> {
     let id = c.id.as_ref()?;
     let start = keyword_start(source, u(c.span.start), last_decorator_end(&c.decorators));
     let end = u(c.span.end);
-    Some(build_def(&CLASSES, id.name.to_string(), file, lines, source, (start, end), 0, names, Canon::body(class_canonical(c))))
+    Some(build_def(&CLASSES, id.name.to_string(), file, lines, source, (start, end), 0, names, Canon::body(class_canonical(c)), facets))
 }
 
 /// The lens record for a class — what it declares and under what decorators.
@@ -404,15 +410,15 @@ fn emit_interface_lens(
 }
 
 /// `type X = ...`.
-fn type_alias_def(t: &TSTypeAliasDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, _ctx: &LensCtx) -> Option<Def> {
+fn type_alias_def(t: &TSTypeAliasDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, _ctx: &LensCtx, facets: bool) -> Option<Def> {
     let (start, end) = (u(t.span.start), u(t.span.end));
-    Some(build_def(&TYPE_ALIASES, t.id.name.to_string(), file, lines, source, (start, end), 0, names, Canon::TEXT))
+    Some(build_def(&TYPE_ALIASES, t.id.name.to_string(), file, lines, source, (start, end), 0, names, Canon::TEXT, facets))
 }
 
 /// `interface X { ... }`.
-fn interface_def(i: &TSInterfaceDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, _ctx: &LensCtx) -> Option<Def> {
+fn interface_def(i: &TSInterfaceDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, _ctx: &LensCtx, facets: bool) -> Option<Def> {
     let (start, end) = (u(i.span.start), u(i.span.end));
-    Some(build_def(&INTERFACES, i.id.name.to_string(), file, lines, source, (start, end), 0, names, Canon::body(interface_canonical(i))))
+    Some(build_def(&INTERFACES, i.id.name.to_string(), file, lines, source, (start, end), 0, names, Canon::body(interface_canonical(i)), facets))
 }
 
 /// A `const`/`let`/`var` declaration may carry several declarators (`const a = 1, b = 2`).
@@ -420,7 +426,10 @@ fn interface_def(i: &TSInterfaceDeclaration<'_>, source: &str, lines: &LineMap, 
 /// - arrow / function-expression initializer ⇒ `functions` (dominant TS form).
 /// - `const NAME` with `UPPER_SNAKE_CASE` name + non-function initializer ⇒ `constants`.
 /// - destructuring patterns bind nothing nameable ⇒ skipped.
-fn variable_decls(v: &VariableDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, ctx: &LensCtx, out: &mut Vec<Def>) {
+// The file's four constants plus the statement, the lens context, the output and the facet gate;
+// bundling them would only move the same values behind a name that adds nothing.
+#[allow(clippy::too_many_arguments)]
+fn variable_decls(v: &VariableDeclaration<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, ctx: &LensCtx, out: &mut Vec<Def>, facets: bool) {
     let is_const = matches!(v.kind, VariableDeclarationKind::Const);
     for decl in &v.declarations {
         let BindingPattern::BindingIdentifier(id) = &decl.id else { continue };
@@ -445,9 +454,9 @@ fn variable_decls(v: &VariableDeclaration<'_>, source: &str, lines: &LineMap, fi
                     is_async: arrow.r#async,
                 };
                 emit_callable_lens(&name, &callable, &Site { source, lines, file, span: (start, end) }, ctx, out);
-                let canon = Canon::callable(&CallableNode::Bound(v.kind, decl));
-                let mut def = build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&arrow.params), names, canon);
-                decided(&mut def, names, &arrow.params, &arrow.body.statements, false);
+                let canon = Canon::callable(&CallableNode::Bound(v.kind, decl), facets);
+                let mut def = build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&arrow.params), names, canon, facets);
+                decided(&mut def, names, &arrow.params, &arrow.body.statements, false, facets);
                 out.push(def);
             }
             Expression::FunctionExpression(fexpr) => {
@@ -466,17 +475,17 @@ fn variable_decls(v: &VariableDeclaration<'_>, source: &str, lines: &LineMap, fi
                     };
                     emit_callable_lens(&name, &callable, &Site { source, lines, file, span: (start, end) }, ctx, out);
                 }
-                let canon = Canon::callable(&CallableNode::Bound(v.kind, decl));
-                let mut def = build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&fexpr.params), names, canon);
+                let canon = Canon::callable(&CallableNode::Bound(v.kind, decl), facets);
+                let mut def = build_def(&FUNCTIONS, name, file, lines, source, (start, end), count_args(&fexpr.params), names, canon, facets);
                 if let Some(body) = &fexpr.body {
-                    decided(&mut def, names, &fexpr.params, &body.statements, false);
+                    decided(&mut def, names, &fexpr.params, &body.statements, false, facets);
                 }
                 out.push(def);
             }
             _ if is_const && is_upper_snake(&name) => {
                 let start = u(decl.span.start);
                 let end = u(decl.span.end);
-                out.push(build_def(&CONSTANTS, name, file, lines, source, (start, end), 0, names, Canon::TEXT));
+                out.push(build_def(&CONSTANTS, name, file, lines, source, (start, end), 0, names, Canon::TEXT, facets));
             }
             _ => {}
         }
@@ -508,7 +517,7 @@ fn property_key_name(key: &PropertyKey<'_>) -> String {
 // The file's four constants plus the class's own three; bundling either half behind a name would
 // only move the same values, and the file half already has one (`Site`) built per definition.
 #[allow(clippy::too_many_arguments)]
-fn class_method_defs(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, ctx: &LensCtx, parent_chain: &str, out: &mut Vec<Def>) {
+fn class_method_defs(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, ctx: &LensCtx, parent_chain: &str, out: &mut Vec<Def>, facets: bool) {
     let Some(class_id) = c.id.as_ref() else { return };
     let class_name = class_id.name.as_str();
     let parent = if parent_chain.is_empty() {
@@ -539,10 +548,10 @@ fn class_method_defs(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<st
                 };
                 emit_callable_lens(&name, &callable, &Site { source, lines, file, span: (start, end) }, ctx, out);
             }
-            let canon = Canon::callable(&CallableNode::Method(&key_name, &m.value));
-            let mut def = build_def(&METHODS, name, file, lines, source, (start, end), args, names, canon);
+            let canon = Canon::callable(&CallableNode::Method(&key_name, &m.value), facets);
+            let mut def = build_def(&METHODS, name, file, lines, source, (start, end), args, names, canon, facets);
             if let Some(body) = &m.value.body {
-                decided(&mut def, names, &m.value.params, &body.statements, !m.decorators.is_empty());
+                decided(&mut def, names, &m.value.params, &body.statements, !m.decorators.is_empty(), facets);
             }
             out.push(def);
         }
@@ -551,49 +560,52 @@ fn class_method_defs(c: &Class<'_>, source: &str, lines: &LineMap, file: &Arc<st
 
 // ─────────────────────────── per-statement dispatch ───────────────────────────
 
-fn process_top_stmt(stmt: &Statement<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, ctx: &LensCtx, out: &mut Vec<Def>) {
+// The file's four constants plus the statement, the lens context, the output and the facet gate;
+// bundling them would only move the same values behind a name that adds nothing.
+#[allow(clippy::too_many_arguments)]
+fn process_top_stmt(stmt: &Statement<'_>, source: &str, lines: &LineMap, file: &Arc<str>, names: &FileNames<'_>, ctx: &LensCtx, out: &mut Vec<Def>, facets: bool) {
     match stmt {
         Statement::FunctionDeclaration(f) => {
-            if let Some(def) = function_def(f, source, lines, file, names, ctx) {
+            if let Some(def) = function_def(f, source, lines, file, names, ctx, facets) {
                 out.push(def);
                 emit_function_lens(f, source, lines, file, ctx, out);
             }
         }
         Statement::ClassDeclaration(c) => {
-            if let Some(def) = class_def(c, source, lines, file, names, ctx) {
+            if let Some(def) = class_def(c, source, lines, file, names, ctx, facets) {
                 out.push(def);
                 emit_class_lens(c, source, lines, file, ctx, out);
             }
-            class_method_defs(c, source, lines, file, names, ctx, "", out);
+            class_method_defs(c, source, lines, file, names, ctx, "", out, facets);
         }
         Statement::TSTypeAliasDeclaration(t) => {
-            if let Some(def) = type_alias_def(t, source, lines, file, names, ctx) {
+            if let Some(def) = type_alias_def(t, source, lines, file, names, ctx, facets) {
                 out.push(def);
             }
         }
         Statement::TSInterfaceDeclaration(i) => {
-            if let Some(def) = interface_def(i, source, lines, file, names, ctx) {
+            if let Some(def) = interface_def(i, source, lines, file, names, ctx, facets) {
                 out.push(def);
                 emit_interface_lens(i, source, lines, file, ctx, out);
             }
         }
-        Statement::VariableDeclaration(v) => variable_decls(v, source, lines, file, names, ctx, out),
+        Statement::VariableDeclaration(v) => variable_decls(v, source, lines, file, names, ctx, out, facets),
         Statement::ExportNamedDeclaration(e) => {
             if let Some(decl) = &e.declaration {
-                process_declaration(decl, source, lines, file, names, ctx, out);
+                process_declaration(decl, source, lines, file, names, ctx, out, facets);
             }
         }
         Statement::ExportDefaultDeclaration(e) => match &e.declaration {
             ExportDefaultDeclarationKind::FunctionDeclaration(f) => {
-                if let Some(def) = function_def(f, source, lines, file, names, ctx) {
+                if let Some(def) = function_def(f, source, lines, file, names, ctx, facets) {
                     out.push(def);
                 }
             }
             ExportDefaultDeclarationKind::ClassDeclaration(c) => {
-                if let Some(def) = class_def(c, source, lines, file, names, ctx) {
+                if let Some(def) = class_def(c, source, lines, file, names, ctx, facets) {
                     out.push(def);
                 }
-                class_method_defs(c, source, lines, file, names, ctx, "", out);
+                class_method_defs(c, source, lines, file, names, ctx, "", out, facets);
             }
             _ => {}
         },
@@ -602,6 +614,9 @@ fn process_top_stmt(stmt: &Statement<'_>, source: &str, lines: &LineMap, file: &
 }
 
 /// Inner-declaration walker — same cases as [`process_top_stmt`] minus the export wrappers.
+// The file's four constants plus the declaration, the lens context, the output and the facet gate;
+// bundling them would only move the same values behind a name that adds nothing.
+#[allow(clippy::too_many_arguments)]
 fn process_declaration(
     decl: &Declaration<'_>,
     source: &str,
@@ -609,33 +624,34 @@ fn process_declaration(
     file: &Arc<str>,
     names: &FileNames<'_>, ctx: &LensCtx,
     out: &mut Vec<Def>,
+    facets: bool,
 ) {
     match decl {
         Declaration::FunctionDeclaration(f) => {
-            if let Some(def) = function_def(f, source, lines, file, names, ctx) {
+            if let Some(def) = function_def(f, source, lines, file, names, ctx, facets) {
                 out.push(def);
                 emit_function_lens(f, source, lines, file, ctx, out);
             }
         }
         Declaration::ClassDeclaration(c) => {
-            if let Some(def) = class_def(c, source, lines, file, names, ctx) {
+            if let Some(def) = class_def(c, source, lines, file, names, ctx, facets) {
                 out.push(def);
                 emit_class_lens(c, source, lines, file, ctx, out);
             }
-            class_method_defs(c, source, lines, file, names, ctx, "", out);
+            class_method_defs(c, source, lines, file, names, ctx, "", out, facets);
         }
         Declaration::TSTypeAliasDeclaration(t) => {
-            if let Some(def) = type_alias_def(t, source, lines, file, names, ctx) {
+            if let Some(def) = type_alias_def(t, source, lines, file, names, ctx, facets) {
                 out.push(def);
             }
         }
         Declaration::TSInterfaceDeclaration(i) => {
-            if let Some(def) = interface_def(i, source, lines, file, names, ctx) {
+            if let Some(def) = interface_def(i, source, lines, file, names, ctx, facets) {
                 out.push(def);
                 emit_interface_lens(i, source, lines, file, ctx, out);
             }
         }
-        Declaration::VariableDeclaration(v) => variable_decls(v, source, lines, file, names, ctx, out),
+        Declaration::VariableDeclaration(v) => variable_decls(v, source, lines, file, names, ctx, out, facets),
         _ => {}
     }
 }
@@ -654,10 +670,12 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
     }
     let lines = LineMap::new(source);
     let mut defs: Vec<Def> = Vec::new();
-    // The module's import table, resolved once: what each bound name stands for.
+    let facets = opts.facets;
+    // The module's import table and name scope, resolved once: what each bound name stands for. Both
+    // are facets-only — skipped when no pass reads them.
     let imports: HashMap<String, Arc<str>> =
-        crate::canon::module_imports(&ret.program, file).into_iter().collect();
-    let scope = crate::decides::FileScope::new(file, &ret.program);
+        if facets { crate::canon::module_imports(&ret.program, file).into_iter().collect() } else { HashMap::new() };
+    let scope = if facets { crate::decides::FileScope::new(file, &ret.program) } else { crate::decides::FileScope::empty(file) };
     let names = FileNames { imports: &imports, decides: &scope };
     let lenses = dup_defs_core::lens::enabled_lenses(opts);
     // Every lens reads the module's own bound names, so they are collected once per file.
@@ -665,7 +683,7 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
         if lenses.is_empty() { HashSet::new() } else { crate::lenses::module_bound_names(&ret.program) };
     let ctx = LensCtx { lenses, module_names };
     for stmt in &ret.program.body {
-        process_top_stmt(stmt, source, &lines, file, &names, &ctx, &mut defs);
+        process_top_stmt(stmt, source, &lines, file, &names, &ctx, &mut defs, facets);
     }
     defs
 }
@@ -684,7 +702,7 @@ mod tests {
     fn lens_record(src: &str, name: &str) -> Vec<String> {
         let f: Arc<str> = Arc::from("t.ts");
         let kinds = vec!["lenses".to_owned()];
-        let opts = ScanOpts { kinds: Some(&kinds) };
+        let opts = ScanOpts { kinds: Some(&kinds), facets: true };
         scan_source(src, &f, &opts)
             .into_iter()
             .find(|d| d.kind.id == "lenses" && d.name == name)

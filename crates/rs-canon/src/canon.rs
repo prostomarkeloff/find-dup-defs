@@ -1050,7 +1050,10 @@ pub fn trait_canon(item: &ItemTrait) -> String {
 
 /// `(cluster_canonical, xname_canonical, type3_lines, node_count)` for a callable from its
 /// signature + body. `name` is the def's own name (blanked to `_fn` in the xname canonical).
-fn analyze(name: &str, sig: &Signature, body: &Block) -> AnalyzedFn {
+///
+/// The statement stream (`Facets::statements`) is the perspective passes' input; a run that
+/// never reads facets (`facets = false`) skips that whole walk and carries an empty stream.
+fn analyze(name: &str, sig: &Signature, body: &Block, facets: bool) -> AnalyzedFn {
     let cluster = {
         let mut d = Dump::new(None);
         d.func(name, sig, Some(body), true)
@@ -1062,8 +1065,13 @@ fn analyze(name: &str, sig: &Signature, body: &Block) -> AnalyzedFn {
         collect.bound
     };
     // The statement stream keeps the body as written: converge reads it to say where two definitions
-    // stop agreeing, and a rewritten line would point the reader at code that is not there.
-    let statements = statement_stream(name, sig, body, &locals_of(body));
+    // stop agreeing, and a rewritten line would point the reader at code that is not there. A run
+    // that never reads facets skips the whole walk.
+    let statements = if facets {
+        statement_stream(name, sig, body, &locals_of(body))
+    } else {
+        Vec::new()
+    };
 
     // The name-agnostic canonicals are taken from the normal form (`normal.rs`): what the exact and
     // Type-3 passes compare is the meaning the rules reach, not the spelling. The Type-3 lines come
@@ -1120,20 +1128,20 @@ pub fn scope_canonical(sig: &Signature, body: &Block, file_names: &HashSet<Strin
 
 /// Analyze a free `fn` item.
 #[must_use]
-pub fn analyze_item_fn(f: &ItemFn) -> AnalyzedFn {
-    analyze(&f.sig.ident.to_string(), &f.sig, &f.block)
+pub fn analyze_item_fn(f: &ItemFn, facets: bool) -> AnalyzedFn {
+    analyze(&f.sig.ident.to_string(), &f.sig, &f.block, facets)
 }
 
 /// Analyze an `impl` method (always has a body).
 #[must_use]
-pub fn analyze_impl_fn(f: &ImplItemFn) -> AnalyzedFn {
-    analyze(&f.sig.ident.to_string(), &f.sig, &f.block)
+pub fn analyze_impl_fn(f: &ImplItemFn, facets: bool) -> AnalyzedFn {
+    analyze(&f.sig.ident.to_string(), &f.sig, &f.block, facets)
 }
 
 /// Analyze a trait method *with a default body* (bodiless signatures are filtered earlier).
 #[must_use]
-pub fn analyze_trait_fn(f: &TraitItemFn) -> Option<AnalyzedFn> {
-    f.default.as_ref().map(|body| analyze(&f.sig.ident.to_string(), &f.sig, body))
+pub fn analyze_trait_fn(f: &TraitItemFn, facets: bool) -> Option<AnalyzedFn> {
+    f.default.as_ref().map(|body| analyze(&f.sig.ident.to_string(), &f.sig, body, facets))
 }
 
 // ───────────────────────────── statement stream ─────────────────────────────

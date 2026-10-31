@@ -93,7 +93,7 @@ mod tests {
         let defs = Java.scan(&paths, &ScanOpts::default());
         assert_eq!(defs.iter().filter(|d| d.name == "A.openFile" || d.name == "B.openFile").count(), 2, "two copies, two definitions");
         let kinds = vec!["lenses".to_owned()];
-        let lensed = Java.scan(&paths, &ScanOpts { kinds: Some(&kinds) });
+        let lensed = Java.scan(&paths, &ScanOpts { kinds: Some(&kinds), facets: true });
         let record = lensed.iter().find(|d| d.kind.id == "lenses" && d.name == "A.openFile").expect("a lens record");
         assert!(record.thickness.is_some(), "scored against the corpus");
         std::fs::remove_dir_all(&dir).ok();

@@ -228,10 +228,21 @@ pub struct Def {
 /// default run and print sections nobody wanted. A frontend consults this to decide which of its
 /// kinds are worth computing, so the choice lives in the CLI (`--kinds`) rather than in a side
 /// channel.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct ScanOpts<'a> {
     /// Kind ids the caller named (`--kinds functions,lenses`), or `None` for "the default set".
     pub kinds: Option<&'a [String]>,
+    /// Whether the pipeline will read the per-definition facets (statement stream, decide facts,
+    /// reached paths). Only the opt-in passes — converge, decisions, the lenses — read them; a
+    /// default run never does, and a frontend may skip their computation wholesale. Defaults to
+    /// `true` so existing per-frontend tests keep observing facets; the pipeline sets it explicitly.
+    pub facets: bool,
+}
+
+impl Default for ScanOpts<'_> {
+    fn default() -> Self {
+        Self { kinds: None, facets: true }
+    }
 }
 
 impl ScanOpts<'_> {

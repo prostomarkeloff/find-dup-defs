@@ -277,12 +277,23 @@ fn opt(value: Option<String>) -> F {
     value.map_or(F::Skip, F::P)
 }
 
-#[allow(clippy::needless_pass_by_value)] // items is a fresh per-field Vec, consumed by the join
+#[allow(clippy::needless_pass_by_value)] // items is a fresh per-field Vec, consumed by the loop
 fn flist(items: Vec<String>) -> F {
     if items.is_empty() {
         F::Empty
     } else {
-        F::P(format!("[{}]", items.join(", ")))
+        let mut out = String::new();
+        out.push('[');
+        let mut first = true;
+        for item in items {
+            if !first {
+                out.push_str(", ");
+            }
+            first = false;
+            out.push_str(&item);
+        }
+        out.push(']');
+        F::P(out)
     }
 }
 
@@ -410,7 +421,11 @@ impl<'a> Dump<'a> {
                 }
                 F::P(value) => {
                     if keywords {
-                        args.push(format!("{fname}={value}"));
+                        let mut arg = String::with_capacity(fname.len() + 1 + value.len());
+                        arg.push_str(fname);
+                        arg.push('=');
+                        arg.push_str(&value);
+                        args.push(arg);
                     } else {
                         for _ in 0..pending {
                             args.push("[]".to_owned());
@@ -421,7 +436,19 @@ impl<'a> Dump<'a> {
                 }
             }
         }
-        format!("{name}({})", args.join(", "))
+        let mut out = String::new();
+        out.push_str(name);
+        out.push('(');
+        let mut first = true;
+        for arg in &args {
+            if !first {
+                out.push_str(", ");
+            }
+            first = false;
+            out.push_str(arg);
+        }
+        out.push(')');
+        out
     }
 
     fn ctx(&mut self, ctx: ExprContext) -> String {
@@ -1488,6 +1515,11 @@ impl Unparse<'_> {
     /// Start a new logical line (CPython `fill`): a newline unless we're at the start, then the
     /// current block nesting as leading spaces.
     fn fill(&mut self, text: &str) {
+        self.fill_fmt(format_args!("{text}"));
+    }
+
+    /// [`fill`] for a formatted value, written straight into `out` (no `format!` temp String).
+    fn fill_fmt(&mut self, args: std::fmt::Arguments<'_>) {
         self.fills += 1;
         if !self.out.is_empty() {
             self.out.push('\n');
@@ -1495,7 +1527,7 @@ impl Unparse<'_> {
         for _ in 0..self.indent {
             self.out.push_str("    ");
         }
-        self.out.push_str(text);
+        let _ = self.out.write_fmt(args);
     }
 
     fn write(&mut self, text: &str) {
@@ -1538,7 +1570,7 @@ impl Unparse<'_> {
                 } else {
                     f.name.id.as_str().to_owned()
                 };
-                self.fill(&format!("{kw}{name}"));
+                self.fill_fmt(format_args!("{kw}{name}"));
                 self.type_params(f.type_params.as_deref());
                 self.write("(");
                 self.arguments(Some(&f.parameters));
@@ -1551,7 +1583,7 @@ impl Unparse<'_> {
                 self.body(&f.body, true);
             }
             Stmt::ClassDef(c) => {
-                self.fill(&format!("class {}", c.name.id.as_str()));
+                self.fill_fmt(format_args!("class {}", c.name.id.as_str()));
                 self.type_params(c.type_params.as_deref());
                 let has_args = c.arguments.as_ref().is_some_and(|a| !a.args.is_empty() || !a.keywords.is_empty());
                 if has_args {
@@ -1600,7 +1632,7 @@ impl Unparse<'_> {
             Stmt::AugAssign(a) => {
                 self.fill("");
                 self.expr(&a.target, prec::TEST);
-                self.write(&format!(" {}= ", operator_tag(a.op)));
+                let _ = write!(self.out, " {}= ", operator_tag(a.op));
                 self.expr(&a.value, prec::TEST);
             }
             Stmt::AnnAssign(a) => {
@@ -1753,11 +1785,25 @@ impl Unparse<'_> {
             }
             Stmt::Global(g) => {
                 self.fill("global ");
-                self.write(&g.names.iter().map(|n| n.id.as_str().to_owned()).collect::<Vec<_>>().join(", "));
+                let mut first = true;
+                for n in &g.names {
+                    if !first {
+                        self.write(", ");
+                    }
+                    first = false;
+                    self.write(n.id.as_str());
+                }
             }
             Stmt::Nonlocal(n) => {
                 self.fill("nonlocal ");
-                self.write(&n.names.iter().map(|x| x.id.as_str().to_owned()).collect::<Vec<_>>().join(", "));
+                let mut first = true;
+                for x in &n.names {
+                    if !first {
+                        self.write(", ");
+                    }
+                    first = false;
+                    self.write(x.id.as_str());
+                }
             }
             Stmt::TypeAlias(t) => {
                 self.fill("type ");
@@ -1984,7 +2030,7 @@ impl Unparse<'_> {
                 }
                 let (lp, rp) = if matches!(b.op, Operator::Pow) { (next_prec(p), p) } else { (p, next_prec(p)) };
                 self.expr(&b.left, lp);
-                self.write(&format!(" {op} "));
+                let _ = write!(self.out, " {op} ");
                 self.expr(&b.right, rp);
                 if parens {
                     self.write(")");
@@ -2017,7 +2063,7 @@ impl Unparse<'_> {
                 }
                 self.expr(&c.left, next_prec(prec::CMP));
                 for (op, comp) in c.ops.iter().zip(c.comparators.iter()) {
-                    self.write(&format!(" {} ", cmpop_tag(*op)));
+                    let _ = write!(self.out, " {} ", cmpop_tag(*op));
                     self.expr(comp, next_prec(prec::CMP));
                 }
                 if parens {
@@ -2400,7 +2446,7 @@ impl Unparse<'_> {
                     if !p.keys.is_empty() {
                         self.write(", ");
                     }
-                    self.write(&format!("**{}", rest.id.as_str()));
+                    let _ = write!(self.out, "**{}", rest.id.as_str());
                 }
                 self.write("}");
             }
@@ -2420,14 +2466,14 @@ impl Unparse<'_> {
                         self.write(", ");
                     }
                     first = false;
-                    self.write(&format!("{}=", kw.attr.id.as_str()));
+                    let _ = write!(self.out, "{}=", kw.attr.id.as_str());
                     self.pattern(&kw.pattern);
                 }
                 self.write(")");
             }
             ast::Pattern::MatchStar(p) => {
                 let name = p.name.as_ref().map_or("_", |n| n.id.as_str());
-                self.write(&format!("*{name}"));
+                let _ = write!(self.out, "*{name}");
             }
             ast::Pattern::MatchAs(p) => match (&p.pattern, &p.name) {
                 (None, None) => self.write("_"),
@@ -2435,7 +2481,7 @@ impl Unparse<'_> {
                 (Some(inner), name) => {
                     self.pattern(inner);
                     if let Some(name) = name {
-                        self.write(&format!(" as {}", name.id.as_str()));
+                        let _ = write!(self.out, " as {}", name.id.as_str());
                     }
                 }
             },
@@ -2576,7 +2622,7 @@ pub fn normalize_functions(texts: &[String]) -> Vec<Option<(String, Vec<String>,
 /// node's ranges index into (for f-string `{x=}` debug text). The node's own (top) decorators are
 /// excluded — matching the decorator-stripped def *text* the text-based path canonicalized — so a
 /// canonical built from a file's AST node is byte-identical to one built by re-parsing the def text.
-pub(crate) fn analyze_stmt(stmt: &Stmt, src: &str) -> Option<AnalyzedFn> {
+pub(crate) fn analyze_stmt(stmt: &Stmt, src: &str, facets: bool) -> Option<AnalyzedFn> {
     let Stmt::FunctionDef(_) = stmt else {
         return None;
     };
@@ -2584,11 +2630,15 @@ pub(crate) fn analyze_stmt(stmt: &Stmt, src: &str) -> Option<AnalyzedFn> {
 
     // The statement stream keeps the definition as written: converge reads it to say where two
     // definitions stop agreeing, and a rewritten line would point the reader at code that is not
-    // there.
-    let locals = collect_locals(stmt);
-    let mut dump = Dump::new(src, Some(&locals));
-    dump.stmt(stmt);
-    let statements = statement_stream(unparse_depths(stmt, src, &locals, dump.map, None).lines);
+    // there. A run that never reads facets skips the whole walk.
+    let statements = if facets {
+        let locals = collect_locals(stmt);
+        let mut dump = Dump::new(src, Some(&locals));
+        dump.stmt(stmt);
+        statement_stream(unparse_depths(stmt, src, &locals, dump.map, None).lines)
+    } else {
+        Vec::new()
+    };
 
     // The name-agnostic canonicals are taken from the normal form (`normal.rs`): what the exact and
     // Type-3 passes compare is the meaning the rules reach, not the spelling. The Type-3 lines come
@@ -2663,7 +2713,19 @@ pub(crate) fn canon_site(
 ) -> (String, usize) {
     let mut dump = Dump::with_anchor(src, Some(locals), anchor);
     let parts: Vec<String> = exprs.iter().map(|e| dump.expr(e)).collect();
-    (format!("{tag}({})", parts.join(", ")), dump.count)
+    let mut out = String::new();
+    out.push_str(tag);
+    out.push('(');
+    let mut first = true;
+    for part in &parts {
+        if !first {
+            out.push_str(", ");
+        }
+        first = false;
+        out.push_str(part);
+    }
+    out.push(')');
+    (out, dump.count)
 }
 
 /// The module-scope canonical alone — what the `scope` lens contributes. Its predecessor rendered
@@ -2737,7 +2799,7 @@ pub(crate) fn module_bound_names(module: &[Stmt]) -> HashSet<String> {
 pub(crate) fn analyze_one(text: &str) -> Option<AnalyzedFn> {
     let module = parse_module(text).ok()?.into_syntax();
     let stmt = module.body.first()?;
-    analyze_stmt(stmt, text)
+    analyze_stmt(stmt, text, true)
 }
 
 /// Batch `analyze_one` in parallel — one parse per function, all dup-defs canonical forms at once.

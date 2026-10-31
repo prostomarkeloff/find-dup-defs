@@ -1351,11 +1351,21 @@ impl PipelineOpts {
 /// 3. Apply `error_thickness` / `warning_thickness` demotion and
 ///    `escalate_thickness` escalation, if any is non-zero.
 ///
+/// Whether the pipeline will read per-definition facets under `opts` — the converge and decisions
+/// passes consume the statement stream and the decide facts, and the lenses consume the reached
+/// paths. A default run reads none of them, so the scan may skip their computation.
+#[must_use]
+pub fn facets_needed(opts: &PipelineOpts) -> bool {
+    opts.converge
+        || opts.decisions
+        || opts.kinds.as_ref().is_some_and(|ks| ks.iter().any(|k| k == "lenses"))
+}
+
 /// Returns the unsorted findings. The caller sorts (typically by
 /// [`section_index`] + name + first member) and renders.
 #[must_use]
 pub fn scan_and_cluster(opts: &PipelineOpts, frontends: &[&dyn Frontend]) -> Vec<Finding> {
-    let scan_opts = ScanOpts { kinds: opts.kinds.as_deref() };
+    let scan_opts = ScanOpts { kinds: opts.kinds.as_deref(), facets: facets_needed(opts) };
     cluster(collect_defs(frontends, &opts.paths, &scan_opts), opts)
 }
 
