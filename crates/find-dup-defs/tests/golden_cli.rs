@@ -144,6 +144,17 @@ fn converge_php_matches_golden() {
 }
 
 #[test]
+fn converge_java_matches_golden() {
+    // The batch pair in Java: the statements both write agree, the loop each fills parts them, and
+    // the subject is the class both reach through their import.
+    assert_golden(
+        &run_in(FIX_CONVERGE, &["--converge", "--show-info", "--only", "java"]),
+        include_str!("golden/converge.java.txt"),
+        "converge.java.txt",
+    );
+}
+
+#[test]
 fn decisions_matches_golden() {
     // Locks the facts, the null and the cut together: the guard and the filter share no line and are
     // found; the forty definitions sharing a common fact or two are not.
@@ -187,6 +198,18 @@ fn decisions_php_matches_golden() {
         &run_at(&format!("{FIX_DECISIONS}/php"), FIX_DECISIONS, &["--decisions", "--show-info"]),
         include_str!("golden/decisions.php.txt"),
         "decisions.php.txt",
+    );
+}
+
+#[test]
+fn decisions_java_matches_golden() {
+    // The same corpus in Java, and the rules Java spells its own way: a guard that throws beside a
+    // filter written as a `.equals` test, and `code == A || code == B` beside a `switch` over the same
+    // two codes. A class constant is the program's wherever it is tested.
+    assert_golden(
+        &run_at(&format!("{FIX_DECISIONS}/java"), FIX_DECISIONS, &["--decisions", "--show-info"]),
+        include_str!("golden/decisions.java.txt"),
+        "decisions.java.txt",
     );
 }
 

@@ -20,8 +20,9 @@ becomes the default.
 **find-dup-defs is the gate that catches it.**
 
 - 🔍 Clusters duplicate and near-duplicate **definitions** — functions, methods, classes,
-  constants, `type` aliases, TS, Go and PHP interfaces, Rust traits, C method tables — across
-  **Python, TypeScript, Rust, Go, C and PHP**.
+  constants, `type` aliases, TS, Go and PHP interfaces, Rust traits, C method tables, Java methods,
+  constructors and `static final` constants — across
+  **Python, TypeScript, Rust, Go, C, PHP and Java**.
 - 🧬 Matches through **renames and edits**, not token streams: everything is compared as an
   alpha-renamed AST canonical.
 - 🎯 **Grades** each cluster by how much a refactor would actually pay off, so the biggest win is
@@ -188,9 +189,12 @@ Two refinements keep those shapes honest:
   alpha-renamed canonical turns every type reference in an annotation into a `_T{n}` slot. The
   renaming is consistent, not an erasure, so `f(a: X, b: X)` and `f(a: X, b: Y)` still differ. A call
   inside an annotation (`Annotated[T, Depends(f)]`) is a value read at runtime, so it stays as
-  written. A Rust, Go, C or PHP type is not inert — it picks the trait implementation, the method
+  written. A Rust, Go, C, PHP or Java type is not inert — it picks the trait implementation, the method
   set, or the arithmetic and the layout that runs, and PHP checks a declared type at every call — so
-  their exact canonicals keep types as written and only their Type-3 lines slot them.
+  their exact canonicals keep types as written and only their Type-3 lines slot them. A Java type
+  selects the overload and the method dispatch, so its exact canonicals keep types as written and only
+  its Type-3 lines slot them; Java generics are erased at runtime, but the declared type is a
+  compile-time fact, so it is kept.
 - **A Type-3 unit depends on itself alone.** Slots are renumbered within each line, so one added
   parameter no longer rewrites every later line. The types an annotation names ride as units of
   their own: a shared type still counts, and a different one costs only its own weight. Type-3
@@ -203,7 +207,7 @@ Type-3 pairs went +172 / −30. In a hand-labelled sample, 57 of 61 added pairs 
 
 Two more take the comparison from how a definition is written to what it does:
 
-- **A normal form first.** Every function — Python, TypeScript, Rust, Go, C or PHP — is rewritten to one
+- **A normal form first.** Every function — Python, TypeScript, Rust, Go, C, PHP or Java — is rewritten to one
   representative of its equivalence class under a fixed set of oriented rules before the
   name-agnostic canonicals are taken: negation normal form, a fixed orientation for comparisons and
   for the branches of an `if`, guard form instead of nesting, `if`/`else` statements in place of
@@ -240,6 +244,11 @@ Two more take the comparison from how a definition is written to what it does:
   a `switch` is its ladder — of loose `==` tests, as `switch` compares — and the guard holds the
   failing branch: a `throw`, a `return false` / `null`, an error object, an `exit`. A body that reads
   its variables by name (`compact`, `extract`, `$$name`) keeps every temporary.
+  In Java a Yoda `.equals` meets the test written the other way round — `x.equals("lit")` and
+  `"lit".equals(x)` are one form, and `Objects.equals(a, b)` sorts its arguments — `if (c) return
+  true; return false;` is `return c;`, a `switch` whose every case ends in `break`, `return` or
+  `throw` is its ladder, the guard is picked as in Go, C and PHP — the failing branch throws or
+  returns `null` / `false` / a code — `x += e` is `x = x + e`, and `while (true)` is `for (;;)`.
 - **Statements agree in part.** Type-3 scores a pair by the *soft cosine* of its line vectors
   (Sidorov et al. 2014): two lines contribute by the Jaccard of their parts — the line and every
   sub-expression inside it — so a token changed deep in a long statement costs the parts it sits
@@ -309,6 +318,11 @@ clusters in the first place:
   Drupal `*.api.php`, which documents hooks and is never loaded; and a function a file declares twice
   — `if (PHP_VERSION_ID >= 80000) { function f() … } else { function f() … }` — is one definition.
   `$this` is `self`, as a receiver is everywhere else.
+- **Java** — bodies that only `return` a name, a literal, `null` or `false`, or only `throw new
+  UnsupportedOperationException(…)` (the IDE's override stub); the accessors a class is mostly made
+  of (a getter `return this.x;`, a setter, a constructor that only hands its parameters to
+  `this.x = x;`); and files that declare themselves generated (a `DO NOT EDIT` comment before the
+  first declaration).
 
 Each surviving cluster lands in a tier: **ERROR** gates CI, **WARNING** is for review, **INFO** is
 hidden unless you ask (`--show-info`, or `--json` where it's always present).
@@ -614,12 +628,14 @@ Then the template has to *survive*, and most don't. A candidate is kept only if 
   → parameters), and **a skeleton that dominates the variation** (fixed / (fixed + holes) ≥ 0.5).
 
 What's left is a motif that genuinely collapses into one clean, reflection-free helper. The
-proposed body is rendered as readable pseudo-source (`def …:` for Python, `fn …` for Rust,
-`func …` for Go, `type name(…) { … }` for C, `function name(…) { … }` for PHP, the matching shape for
-TS), and the finding carries its parameter count and an estimated LOC saved.
+The proposed body is rendered as readable pseudo-source (`def …:` for Python, `fn …` for Rust,
+`func …` for Go, `type name(…) { … }` for C, `function name(…) { … }` for PHP,
+`int helper(int id) { … }` for Java, the matching shape for TS), and the finding carries its
+parameter count and an estimated LOC saved.
 
 The dialect seam is a `Dialect` trait — slot classification plus a pseudo-source renderer — with
-`PyDialect`, `RustDialect`, `TsDialect`, `GoDialect`, `CDialect` and `PhpDialect` behind it. A run
+`PyDialect`, `RustDialect`, `TsDialect`, `GoDialect`, `CDialect`, `PhpDialect` and `JavaDialect`
+behind it. A run
 partitions defs by language and folds each group with its own dialect; functions of two languages never
 anti-unify against each other. In Go a struct literal's field name is a selector — a varying one would
 need reflection, so it is never a hole — while a map literal's key is a value and may be. C reads the
@@ -627,7 +643,10 @@ same way: a designated initializer's member (`.port = 80`) is a selector and an 
 (`[3] = x`) a value, and a call through a member (`dev->ops->open(dev)`) is C's method call, the
 member it calls a selector like a method's name. In PHP every member slot is a selector — a method, a
 property, `Scope::CONST`, `Scope::$static`, a named argument's name — and a method named by a variable
-(`$node->$operation('')`) is not a hole at all but the same call in every copy.
+(`$node->$operation('')`) is not a hole at all but the same call in every copy. In Java a field read
+off a value is a selector (`r.getQty()` — no: only `a.b` is a selector; a method name is a selector
+and its argument a value; a map key is a value like any other; and `Foo::bar`'s method name is a
+selector).
 </details>
 
 <details>
@@ -695,7 +714,7 @@ Ten lenses, each answering one question:
 | `scope` | what does its body do? | the body with every name its module introduced erased |
 | `use` | how is it handled? | the statements elsewhere in the tree that mention it |
 
-Opt in with `--kinds lenses` — Python, Rust, TypeScript, Go, C and PHP. Directives address it like any other
+Opt in with `--kinds lenses` — Python, Rust, TypeScript, Go, C, PHP and Java. Directives address it like any other
 kind: `-D 'suppress:<lenses>*@*/legacy/*=deliberate parallel port'`. The kind exists exactly when
 asked for, so the section list, the default report and the default JSON are byte-identical without
 it.
@@ -781,6 +800,13 @@ And it returns a failure value, the convention older PHP and every plugin API bu
 Its resources are released by a call, as C's are — `$f = fopen(…); … fclose($f)` holds `fopen`,
 `ob_start` is what `ob_get_clean` releases — and `decorators` reads a definition's modifiers
 (`public`, `static`, `final`) and its attributes (`#[Route('/x')]`).
+
+Java's resources are try-with-resources (`try (InputStream in = …)`) and a `.close()` in `finally`
+reads the release. Java fails by throwing, so `failures` reads the classes a body throws and catches
+and the library's checks (`Objects.requireNonNull`, Guava `Preconditions.check*`, `assert`).
+`decorators` reads a definition's annotations (`@Deprecated`, `@FunctionalInterface` — `@Override`
+is every override's, so it stays out), and the `use` lens counts mentions of class and method names
+across the tree.
 </details>
 
 ---
@@ -875,6 +901,13 @@ language's library is global and never imported. One addition is PHP's own: a cl
 dependencies keeps them in properties, so a method reaches the class of every property it reads off
 `$this` — `private LoggerInterface $log` or a promoted constructor parameter — the dependency it
 turns to, though its body names nothing but `$this->log`.
+
+Java says what a file is about in its `import` statements, read by the language's own rules — a class
+through its dotted name or a member under it — and a definition reaches the classes its file imported
+and the fully qualified names its body writes (`com.example.Order`). Go's exception falls out by
+itself again: `java.lang` is never imported. Unlike PHP, a method does not reach the class of every
+field it reads off `this` — Java reads `this.x` as a field of the value the method is read off, and,
+read without a type checker, a bare `helper()` call is not resolved to a method on `this`.
 
 | anchor | agreement | divergence | reads as |
 |---|---|---|---|
@@ -1002,6 +1035,10 @@ for a test and its negation.
   else, `array_key_exists`, `str_contains` and `strpos(…) !== false` membership, `strcmp(…) === 0`
   equality; and `$x instanceof C` and `is_string($x)` are membership in a type, as Python's `isinstance`
   is.
+- **In Java** `instanceof` is membership in a type; `.equals` / `Objects.equals` / `compareTo(…) == 0`
+  are equality, `.contains` / `.startsWith` / `.indexOf(…) != -1` membership, and
+  `Optional.isPresent()` presence; a `switch` compares its subject with each case; and
+  `Objects.requireNonNull` / `Preconditions.checkArgument` read the proposition they check.
 - **What a term is:** a name the definition binds is a hole (its spelling is the writer's); an imported
   name is the path it was imported from; a name the module defines is a local path, named the way the
   rest of the tree imports that module — under the source root the corpus's own imports attest, not
@@ -1203,8 +1240,8 @@ walk, the decision-atom grammar and the facts record, the normal form's round bo
 operator tables, and — behind a feature, for the frontends that parse with it — the tree-sitter node
 accessors, the lowering depth limit and the deep-stack pool. [`py-canon`](crates/py-canon),
 [`ts-canon`](crates/ts-canon), [`rs-canon`](crates/rs-canon), [`go-canon`](crates/go-canon),
-[`c-canon`](crates/c-canon) and [`php-canon`](crates/php-canon) are the frontends (Ruff, oxc, syn, and
-tree-sitter for the last three).
+[`c-canon`](crates/c-canon), [`php-canon`](crates/php-canon) and [`java-canon`](crates/java-canon) are the frontends (Ruff, oxc, syn, and
+tree-sitter for the last four).
 
 **Adding a language is one more `<lang>-canon` crate implementing `Frontend`** — plus a `Dialect`
 impl if it wants patternology — and no engine changes.
@@ -1308,7 +1345,7 @@ SETTINGS (via -D 'settings:KEY=VALUE')
 
 The honest ledger:
 
-- **Languages.** Python, TypeScript, Rust, Go, C and PHP today. A new language is a `<lang>-canon` sibling
+- **Languages.** Python, TypeScript, Rust, Go, C, PHP and Java today. A new language is a `<lang>-canon` sibling
   crate.
 - **Go is read without a type checker.** A method call is named by the value it is read off, not by
   the type that value has, so the closed world sees no call site through a variable; and build
@@ -1328,6 +1365,11 @@ The honest ledger:
   read as a call; and an unqualified function a namespace declares is read as the global one PHP falls
   back to when no import says otherwise. Of 156k function and method bodies across five large trees,
   two hold a parse error.
+- **Java is read without a type checker.** A bare `helper()` call is never resolved to a method on
+  `this`, and a name resolves through its file's imports and package, never through a classpath; an
+  anonymous class body (`new Handler() { … }`) is part of the enclosing expression, its methods are
+  not definitions of their own; and annotation-processing-generated sources are read as written
+  unless they declare themselves generated.
 - **Rust macros** are read when their arguments are comma-separated expressions (`vec![a, b]`,
   `assert_eq!(x, y)`, `format!(…)`); one that takes anything else (`vec![0; n]`, a DSL) is opaque
   to every pass.

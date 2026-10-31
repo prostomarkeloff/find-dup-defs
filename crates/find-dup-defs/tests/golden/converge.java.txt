@@ -1,0 +1,24 @@
+--- duplicate constants (cross-file, by name) ---
+
+--- duplicate methods (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate methods (cross-name, exact AST-normalized) ---
+
+--- duplicate methods (cross-name Type-3, IDF-weighted cosine) ---
+DUPLICATE METHOD [WARNING]: Batch.expelMembers/Batch.revokeAdmins  [ast sim 0.77, T=0.39, n=2, loc=10, args=2]  # evidence: p = 1.0e0 under the bipartite configuration model
+  java/batch.java:10
+  java/batch.java:21
+
+
+--- duplicate classes (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate interfaces (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- divergences in methods (converge — one thing done twice, and where they part) ---
+DUPLICATE METHOD [INFO]: Batch.revokeAdmins / Batch.expelMembers  [T=0.06, n=2, loc=10, args=2]  votes[4]: text×11 shape×3 subject×0 fork×3  # agreed on 5 statement(s):;   = Let(PatType(Bind('_v2'), Ty('Object', )), StaticCall('chat.session.SessionApi', 'open', Path('_v0')));   = Let(PatType(Bind('_v3'), Ty('Object', )), StaticCall('chat.session.SessionApi', 'resolve', Path('_v2'), Path('_v0')));   = Let(PatType(Bind('_v4'), Ty('int', )), StaticCall('chat.session.SessionApi', 'identifier', Path('_v3')));   = Let(PatType(Bind('_v5'), TyArray(Ty('String', ))), New('String', Path('_v1')));   = ForC(Let(PatType(Bind('_v6'), Ty('int', )), Num('0')), Bin(Path('_v6'), '<', Field(Path('_v1'), 'length')), Path('_v6')); parted:;   ExprStmt(AssignExpr(Index(Path('_v5'), Path('_v6')), '=', Call(Path('demoteOne'), Path('_v2'), Path('_v4'), Index(Path('_v1'), Path('_v6')))));   by: demoteOne;   ExprStmt(AssignExpr(Index(Path('_v5'), Path('_v6')), '=', Call(Path('kickOne'), Path('_v2'), Path('_v4'), Index(Path('_v1'), Path('_v6')))));   by: kickOne; and agreed again; subject: chat.session.SessionApi (reached by 2 definitions)
+  java/batch.java:10
+  java/batch.java:21
+
+
+--- families of methods (converge — many places, one subject, one shape) ---
+# summary: 0 ERROR, 2 WARNING groups

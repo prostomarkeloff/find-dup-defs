@@ -2686,7 +2686,7 @@ fn php_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
             }
             out.push_str(" }");
         }
-        // `Case(value, Block)`, `Default(Block)` — and a `match`'s `Default(value)`.
+        // `Case(values, Block)` / `Default(Block)` — and a switch expression's `Default(e)`.
         "Case" | "Default" => {
             if tag == "Default" {
                 out.push_str("default");
@@ -3658,6 +3658,498 @@ fn ts_op(t: Option<&Term>, sym: fn(&str) -> &str) -> String {
     match t {
         Some(Term::Atom(s)) => sym(unq(s)).to_owned(),
         _ => "?".to_owned(),
+    }
+}
+
+// ── Java dialect ─────────────────────────────────────────────────────────────
+
+/// The Java dialect — `java-canon`'s tree-sitter-derived structural dump. It lays a callable out as
+/// Go's, C's and PHP's do — `Func(name, Params(…), return type, Block(…))`, the body at slot 3, read
+/// by the same borrow ([`go_parse_function_body`]) — and speaks the shared tags wherever the
+/// construct is the same one, adding Java's own (`StaticCall`/`StaticField`/`ClassConst`,
+/// `MethodRef`, `Lambda`, `SwitchExpr`, `TryRes`, `Synchronized`). Selectors are the member slots of
+/// a call or a read — instance or static — and a method-reference's target method; a parameter's
+/// type, a catch's type/binding, the return type and the type refs of a `new` / static read are
+/// signature material (`_T{n}`-slotted type refs).
+pub(crate) struct JavaDialect;
+
+impl Dialect for JavaDialect {
+    fn slot_ctx(&self, tag: &str, k: usize) -> Ctx {
+        match (tag, k) {
+            // Statement-holding positions — a hole here is a leaky statement divergence. Every child
+            // of a `Block` is a statement; a compound body is always a `Block` EXCEPT an `if`'s
+            // `else`, which may be the bare next `if` of the chain. `Case`/`Default` bodies are
+            // `Block`s (the `Block` rule already classifies their statements); the extra arms here
+            // mark the body *slot* itself so a holed body reads as a statement hole.
+            ("Block", _) | ("If", 1 | 2) | ("While" | "Synchronized" | "Case", 1) | ("DoWhile" | "Try", 0)
+            | ("ForC", 3) | ("For" | "Catch", 2) => Ctx::Stmt,
+            // Name-identity (selector) slots: a varying member/method/field/constant name needs
+            // reflection, not a parameter. `Variant`'s name and a `Labeled` label are the same class.
+            ("Field" | "StaticField" | "Method" | "StaticCall" | "ClassConst", 1)
+            | ("Labeled" | "Variant", 0) => Ctx::Selector,
+            // Signature material — a type ref (slotted `_T{n}` in the xname view) or a synthetic name
+            // (`_fn`, a `Bind` placeholder). A method reference's target method is a *value* (you pass
+            // the reference), so it is `Anno` rather than `Selector`; a `new`/static-read's class name
+            // is a type ref. `Anno` is sticky, so nested type arguments are all excluded from anchors.
+            ("Param" | "Catch" | "Component", 0 | 1) | ("PatType" | "MethodRef", 1) | ("Func", 0 | 2)
+            | ("Resource" | "StaticField" | "StaticCall" | "New" | "ClassConst" | "Lambda", 0) => Ctx::Anno,
+            _ => Ctx::Expr,
+        }
+    }
+
+    fn parse_function_body(&self, canon: &str) -> Vec<Term> {
+        go_parse_function_body(canon)
+    }
+
+    fn render(&self, t: &Term, out: &mut String, budget: &mut usize) {
+        java_render(t, out, budget);
+    }
+
+    fn is_sequence(&self, tag: &str) -> bool {
+        matches!(
+            tag,
+            "Block"
+                | "Params"
+                | "Decls"
+                | "Members"
+                | "Types"
+                | "Resources"
+                | "Components"
+                | "Variants"
+                | "Seq"
+                | "Conds"
+                | "Mods"
+                | "TypeArgs"
+        )
+    }
+}
+
+/// A variable as Java spells it: the renamed `self` reads as `this`.
+fn java_var(name: &str) -> String {
+    match name {
+        "self" => "this".to_owned(),
+        n => n.to_owned(),
+    }
+}
+
+/// Render a folded Java term as one line of pseudo-source. Mirrors [`c_render`]: bounded by `b`, holes
+/// `?`, unknown tags fall back to the raw `Tag(child, …)` form.
+fn java_render(t: &Term, out: &mut String, b: &mut usize) {
+    if *b == 0 {
+        out.push('…');
+        return;
+    }
+    *b -= 1;
+    match t {
+        Term::Hole => out.push('?'),
+        Term::Atom(s) => out.push_str(unq(s)),
+        Term::List(items) => {
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                java_render(it, out, b);
+            }
+        }
+        Term::Node(tag, ch) => java_node(tag, ch, out, b),
+    }
+}
+
+#[allow(clippy::too_many_lines)] // one arm per construct reads better straight-through
+fn java_node(tag: &str, ch: &[Term], out: &mut String, b: &mut usize) {
+    let hole = &Term::Hole;
+    let at = |i: usize| ch.get(i).unwrap_or(hole);
+    match tag {
+        "Func" => {
+            // `Func(name, Params, ret, Block)` → `ret name(params) { … }`.
+            opt(ch.get(2), out, b, java_render);
+            out.push(' ');
+            out.push_str(&ident(ch.first()));
+            out.push('(');
+            if let Some(Term::Node(pt, pch)) = ch.get(1) {
+                if pt == "Params" {
+                    seq(pch, 0, out, b, java_render);
+                }
+            }
+            out.push_str(") ");
+            braced(ch.get(3), out, b, java_render);
+        }
+        "Params" | "Decls" | "Seq" | "Conds" | "Resources" | "TypeArgs" | "Members" | "Components" | "Variants" => {
+            seq(ch, 0, out, b, java_render);
+        }
+        "Mods" => {
+            for (i, c) in ch.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                out.push_str(&ident(Some(c)));
+            }
+        }
+        "Param" | "PatType" => {
+            // `Param(Bind, Ty[, default])` / `PatType(Bind, Ty)` → `Ty name` (= default).
+            java_render(at(1), out, b);
+            if !go_blank(ch.first()) {
+                out.push(' ');
+                java_render(at(0), out, b);
+            }
+            if tag == "Param" && !go_blank(ch.get(2)) {
+                out.push_str(" = ");
+                java_render(at(2), out, b);
+            }
+        }
+        "Block" => braced(Some(&Term::Node(tag.to_owned(), ch.to_vec())), out, b, java_render),
+        "Let" | "Resource" => {
+            java_render(at(0), out, b);
+            if !go_blank(ch.get(1)) {
+                out.push_str(" = ");
+                java_render(at(1), out, b);
+            }
+        }
+        "Assign" => {
+            java_render(at(0), out, b);
+            out.push_str(" = ");
+            java_render(at(1), out, b);
+        }
+        "Bin" | "AssignExpr" => {
+            java_render(at(0), out, b);
+            out.push(' ');
+            out.push_str(&ident(ch.get(1)));
+            out.push(' ');
+            java_render(at(2), out, b);
+        }
+        "Inc" | "Dec" => {
+            java_render(at(0), out, b);
+            out.push_str(if tag == "Inc" { "++" } else { "--" });
+        }
+        "PreInc" | "PreDec" => {
+            out.push_str(if tag == "PreInc" { "++" } else { "--" });
+            java_render(at(0), out, b);
+        }
+        "ExprStmt" => java_render(at(0), out, b),
+        "Return" | "Throw" | "Break" | "Continue" => {
+            out.push_str(match tag {
+                "Return" => "return",
+                "Throw" => "throw",
+                "Break" => "break",
+                _ => "continue",
+            });
+            if !go_blank(ch.first()) {
+                out.push(' ');
+                java_render(at(0), out, b);
+            }
+        }
+        "Assert" => {
+            out.push_str("assert ");
+            java_render(at(0), out, b);
+        }
+        "If" => {
+            out.push_str("if (");
+            java_render(at(0), out, b);
+            out.push_str(") ");
+            braced(ch.get(1), out, b, java_render);
+            if !go_blank(ch.get(2)) {
+                out.push_str(" else ");
+                match at(2) {
+                    Term::Node(t, _) if t == "If" => java_render(at(2), out, b),
+                    other => braced(Some(other), out, b, java_render),
+                }
+            }
+        }
+        "While" => {
+            out.push_str("while (");
+            java_render(at(0), out, b);
+            out.push_str(") ");
+            braced(ch.get(1), out, b, java_render);
+        }
+        "DoWhile" => {
+            out.push_str("do ");
+            braced(ch.first(), out, b, java_render);
+            out.push_str(" while (");
+            java_render(at(1), out, b);
+            out.push(')');
+        }
+        "ForC" => {
+            out.push_str("for (");
+            opt(ch.first(), out, b, java_render);
+            out.push_str("; ");
+            opt(ch.get(1), out, b, java_render);
+            out.push_str("; ");
+            opt(ch.get(2), out, b, java_render);
+            out.push_str(") ");
+            braced(ch.get(3), out, b, java_render);
+        }
+        "For" => {
+            // `For(Bind, iter, Block)` → `for (T x : iter) { … }`.
+            out.push_str("for (");
+            java_render(at(0), out, b);
+            out.push_str(" : ");
+            java_render(at(1), out, b);
+            out.push_str(") ");
+            braced(ch.get(2), out, b, java_render);
+        }
+        "Switch" | "SwitchExpr" => {
+            out.push_str("switch (");
+            java_render(at(0), out, b);
+            out.push_str(") { ");
+            for (i, clause) in ch.iter().enumerate().skip(1) {
+                if i > 1 {
+                    out.push(' ');
+                }
+                java_render(clause, out, b);
+            }
+            out.push_str(" }");
+        }
+        // `Case(values, Block)` / `Default(Block)` — and a switch expression's `Default(e)`.
+        "Case" | "Default" => {
+            if tag == "Default" {
+                out.push_str("default");
+            } else {
+                out.push_str("case ");
+                java_render(at(0), out, b);
+            }
+            match ch.last() {
+                Some(Term::Node(t, _)) if t == "Block" => {
+                    out.push_str(": ");
+                    block_inner(ch.last(), out, b, java_render);
+                }
+                Some(value) => {
+                    out.push_str(" -> ");
+                    java_render(value, out, b);
+                }
+                None => {}
+            }
+        }
+        "Arm" => {
+            out.push_str("case ");
+            java_render(at(0), out, b);
+            out.push_str(" -> ");
+            java_render(at(1), out, b);
+        }
+        "Try" => {
+            out.push_str("try ");
+            braced(ch.first(), out, b, java_render);
+            let catches = ch.len().saturating_sub(1);
+            for c in ch.iter().take(catches).skip(1) {
+                out.push(' ');
+                java_render(c, out, b);
+            }
+            if !go_blank(ch.last()) && ch.len() > 1 {
+                out.push_str(" finally ");
+                braced(ch.last(), out, b, java_render);
+            }
+        }
+        "TryRes" => {
+            out.push_str("try (");
+            if let Some(Term::Node(rt, rch)) = ch.first() {
+                if rt == "Resources" {
+                    seq(rch, 0, out, b, java_render);
+                }
+            }
+            out.push_str(") ");
+            braced(ch.get(1), out, b, java_render);
+            let catches = ch.len().saturating_sub(1);
+            for c in ch.iter().take(catches).skip(2) {
+                out.push(' ');
+                java_render(c, out, b);
+            }
+            if !go_blank(ch.last()) && ch.len() > 2 {
+                out.push_str(" finally ");
+                braced(ch.last(), out, b, java_render);
+            }
+        }
+        "Catch" => {
+            // `Catch(Types(…), Bind, Block)`.
+            out.push_str("catch (");
+            java_render(at(0), out, b);
+            if !go_blank(ch.get(1)) {
+                out.push(' ');
+                java_render(at(1), out, b);
+            }
+            out.push_str(") ");
+            braced(ch.get(2), out, b, java_render);
+        }
+        "Types" => {
+            for (i, t) in ch.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(" | ");
+                }
+                java_render(t, out, b);
+            }
+        }
+        "Synchronized" => {
+            out.push_str("synchronized (");
+            java_render(at(0), out, b);
+            out.push_str(") ");
+            braced(ch.get(1), out, b, java_render);
+        }
+        "Labeled" => {
+            out.push_str(&ident(ch.first()));
+            out.push_str(": ");
+            opt(ch.get(1), out, b, java_render);
+        }
+        "Empty" => out.push(';'),
+        "NestedItem" => out.push_str("/* nested declaration */"),
+        "Path" | "Bind" => out.push_str(&java_var(&ident(ch.first()))),
+        "Num" | "Bool" | "Ty" => {
+            out.push_str(&ident(ch.first()));
+            if tag == "Ty" && ch.len() > 1 {
+                out.push('<');
+                seq(ch, 1, out, b, java_render);
+                out.push('>');
+            }
+        }
+        "TyArray" => {
+            java_render(at(0), out, b);
+            out.push_str("[]");
+        }
+        "TyVariadic" => {
+            java_render(at(0), out, b);
+            out.push_str("...");
+        }
+        "TyWild" => {
+            out.push('?');
+            if !go_blank(ch.first()) {
+                out.push(' ');
+                out.push_str(&ident(ch.first()));
+                if !go_blank(ch.get(1)) {
+                    out.push(' ');
+                    java_render(at(1), out, b);
+                }
+            }
+        }
+        "TyUnion" | "TyInter" => {
+            for (i, t) in ch.iter().enumerate() {
+                if i > 0 {
+                    out.push(if tag == "TyUnion" { '|' } else { '&' });
+                }
+                java_render(t, out, b);
+            }
+        }
+        "Nil" => out.push_str("null"),
+        "Str" => {
+            out.push('"');
+            out.push_str(&ident(ch.first()));
+            out.push('"');
+        }
+        "Char" => {
+            out.push('\'');
+            out.push_str(&ident(ch.first()));
+            out.push('\'');
+        }
+        "Unary" => {
+            out.push_str(&ident(ch.first()));
+            java_render(at(1), out, b);
+        }
+        "Cond" => {
+            java_render(at(0), out, b);
+            out.push_str(" ? ");
+            opt(ch.get(1), out, b, java_render);
+            out.push_str(" : ");
+            java_render(at(2), out, b);
+        }
+        "Call" => {
+            java_render(at(0), out, b);
+            out.push('(');
+            seq(ch, 1, out, b, java_render);
+            out.push(')');
+        }
+        "Method" => {
+            java_render(at(0), out, b);
+            out.push('.');
+            out.push_str(&ident(ch.get(1)));
+            out.push('(');
+            seq(ch, 2, out, b, java_render);
+            out.push(')');
+        }
+        "StaticCall" => {
+            out.push_str(&ident(ch.first()));
+            out.push('.');
+            out.push_str(&ident(ch.get(1)));
+            let mut arg_start = 2;
+            if let Some(Term::Node(tt, tch)) = ch.get(2) {
+                if tt == "TypeArgs" {
+                    out.push('<');
+                    seq(tch, 0, out, b, java_render);
+                    out.push('>');
+                    arg_start = 3;
+                }
+            }
+            out.push('(');
+            seq(ch, arg_start, out, b, java_render);
+            out.push(')');
+        }
+        "Field" => {
+            java_render(at(0), out, b);
+            out.push('.');
+            out.push_str(&ident(ch.get(1)));
+        }
+        "StaticField" | "ClassConst" => {
+            out.push_str(&ident(ch.first()));
+            out.push('.');
+            out.push_str(&ident(ch.get(1)));
+        }
+        "Index" => {
+            java_render(at(0), out, b);
+            out.push('[');
+            java_render(at(1), out, b);
+            out.push(']');
+        }
+        "New" => {
+            out.push_str("new ");
+            out.push_str(&ident(ch.first()));
+            out.push('(');
+            seq(ch, 1, out, b, java_render);
+            out.push(')');
+        }
+        "Super" => {
+            out.push_str("super(");
+            seq(ch, 0, out, b, java_render);
+            out.push(')');
+        }
+        "InstanceOf" => {
+            java_render(at(0), out, b);
+            out.push_str(" instanceof ");
+            java_render(at(1), out, b);
+        }
+        "Cast" => {
+            out.push('(');
+            java_render(at(1), out, b);
+            out.push_str(") ");
+            java_render(at(0), out, b);
+        }
+        "Arr" => {
+            out.push('{');
+            seq(ch, 0, out, b, java_render);
+            out.push('}');
+        }
+        "Lambda" => {
+            out.push('(');
+            if let Some(Term::Node(pt, pch)) = ch.first() {
+                if pt == "Params" {
+                    seq(pch, 0, out, b, java_render);
+                }
+            }
+            out.push_str(") -> ");
+            match ch.get(1) {
+                Some(Term::Node(bt, _)) if bt == "Block" => braced(ch.get(1), out, b, java_render),
+                Some(other) => java_render(other, out, b),
+                None => {}
+            }
+        }
+        "MethodRef" => {
+            java_render(at(0), out, b);
+            out.push_str("::");
+            out.push_str(&ident(ch.get(1)));
+        }
+        // Unknown / unhandled node: compact `Tag(child, …)` fallback (keeps holes visible).
+        _ => {
+            out.push_str(tag);
+            if !ch.is_empty() {
+                out.push('(');
+                seq(ch, 0, out, b, java_render);
+                out.push(')');
+            }
+        }
     }
 }
 
@@ -5434,5 +5926,76 @@ mod tests {
         let qty = php_xname("function count_all($rows) {\n\t$total = 0;\n\tforeach ($rows as $r) {\n\t\tif ($r->ok) {\n\t\t\t$total += $r->qty;\n\t\t}\n\t}\n\treturn $total;\n}\n", "count_all");
         let none = whole_fn_helpers(&PhpDialect, &[sum, qty], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
         assert!(none.is_empty(), "a varying property name must not extract, got: {none:?}");
+    }
+
+    // ── Java dialect (the `java-canon` tree-sitter shape) ─────────────────────
+    //
+    // As for Go, C and PHP: the canonicals come from `java-canon` itself, so a change to its output
+    // that the dialect does not read breaks these here. In the xname view Java slots every type ref
+    // to `_T{n}` (like a local to `_v{n}`), so the shared-skeleton assertions read the value-level
+    // atoms (`registry.add(`, `db.load(`, `return _v1`) and never a type name.
+
+    fn java_xname(src: &str, name: &str) -> String {
+        let file: std::sync::Arc<str> = std::sync::Arc::from("t.java");
+        java_canon::scan_source(&format!("class T {{ {src} }}"), &file, &dup_defs_core::ScanOpts::default())
+            .into_iter()
+            .find(|d| d.name == name)
+            .and_then(|d| d.analysis)
+            .map_or_else(|| panic!("no analysis for {name}"), |a| a.xname_canonical)
+    }
+
+    #[test]
+    fn java_parse_function_body_matches_full_parse() {
+        for src in [
+            "User make(int id) {\n\tUser v = new User(id);\n\tstore.add(v);\n\treturn v;\n}\n",
+            "void make(int id) {\n\tUser v = new User(id);\n\tstore.add(v);\n}\n",
+        ] {
+            let canon = java_xname(src, "T.make");
+            let full = match parse_term(&canon) {
+                Term::Node(_, ch) => match ch.get(3) {
+                    Some(Term::Node(tag, stmts)) if tag == "Block" => stmts.clone(),
+                    other => panic!("slot 3 is not the body: {other:?} in {canon}"),
+                },
+                other => panic!("not a node: {other:?}"),
+            };
+            assert_eq!(JavaDialect.parse_function_body(&canon), full, "{canon}");
+        }
+    }
+
+    #[test]
+    fn java_whole_fn_emits_factory_helper() {
+        // Two builders differing only in the registry name they register under — a string, a value
+        // that becomes the one parameter (types slot identically to `_T{n}`, so they carry no signal).
+        let a = java_xname("User makeA(int id) {\n\tUser v = new User(id);\n\tregistry.add(\"users\", v);\n\treturn v;\n}\n", "T.makeA");
+        let b = java_xname("User makeB(int id) {\n\tUser v = new User(id);\n\tregistry.add(\"orders\", v);\n\treturn v;\n}\n", "T.makeB");
+        let cands = whole_fn_helpers(&JavaDialect, &[a, b], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert_eq!(cands.len(), 1, "exactly the factory helper: {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.granularity, "whole-fn");
+        assert!(c.body.contains("registry.add(") && c.body.contains("return _v1"), "body: {}", c.body);
+        assert_eq!(c.params, 1, "only the registry name varies: {c:?}");
+    }
+
+    #[test]
+    fn java_subblock_mines_the_load_or_bail_motif() {
+        // Java's own idiom — load, test for null, hand null back — embedded in two functions whose
+        // first statements share nothing. The divergent table name is the one parameter.
+        let a = java_xname("Row a(String k) {\n\tlog(\"a\");\n\tRow row = db.load(k, \"users\");\n\tif (row == null) {\n\t\treturn null;\n\t}\n\treturn row;\n}\n", "T.a");
+        let b = java_xname("Row b(String k) {\n\tcount++;\n\tRow row = db.load(k, \"orders\");\n\tif (row == null) {\n\t\treturn null;\n\t}\n\treturn row;\n}\n", "T.b");
+        let cands = subblock_helpers(&JavaDialect, &[a, b], 2, &ExtractCfg::default());
+        assert_eq!(cands.len(), 1, "exactly the load-or-bail motif: {cands:?}");
+        let c = &cands[0];
+        assert_eq!(c.members, vec![0, 1]);
+        assert!(c.body.contains("db.load(") && c.body.contains("return null"), "body: {}", c.body);
+        assert_eq!(c.params, 1);
+    }
+
+    #[test]
+    fn java_a_varying_field_is_a_selector() {
+        // `r.price` vs `r.qty`: another member, reached only by reflection — not extractable.
+        let sum = java_xname("int sum(Row[] rows) {\n\tint total = 0;\n\tfor (Row r : rows) {\n\t\tif (r.ok) {\n\t\t\ttotal += r.price;\n\t\t}\n\t}\n\treturn total;\n}\n", "T.sum");
+        let qty = java_xname("int count(Row[] rows) {\n\tint total = 0;\n\tfor (Row r : rows) {\n\t\tif (r.ok) {\n\t\t\ttotal += r.qty;\n\t\t}\n\t}\n\treturn total;\n}\n", "T.count");
+        let none = whole_fn_helpers(&JavaDialect, &[sum, qty], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
+        assert!(none.is_empty(), "a varying field name must not extract, got: {none:?}");
     }
 }
