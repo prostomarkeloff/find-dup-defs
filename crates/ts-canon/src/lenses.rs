@@ -407,10 +407,10 @@ pub(crate) fn callable_facts(
     // A *set*: what it depends on, order irrelevant.
     facts.extend(Lens::Outgoing, walked.effects.iter().cloned().collect::<BTreeSet<_>>());
     // A *sequence*: the protocol it drives, order load-bearing.
-    facts.extend(Lens::Effects, walked.effects.clone());
-    facts.extend(Lens::Control, walked.control.clone());
-    facts.extend(Lens::Failures, walked.failures.iter().cloned());
-    facts.extend(Lens::Resources, walked.resources.clone());
+    facts.extend(Lens::Effects, walked.effects);
+    facts.extend(Lens::Control, walked.control);
+    facts.extend(Lens::Failures, walked.failures);
+    facts.extend(Lens::Resources, walked.resources);
     facts.extend(Lens::Signature, signature_facts(params, return_type, is_async, bound));
     facts.extend(Lens::Decorators, decorator_facts(decorators));
     // One fact rather than one per statement: what it asserts is all-or-nothing.

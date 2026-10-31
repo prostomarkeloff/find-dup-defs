@@ -406,10 +406,13 @@ impl ClassNull {
     }
 }
 
-/// A pair that passed its class pair's critical value at the rate.
+/// A pair that passed its class pair's critical value at the rate. `cp` is the pair's class pair,
+/// carried so the step-up and the tail below never recompute it (two row-class lookups and a
+/// min/max per overlap, per iteration).
 struct Overlap {
     a: usize,
     b: usize,
+    cp: (usize, usize),
     shared: usize,
     surprise: f64,
 }
@@ -444,7 +447,6 @@ fn overlaps(
             index[f as usize].push(m as u32);
         }
     }
-    let surprise_of = |r: usize, f: u32| -model.edge(r, col_of[f as usize]).ln();
     let mut out: Vec<Overlap> = (0..n)
         .into_par_iter()
         .map_init(
@@ -452,6 +454,11 @@ fn overlaps(
             |(count, weight, touched), a| {
                 let ra = row_of[a];
                 for &f in &c.facts[a] {
+                    // The edge probability depends on the row class and the fact's column class
+                    // alone, so `a`'s own term is loop-invariant over the members sharing the fact:
+                    // it is taken once here, not once per member.
+                    let cf = col_of[f as usize];
+                    let own = -model.edge(ra, cf).ln();
                     for &b in &index[f as usize] {
                         let b_at = b as usize;
                         if b_at <= a {
@@ -461,7 +468,7 @@ fn overlaps(
                             touched.push(b);
                         }
                         count[b_at] += 1;
-                        weight[b_at] += surprise_of(ra, f) + surprise_of(row_of[b_at], f);
+                        weight[b_at] += own - model.edge(row_of[b_at], cf).ln();
                     }
                 }
                 let mut found = Vec::new();
@@ -470,13 +477,14 @@ fn overlaps(
                     let (shared, w) = (count[b_at] as usize, weight[b_at]);
                     count[b_at] = 0;
                     weight[b_at] = 0.0;
-                    let null = &nulls[&class_pair(row_of, a, b_at)];
+                    let cp = class_pair(row_of, a, b_at);
+                    let null = &nulls[&cp];
                     let admitted = match statistic {
                         Statistic::Count => shared >= null.count_crit,
                         Statistic::Surprise => w >= null.surprise_crit,
                     };
                     if admitted {
-                        found.push(Overlap { a, b: b_at, shared, surprise: w });
+                        found.push(Overlap { a, b: b_at, cp, shared, surprise: w });
                     }
                 }
                 found
@@ -503,13 +511,19 @@ fn class_pair(row_of: &[usize], a: usize, b: usize) -> (usize, usize) {
 fn candidates(
     overlaps: Vec<Overlap>,
     nulls: &HashMap<(usize, usize), ClassNull>,
-    row_of: &[usize],
     statistic: Statistic,
     tests: f64,
     alpha: f64,
 ) -> Vec<Candidate> {
     let mut kept = overlaps;
     if statistic == Statistic::Surprise {
+        // The class pairs that hold an overlap: `critical` is paid only for these, not the whole
+        // row-class × row-class grid, and only the step-up's survivors ever read one. `kept` is
+        // narrowed by the loop and never re-scanned, so the set is collected once, up front.
+        let mut seen: rustc_hash::FxHashSet<(usize, usize)> = rustc_hash::FxHashSet::default();
+        seen.reserve(nulls.len());
+        seen.extend(kept.iter().map(|o| o.cp));
+        let pairs: Vec<(usize, usize)> = seen.into_iter().collect();
         let mut level = alpha;
         loop {
             let next = kept.len() as f64 * alpha / tests;
@@ -517,14 +531,16 @@ fn candidates(
                 break;
             }
             level = next;
-            let crit: HashMap<(usize, usize), f64> =
-                nulls.par_iter().map(|(&key, null)| (key, null.surprise.critical(2.0 * level))).collect();
-            kept.retain(|o| o.surprise >= crit[&class_pair(row_of, o.a, o.b)]);
+            let crit: HashMap<(usize, usize), f64> = pairs
+                .par_iter()
+                .map(|&cp| (cp, nulls[&cp].surprise.critical(2.0 * level)))
+                .collect();
+            kept.retain(|o| o.surprise >= crit[&o.cp]);
         }
     }
     kept.into_par_iter()
         .map(|o| {
-            let null = &nulls[&class_pair(row_of, o.a, o.b)];
+            let null = &nulls[&o.cp];
             let p = match statistic {
                 Statistic::Count => null.count_tail(o.shared),
                 Statistic::Surprise => null.surprise.tail(o.surprise),
@@ -703,7 +719,7 @@ pub fn pass_decisions(defs: &[Def], already: &[Finding], opts: &DecisionOpts) ->
     let admitted = overlaps(&c, &model, &nulls, &row_of, &col_of, opts.statistic);
     let admitted_count = admitted.len();
     let tests = n as f64 * (n as f64 - 1.0) / 2.0;
-    let found = candidates(admitted, &nulls, &row_of, opts.statistic, tests, opts.fdr);
+    let found = candidates(admitted, &nulls, opts.statistic, tests, opts.fdr);
     let p_values: Vec<f64> = found.iter().map(|cand| cand.p).collect();
     let threshold = bh_threshold(&p_values, tests, opts.fdr);
     if std::env::var_os("FDD_TIMING").is_some() {
