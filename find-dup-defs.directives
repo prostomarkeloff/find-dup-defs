@@ -45,7 +45,7 @@ de-escalate:<methods>Collect::{expr,stmts}@*canon/src/canon.rs=per-language AST 
 # three jumps, an expression's children, a statement's parts — and they are still two languages' types:
 # Go's `case` holds a list of values and C's one, Go's jumps take labels everywhere and C's only on
 # `goto`, and every walk matches on its own language's variants.
-de-escalate:<classes>{Case,Child,Else,Jump,Part,Ctx}@*canon/src/*=per-language owned tree, one shape where the languages agree
+de-escalate:<classes>{Case,Child,Else,Jump,Part,Ctx,Arm,Catch}@*canon/src/*=per-language owned tree, one shape where the languages agree
 de-escalate:<functions>is_wrapper@*canon/src/canon.rs=per-language expression shape over its own tree
 de-escalate:<functions>{boxed,opt_boxed,cond_of}@*canon/src/ir.rs=per-language lowering into its own tree
 
@@ -103,7 +103,7 @@ de-escalate:<methods>Dump::{expr,anchoring,hunting,block,mention,type_name,eleme
 # temporary, the operands of a `&&` chain, whether a block ends, the placeholder a rewrite leaves while
 # it moves a node — have one shape and four node types. What they share (the round bound, the name
 # counts) is `dup_defs_core::normal`'s.
-de-escalate:<functions>{has_effects,names_read,reads_of,names_read_count,operands,block_ends,placeholder}@*canon/src/normal.rs=per-language walk over its own AST
+de-escalate:<functions>{has_effects,names_read,reads_of,names_read_count,operands,block_ends,placeholder,conditions,rewrite_truth,errorish}@*canon/src/normal.rs=per-language walk over its own AST
 de-escalate:<classes>{ScopeWalk,Subst}@*canon/src/normal.rs=per-language visitor over its own AST
 de-escalate:<methods>ScopeWalk::*@*canon/src/normal.rs=per-language visitor over its own AST
 
@@ -121,6 +121,8 @@ de-escalate:<methods>Atoms::named@*canon/src/decides.rs=per-language binding rul
 de-escalate:<methods>Atoms::{push,typed,stmts,callee}@*canon/src/decides.rs=thin per-crate forwarder over its own tree
 de-escalate:<methods>Refs::stmts@*canon/src/decides.rs=per-language list walk over its own tree
 de-escalate:<methods>FileScope::module@*canon/src/decides.rs=thin per-crate getter
+de-escalate:<methods>FileScope::{member_path,qualified}@*canon/src/decides.rs=per-language name resolution over its own paths
+de-escalate:<methods>Scope::dump@*canon/src/canon.rs=thin per-crate use-site scope constructor
 de-escalate:<methods>Locals::*@*canon/src/decides.rs=per-language binding counter over its own AST
 de-escalate:<classes>Refs@*canon/src/decides.rs=per-language visitor over its own AST
 de-escalate:<classes>FileNames@*canon/src/defs.rs=per-language pair of the file's name tables

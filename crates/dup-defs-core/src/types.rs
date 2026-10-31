@@ -61,6 +61,13 @@ pub enum CanonDialect {
     /// construct is the same one (`Method`/`Field`/`Call`/`If`/`ForC`/`For`/`Switch`/`Try`/`Catch`/…),
     /// adding PHP's own (`StaticCall`/`ClassConst`/`Echo`/`Interp`/`Arr`/`Closure`/`Match`/…).
     Php,
+    /// The Java frontend's tree-sitter-derived structural dump. It lays a callable out as the Go,
+    /// C and PHP dumps do (`Func(name, Params(…), return type, Block(…))`, body at slot 3) and speaks
+    /// the shared tags wherever the construct is the same one (`Method`/`Field`/`Call`/`If`/`ForC`/
+    /// `For`/`Switch`/`Try`/`Catch`/…), adding Java's own (`New`/`StaticCall`/`StaticField`/
+    /// `InstanceOf`/`Lambda`/`MethodRef`/`Synchronized`/`Throw`/`Finally`/`SwitchExpr`/`TryRes`/
+    /// `Record`/…).
+    Java,
     /// The TypeScript frontend's `oxc`-derived structural dump (`Func`/`Block`/`Var`/`Call`/… tags)
     /// — the patternology engine has a `TsDialect` for it. (Also the catch-all for any future
     /// frontend whose canonical the dialect-specific passes don't yet recognize.)

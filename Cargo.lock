@@ -320,7 +320,7 @@ checksum = "fd8e701084c37e7ef62d3f9e453b618130cbc0ef3573847785952a3ac3f746bf"
 
 [[package]]
 name = "dup-defs-core"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "rayon",
  "tree-sitter",
@@ -346,7 +346,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "find-dup-defs"
-version = "0.18.0"
+version = "0.19.0"
 dependencies = [
  "c-canon",
  "clap",
@@ -354,6 +354,7 @@ dependencies = [
  "directiva",
  "dup-defs-core",
  "go-canon",
+ "java-canon",
  "mimalloc",
  "php-canon",
  "py-canon",
@@ -513,6 +514,16 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "java-canon"
+version = "0.1.0"
+dependencies = [
+ "dup-defs-core",
+ "rayon",
+ "tree-sitter",
+ "tree-sitter-java",
+]
 
 [[package]]
 name = "libc"
@@ -1410,6 +1421,16 @@ name = "tree-sitter-go"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8560a4d2f835cc0d4d2c2e03cbd0dde2f6114b43bc491164238d333e28b16ea"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-java"
+version = "0.23.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa6cbcdc8c679b214e616fd3300da67da0e492e066df01bcf5a5921a71e90d6"
 dependencies = [
  "cc",
  "tree-sitter-language",

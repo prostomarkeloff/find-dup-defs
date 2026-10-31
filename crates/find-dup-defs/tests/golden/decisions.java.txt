@@ -1,0 +1,84 @@
+--- duplicate constants (cross-file, by name) ---
+
+--- duplicate functions (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate functions (cross-name, exact AST-normalized) ---
+
+--- duplicate functions (cross-name Type-3, IDF-weighted cosine) ---
+
+--- duplicate methods (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate methods (cross-name, exact AST-normalized) ---
+
+--- duplicate methods (cross-name Type-3, IDF-weighted cosine) ---
+DUPLICATE METHOD [ERROR]: Retry.exhausted/Retry.outOf  [ast sim 1.00, T=0.30, n=2, loc=3, args=2]  # evidence: p = 8.7e-8 under the bipartite configuration model
+  java/retry/Retry.java:25
+  java/retry/Retry.java:44
+
+DUPLICATE METHOD [WARNING]: Shipping.check0/Shipping.check10/Shipping.check12/Shipping.check14/Shipping.check16/Shipping.check18/Shipping.check2/Shipping.check20/Shipping.check22/Shipping.check24/Shipping.check26/Shipping.check28/Shipping.check30/Shipping.check32/Shipping.check34/Shipping.check36/Shipping.check38/Shipping.check4/Shipping.check6/Shipping.check8  [ast sim 0.87, T=0.89, n=20, loc=9, args=1]  # evidence: p = 1.3e-1 under the bipartite configuration model
+  java/shipping/Shipping.java:32
+  java/shipping/Shipping.java:52
+  java/shipping/Shipping.java:72
+  java/shipping/Shipping.java:92
+  java/shipping/Shipping.java:112
+  java/shipping/Shipping.java:132
+  java/shipping/Shipping.java:152
+  java/shipping/Shipping.java:172
+  java/shipping/Shipping.java:192
+  java/shipping/Shipping.java:212
+  java/shipping/Shipping.java:232
+  java/shipping/Shipping.java:252
+  java/shipping/Shipping.java:272
+  java/shipping/Shipping.java:292
+  java/shipping/Shipping.java:312
+  java/shipping/Shipping.java:332
+  java/shipping/Shipping.java:352
+  java/shipping/Shipping.java:372
+  java/shipping/Shipping.java:392
+  java/shipping/Shipping.java:412
+
+DUPLICATE METHOD [WARNING]: Shipping.check1/Shipping.check11/Shipping.check13/Shipping.check15/Shipping.check17/Shipping.check19/Shipping.check21/Shipping.check23/Shipping.check25/Shipping.check27/Shipping.check29/Shipping.check3/Shipping.check31/Shipping.check33/Shipping.check35/Shipping.check37/Shipping.check39/Shipping.check5/Shipping.check7/Shipping.check9  [ast sim 0.87, T=0.89, n=20, loc=9, args=1]  # evidence: p = 1.3e-1 under the bipartite configuration model
+  java/shipping/Shipping.java:42
+  java/shipping/Shipping.java:62
+  java/shipping/Shipping.java:82
+  java/shipping/Shipping.java:102
+  java/shipping/Shipping.java:122
+  java/shipping/Shipping.java:142
+  java/shipping/Shipping.java:162
+  java/shipping/Shipping.java:182
+  java/shipping/Shipping.java:202
+  java/shipping/Shipping.java:222
+  java/shipping/Shipping.java:242
+  java/shipping/Shipping.java:262
+  java/shipping/Shipping.java:282
+  java/shipping/Shipping.java:302
+  java/shipping/Shipping.java:322
+  java/shipping/Shipping.java:342
+  java/shipping/Shipping.java:362
+  java/shipping/Shipping.java:382
+  java/shipping/Shipping.java:402
+  java/shipping/Shipping.java:422
+
+
+--- duplicate classes (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate interfaces (cross-file, AST sim warn=0.5 error=0.85) ---
+
+--- duplicate type aliases (cross-file, by name) ---
+
+--- decisions in functions (one decision, written in two places) ---
+
+--- decisions in methods (one decision, written in two places) ---
+DUPLICATE METHOD [INFO]: Catalog.offers / Orders.refuse  [T=0.03, n=2, loc=9, args=1]  votes[2]: decides×2 members×2  # decide on 2 shared fact(s), 0.78 expected by chance; surprise 15.0 nats (null mean 0.8); p = 5.9e-5 under the bipartite configuration model, Benjamini–Hochberg cut 7.8e-5 at FDR 0.05 over 1275 pairs;   · @shop.models.Status.OPEN.code() = _.status();   · ? _.paid()
+  java/catalog/Catalog.java:11
+  java/orders/Orders.java:8
+
+DUPLICATE METHOD [INFO]: Retry.retryable / Retry.backoff  [T=0.03, n=2, loc=9, args=2]  votes[2]: decides×2 members×2  # decide on 2 shared fact(s), 0.78 expected by chance; surprise 15.0 nats (null mean 0.8); p = 5.9e-5 under the bipartite configuration model, Benjamini–Hochberg cut 7.8e-5 at FDR 0.05 over 1275 pairs;   · @shop.retry.Code.BUSY = _;   · @shop.retry.Code.TIMEOUT = _
+  java/retry/Retry.java:10
+  java/retry/Retry.java:15
+
+
+--- decision families in functions (one decision, written in many places) ---
+
+--- decision families in methods (one decision, written in many places) ---
+# summary: 1 ERROR, 4 WARNING groups

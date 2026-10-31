@@ -100,6 +100,7 @@ struct Cli {
     ///   `go` — Go via `go-canon` (tree-sitter parser)
     ///   `c`  — C via `c-canon` (tree-sitter parser)
     ///   `php` — PHP via `php-canon` (tree-sitter parser)
+    ///   `java` — Java via `java-canon` (tree-sitter parser)
     /// Unknown codes exit non-zero. Useful in mixed-language repos where you only care about
     /// one frontend per CI job (`--only py`, `--only ts`), or when a frontend's parser is
     /// crashing on bad input and you need to scan around it.
@@ -456,8 +457,8 @@ fn main() {
     // Frontend registry — the binary is the composition root that knows every language; the
     // engine itself is frontend-agnostic. Bound to locals so the `&dyn Frontend` refs outlive
     // the whole run.
-    let (py, ts, rs, go, c, php) = (py_canon::Python, ts_canon::TypeScript, rs_canon::Rust, go_canon::Go, c_canon::C, php_canon::Php);
-    let registry: Vec<&dyn Frontend> = vec![&py, &ts, &rs, &go, &c, &php];
+    let (py, ts, rs, go, c, php, java) = (py_canon::Python, ts_canon::TypeScript, rs_canon::Rust, go_canon::Go, c_canon::C, php_canon::Php, java_canon::Java);
+    let registry: Vec<&dyn Frontend> = vec![&py, &ts, &rs, &go, &c, &php, &java];
     // `--only` selects a subset by language code. Unknown codes are an error (exit 2) rather
     // than a silent no-op — a typo'd `--only py,rs` should fail loud so a CI job that meant to
     // include Rust doesn't ship an empty report.
