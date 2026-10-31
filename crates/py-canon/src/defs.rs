@@ -271,9 +271,10 @@ fn top_def_canon(
     kind: &'static KindSpec,
     stmt: &Stmt,
     src: &str,
+    facets: bool,
 ) -> (Option<String>, Option<Analysis>, Vec<Statement>) {
     match kind.id {
-        "functions" => match analyze_stmt(stmt, src) {
+        "functions" => match analyze_stmt(stmt, src, facets) {
             Some(analyzed) => split_analysis(analyzed),
             // A FunctionDef always analyzes; this branch only guards future kinds.
             None => (Some(cluster_canonical_node(stmt, src)), None, Vec::new()),
@@ -305,6 +306,7 @@ fn method_canon_node(
     func: &ruff_python_ast::StmtFunctionDef,
     start: usize,
     end: usize,
+    facets: bool,
 ) -> (Option<String>, Option<Analysis>, Vec<Statement>) {
     let params = &func.parameters;
     if params.posonlyargs.is_empty()
@@ -313,7 +315,7 @@ fn method_canon_node(
         let mut stripped = func.clone();
         stripped.parameters.args.remove(0);
         let stmt = Stmt::FunctionDef(stripped);
-        if let Some(analyzed) = analyze_stmt(&stmt, source) {
+        if let Some(analyzed) = analyze_stmt(&stmt, source, facets) {
             return split_analysis(analyzed);
         }
     }
@@ -330,6 +332,7 @@ struct FileNames<'a> {
 
 /// Methods of one class as `Def`s (`kind = methods`, class-qualified names). Recurses into
 /// nested classes (`Outer.Inner.foo`); classes hidden inside a *function* are never reached.
+#[allow(clippy::too_many_arguments)] // file context + facet gate ride the recursion together
 fn method_defs(
     source: &str,
     stmt: &Stmt,
@@ -338,6 +341,7 @@ fn method_defs(
     parent_chain: &str,
     names: &FileNames<'_>,
     out: &mut Vec<Def>,
+    facets: bool,
 ) {
     let Stmt::ClassDef(class) = stmt else { return };
     let class_name = class.name.id.as_str();
@@ -361,10 +365,18 @@ fn method_defs(
                 let loc = count_loc(&text_orig);
                 let args = count_args(&node.parameters);
                 let (cluster_canonical, analysis, statements) =
-                    method_canon_node(source, node, start, end);
+                    method_canon_node(source, node, start, end, facets);
                 let reaches = reached_paths(inner, names.reaches);
-                let decided = crate::decides::decides(inner, names.decides);
-                let identity = Some(Arc::from(dup_defs_core::decide::local(names.decides.module(), &name)));
+                let decided = if facets {
+                    crate::decides::decides(inner, names.decides)
+                } else {
+                    dup_defs_core::decide::DecisionFacts::default()
+                };
+                let identity = if facets {
+                    Some(Arc::from(dup_defs_core::decide::local(names.decides.module(), &name)))
+                } else {
+                    None
+                };
                 out.push(Def {
                     lang: "py",
                     kind: &METHODS,
@@ -390,7 +402,7 @@ fn method_defs(
                     },
                 });
             }
-            Stmt::ClassDef(_) => method_defs(source, inner, lines, file, &parent, names, out),
+            Stmt::ClassDef(_) => method_defs(source, inner, lines, file, &parent, names, out, facets),
             _ => {}
         }
     }
@@ -401,17 +413,19 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
     let Ok(parsed) = parse_module(source) else { return Vec::new() };
     let module = parsed.into_syntax();
     let lines = LineMap::new(source);
+    let facets = opts.facets;
     // The file's import table, resolved once: what each bound name stands for. Python already writes
     // its paths with dots, so `reach_path` here is about agreeing with the other frontends on the
-    // form rather than translating a separator.
-    let written_imports = crate::canon::module_imports(source);
+    // form rather than translating a separator. Facets-only data — skipped when no pass reads them.
+    let written_imports = if facets { crate::canon::module_imports(source) } else { Vec::new() };
     let imports: std::collections::HashMap<String, Arc<str>> = written_imports
         .iter()
         .map(|i| (i.local.clone(), reach_path(&i.path.split('.').collect::<Vec<_>>())))
         .collect();
     // What each name stands for, for the propositions a definition tests: relative imports keep their
     // dots here, since they resolve against the file's own package.
-    let scope_of_names = crate::decides::FileScope::new(file, &written_imports, &module.body);
+    let scope_of_names =
+        crate::decides::FileScope::new(file, &written_imports, if facets { &module.body } else { &[] });
     let mut defs: Vec<Def> = Vec::new();
     // Module scope is a property of the file, so it is collected once before any definition is
     // canonicalized against it.
@@ -420,25 +434,37 @@ pub(crate) fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec
     let scope = (!lenses.is_empty()).then(|| crate::canon::module_bound_names(&module.body));
     for stmt in &module.body {
         if matches!(stmt, Stmt::ClassDef(_)) {
-            method_defs(source, stmt, &lines, file, "", &FileNames { reaches: &imports, decides: &scope_of_names }, &mut defs);
+            method_defs(source, stmt, &lines, file, "", &FileNames { reaches: &imports, decides: &scope_of_names }, &mut defs, facets);
         }
         let Some((kind_id, name, start, end, args)) = classify(source, stmt) else { continue };
         let (line, col) = lines.loc0(start);
         let text_orig = source[start..end].to_owned();
         let loc = count_loc(&text_orig);
         let kind = kind_spec(kind_id);
-        let (cluster_canonical, analysis, statements) = top_def_canon(kind, stmt, source);
+        let (cluster_canonical, analysis, statements) = top_def_canon(kind, stmt, source, facets);
         let reaches = reached_paths(stmt, &imports);
-        let decided = crate::decides::decides(stmt, &scope_of_names);
-        let identity = matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_))
-            .then(|| Arc::from(dup_defs_core::decide::local(scope_of_names.module(), &name)));
+        let decided = if facets {
+            crate::decides::decides(stmt, &scope_of_names)
+        } else {
+            dup_defs_core::decide::DecisionFacts::default()
+        };
+        let identity = if facets {
+            matches!(stmt, Stmt::FunctionDef(_) | Stmt::ClassDef(_))
+                .then(|| Arc::from(dup_defs_core::decide::local(scope_of_names.module(), &name)))
+        } else {
+            None
+        };
         // A record's constructor takes its fields: those are the parameters its calls fill.
-        let record_params: Vec<Arc<str>> = match (stmt, &identity) {
-            (Stmt::ClassDef(_), Some(id)) => scope_of_names
-                .record(id)
-                .map(|fields| fields.iter().map(|(f, _)| Arc::from(f.as_str())).collect())
-                .unwrap_or_default(),
-            _ => Vec::new(),
+        let record_params: Vec<Arc<str>> = if facets {
+            match (stmt, &identity) {
+                (Stmt::ClassDef(_), Some(id)) => scope_of_names
+                    .record(id)
+                    .map(|fields| fields.iter().map(|(f, _)| Arc::from(f.as_str())).collect())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
         };
         if let Some(scope) = &scope {
             // The `scope` lens contributes a single fact: the whole body canonicalized with every

@@ -1009,7 +1009,7 @@ mod tests {
     fn analyzed(src: &str) -> crate::AnalyzedFn {
         let file = syn::parse_file(src).expect("fixture parses");
         let syn::Item::Fn(f) = &file.items[0] else { panic!("a function") };
-        analyze_item_fn(f)
+        analyze_item_fn(f, true)
     }
 
     fn xname(src: &str) -> String {

@@ -1,6 +1,6 @@
 [package]
 name = "find-dup-defs"
-version = "0.19.1"
+version = "0.19.5"
 description = "Find duplicate / near-duplicate top-level definitions across a codebase via clone clustering — Python, Rust, TypeScript, Go, C, PHP and Java frontends, plus an opt-in structural helper-extraction pass."
 keywords = ["duplicate", "clone", "refactor", "lint", "ast"]
 categories = ["command-line-utilities", "development-tools"]
@@ -16,24 +16,24 @@ path = "src/main.rs"
 
 [dependencies]
 # The frontend↔engine contract (Def / KindSpec / Frontend) the engine clusters over.
-dup-defs-core = { path = "../dup-defs-core", version = "0.4.5" }
-py-canon = { path = "../py-canon", version = "0.6.1" }
+dup-defs-core = { path = "../dup-defs-core", version = "0.4.6" }
+py-canon = { path = "../py-canon", version = "0.6.2" }
 # TypeScript frontend — same contract as `py-canon`, oxc-based parser. `0.1.4` carries the
 # arrow-const name blanking the TS patternology dialect relies on, so pin the floor there.
-ts-canon = { path = "../ts-canon", version = "0.3.1" }
+ts-canon = { path = "../ts-canon", version = "0.3.2" }
 # Rust frontend — same contract as `py-canon`/`ts-canon`, over the `syn` parser.
-rs-canon = { path = "../rs-canon", version = "0.3.2" }
+rs-canon = { path = "../rs-canon", version = "0.3.3" }
 # Go frontend — same contract, over the tree-sitter Go grammar.
-go-canon = { path = "../go-canon", version = "0.1.1" }
+go-canon = { path = "../go-canon", version = "0.1.2" }
 # C frontend — same contract, over the tree-sitter C grammar.
-c-canon = { path = "../c-canon", version = "0.1.1" }
+c-canon = { path = "../c-canon", version = "0.1.2" }
 # PHP frontend — same contract, over the tree-sitter PHP grammar.
-php-canon = { path = "../php-canon", version = "0.1.0" }
+php-canon = { path = "../php-canon", version = "0.1.1" }
 # Java frontend — same contract, over the tree-sitter Java grammar.
-java-canon = { path = "../java-canon", version = "0.1.0" }
+java-canon = { path = "../java-canon", version = "0.1.1" }
 # exact difflib Ratcliff–Obershelp ratio + clustering + exact weighted-cosine similarity join
 # (simjoin) — https://crates.io/crates/difflib-fast
-difflib-fast = "0.4"
+difflib-fast = "0.5"
 # The directive mini-language (ACTION:[<KIND>]NAME[@PATH][=NOTE]) — parsing, glob matching, the
 # `-D` overload, and the lint pack (LintAction/Severity/fold) — https://crates.io/crates/directiva
 directiva = "0.1"

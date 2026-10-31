@@ -832,11 +832,13 @@ fn member_canon(dump: &mut Dump<'_>, m: &ClassMember) -> Option<String> {
 /// compares what is spelled, and converge reads the stream to say where two definitions stop agreeing.
 /// The Type-3 lines read the normal form that keeps every statement, the exact canonical the one that
 /// also inlines single-use temporaries ([`crate::normal`]).
-pub(crate) fn analyze(imports: &HashMap<String, Arc<str>>, name: &str, f: &Func) -> AnalyzedFn {
+pub(crate) fn analyze(imports: &HashMap<String, Arc<str>>, name: &str, f: &Func, facets: bool) -> AnalyzedFn {
     let bound = crate::ir::locals_of(f);
     let cluster = Dump::new(imports, &bound, None).func(name, f, true, true);
 
-    let statements = {
+    // The statement stream keeps the definition as written: converge reads it to say where two
+    // definitions stop agreeing. A run that never reads facets skips the whole walk.
+    let statements = if facets {
         let mut dump = Dump::new(imports, &bound, Some(&bound));
         // The definition's own header opens the stream at depth 0 and the body starts at depth 1 — the
         // contract every frontend agrees on.
@@ -845,6 +847,8 @@ pub(crate) fn analyze(imports: &HashMap<String, Arc<str>>, name: &str, f: &Func)
         walk.push(0, head);
         walk.stmts(&f.body, 1);
         walk.out
+    } else {
+        Vec::new()
     };
 
     let statement_form = crate::normal::normal_form(f, false);
@@ -1559,7 +1563,7 @@ mod tests {
         let (imports, f) = first_method(
             "class C { int add(int a, int b) { int s = a + b; return s + s; } }",
         );
-        let analyzed = analyze(&imports, "C.add", &f);
+        let analyzed = analyze(&imports, "C.add", &f, true);
         assert!(analyzed.xname_canonical.starts_with("Func('_fn', "), "{}", analyzed.xname_canonical);
         // The three value bindings (`a`, `b`, `s`) renumber by first occurrence; `s` is read twice so
         // the exact pass keeps it rather than inlining the single-use temporary.
@@ -1573,7 +1577,7 @@ mod tests {
         let (imports, f) = first_method(
             "class C { int x; C(int x) { this.x = x; } }",
         );
-        let analyzed = analyze(&imports, "C", &f);
+        let analyzed = analyze(&imports, "C", &f, true);
         // The constructor's return type is empty, and `this` reads `self`.
         assert!(analyzed.xname_canonical.contains("Path('self')"), "{}", analyzed.xname_canonical);
     }
@@ -1583,7 +1587,7 @@ mod tests {
         let (imports, f) = first_method(
             "class C { void m(int n) { if (n > 0) { while (n > 0) { n--; } } } }",
         );
-        let analyzed = analyze(&imports, "C.m", &f);
+        let analyzed = analyze(&imports, "C.m", &f, true);
         // Depth 0 is the header, body starts at depth 1, the `if` at 1, the `while` at 2.
         assert_eq!(analyzed.statements[0].depth, 0);
         let depths: Vec<u16> = analyzed.statements.iter().map(|s| s.depth).collect();
@@ -1599,7 +1603,7 @@ mod tests {
         let (imports, f) = first_method(
             "import java.util.List;\nclass C { List<String> first(List<String> xs) { return xs.get(0); } }",
         );
-        let analyzed = analyze(&imports, "C.first", &f);
+        let analyzed = analyze(&imports, "C.first", &f, true);
         // The import-resolved type slots and reports once, whatever its argument.
         assert!(analyzed.type_refs.iter().any(|t| t == "java.util.List"), "{:?}", analyzed.type_refs);
         assert!(analyzed.type3_lines[0].contains("_T0"), "{}", analyzed.type3_lines[0]);

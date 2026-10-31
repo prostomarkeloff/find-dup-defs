@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "c-canon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dup-defs-core",
  "rayon",
@@ -298,9 +298,9 @@ dependencies = [
 
 [[package]]
 name = "difflib-fast"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "687d5a84a2006cad6a1ccfee9d1b9448b762455aa336c7b5b8c02beb86bee51b"
+checksum = "e04cbe4bb1adbde05ef45149567b01b6a1bf808a879bc8088098ca08163f2fc6"
 dependencies = [
  "metal",
  "rayon",
@@ -320,7 +320,7 @@ checksum = "fd8e701084c37e7ef62d3f9e453b618130cbc0ef3573847785952a3ac3f746bf"
 
 [[package]]
 name = "dup-defs-core"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "rayon",
  "tree-sitter",
@@ -346,7 +346,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "find-dup-defs"
-version = "0.19.1"
+version = "0.19.5"
 dependencies = [
  "c-canon",
  "clap",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "go-canon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "dup-defs-core",
  "rayon",
@@ -517,7 +517,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "java-canon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dup-defs-core",
  "rayon",
@@ -1045,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "php-canon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dup-defs-core",
  "rayon",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "py-canon"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "dup-defs-core",
  "littrs-ruff-python-ast",
@@ -1207,7 +1207,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rs-canon"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "dup-defs-core",
  "proc-macro2",
@@ -1454,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "ts-canon"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "dup-defs-core",
  "oxc_allocator",

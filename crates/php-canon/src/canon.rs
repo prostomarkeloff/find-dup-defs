@@ -1256,11 +1256,12 @@ fn member_canon(d: &mut Dump<'_>, m: &ClassMember) -> String {
 /// compares what is spelled, and converge reads the stream to say where two definitions stop agreeing
 /// — a rewritten line would point the reader at code that is not there. The Type-3 lines read the
 /// normal form that keeps every statement, the exact canonical the one that also inlines single-use
-/// temporaries ([`crate::normal`]).
-pub(crate) fn analyze(name: &str, f: &Func) -> AnalyzedFn {
+/// temporaries ([`crate::normal`]). `facets` false skips the statement stream: a run that never reads
+/// facets need not build it.
+pub(crate) fn analyze(name: &str, f: &Func, facets: bool) -> AnalyzedFn {
     let cluster = Dump::new(None).func(name, f, true, true);
 
-    let statements = {
+    let statements = if facets {
         let bound = locals_of(f);
         let mut dump = Dump::new(Some(&bound));
         // The definition's own header opens the stream at depth 0 and the body starts at depth 1 — the
@@ -1270,6 +1271,8 @@ pub(crate) fn analyze(name: &str, f: &Func) -> AnalyzedFn {
         walk.push(0, head);
         walk.stmts(&f.body, 1);
         walk.out
+    } else {
+        Vec::new()
     };
 
     let statement_form = crate::normal::normal_form(f, false);

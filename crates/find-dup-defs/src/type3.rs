@@ -66,7 +66,7 @@
     clippy::cast_sign_loss
 )]
 
-use difflib_fast::simjoin::{cosine_join_with, Corpus};
+use difflib_fast::simjoin::{cosine_join_double, cosine_join_with, Corpus};
 use difflib_fast::Concurrency;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -535,8 +535,19 @@ pub fn type3_clusters(
     // which is every pair the plain cosine would have scored, and over the parts alone, which
     // reaches the pairs whose agreement is inside edited lines — a line's own weight is exactly what
     // the edit changes, so it is kept out of that vector.
-    let mut candidates = cosine_join_with(&Corpus::from_rows(&line_rows), theta, concurrency); // (j, i, cos), j < i
-    candidates.extend(cosine_join_with(&Corpus::from_rows(&part_rows), theta, concurrency));
+    let (mut candidates, part_pairs) = if matches!(concurrency, Concurrency::Cpu) {
+        // One probe pass over both corpora: each half is bit-identical to a separate join, the
+        // per-probe fixed costs (schedule, scratch, iteration) are paid once. The GPU modes keep
+        // the two separate joins (the fused entry is CPU-only; they degrade to it anyway when the
+        // device is absent).
+        cosine_join_double(&Corpus::from_rows(&line_rows), &Corpus::from_rows(&part_rows), theta)
+    } else {
+        (
+            cosine_join_with(&Corpus::from_rows(&line_rows), theta, concurrency),
+            cosine_join_with(&Corpus::from_rows(&part_rows), theta, concurrency),
+        )
+    };
+    candidates.extend(part_pairs);
     candidates.par_sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     candidates.dedup_by(|a, b| (a.0, a.1) == (b.0, b.1));
 

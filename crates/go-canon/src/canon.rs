@@ -1182,12 +1182,14 @@ pub(crate) fn interface_canon(src: &str, name: &str, type_params: Option<Node<'_
 /// agreeing — a rewritten line would point the reader at code that is not there. The Type-3 lines
 /// read the normal form that keeps every statement, the exact canonical the one that also inlines
 /// single-use temporaries ([`crate::normal`]).
-pub(crate) fn analyze(imports: &HashMap<String, Arc<str>>, name: &str, f: &Func) -> AnalyzedFn {
+pub(crate) fn analyze(imports: &HashMap<String, Arc<str>>, name: &str, f: &Func, facets: bool) -> AnalyzedFn {
     let bound = locals_of(f);
     let receiver = f.receiver.as_deref();
     let cluster = Dump::new(imports, &bound, receiver, None).func(name, f, true, true);
 
-    let statements = {
+    // The statement stream is a facet the converge/decisions/lenses passes read; a run that never
+    // reads facets skips the whole walk.
+    let statements = if facets {
         let mut dump = Dump::new(imports, &bound, receiver, Some(&bound));
         // The definition's own header opens the stream at depth 0 and the body starts at depth 1 — the
         // contract every frontend agrees on.
@@ -1196,6 +1198,8 @@ pub(crate) fn analyze(imports: &HashMap<String, Arc<str>>, name: &str, f: &Func)
         walk.push(0, head);
         walk.stmts(&f.body, 1);
         walk.out
+    } else {
+        Vec::new()
     };
 
     let statement_form = crate::normal::normal_form(f, false);

@@ -236,14 +236,19 @@ struct Builder<'a> {
     source: &'a str,
     lines: &'a LineMap<'a>,
     file: &'a Arc<str>,
-    /// What each name this file `use`s stands for — resolved once, read by every callable.
+    /// Whether this run reads per-def facets (statement stream, reached paths, decides/identity).
+    /// Off, every perspective-pass input is skipped and the defs carry empty facets.
+    facets: bool,
+    /// What each name this file `use`s stands for — resolved once, read by every callable. Empty
+    /// when `facets` is off: reached paths are a facets-only fact.
     imports: HashMap<String, Arc<str>>,
     /// Which lenses this run asked for; empty when it did not ask.
     lenses: Vec<dup_defs_core::lens::Lens>,
     /// Names the file itself introduced — what every lens erases before it looks.
     file_names: std::collections::HashSet<String>,
-    /// What the file's names stand for, as the decisions pass writes them.
-    decides: crate::decides::FileScope,
+    /// What the file's names stand for, as the decisions pass writes them. `None` when `facets` is
+    /// off: the file walk that builds it is skipped too.
+    decides: Option<crate::decides::FileScope>,
     out: &'a mut Vec<Def>,
 }
 
@@ -323,8 +328,10 @@ fn walk_item(item: &Item, prefix: &str, b: &mut Builder) {
                 b.push_lens(&qualify(prefix, &f.sig.ident.to_string()), &f.attrs, f.span(), &facts);
             }
             let name = qualify(prefix, &f.sig.ident.to_string());
-            let mut canon = DefCanon::callable(analyze_item_fn(f), &f.block, &b.imports);
-            decided(&mut canon, &b.decides, prefix, &name, &f.sig, &f.block, None, registered(&f.attrs));
+            let mut canon = DefCanon::callable(analyze_item_fn(f, b.facets), &f.block, &b.imports);
+            if let Some(scope) = &b.decides {
+                decided(&mut canon, scope, prefix, &name, &f.sig, &f.block, None, registered(&f.attrs));
+            }
             b.push(
                 &FUNCTIONS,
                 name,
@@ -342,10 +349,12 @@ fn walk_item(item: &Item, prefix: &str, b: &mut Builder) {
             let name = qualify(prefix, &s.ident.to_string());
             let mut canon = DefCanon::body(Some(struct_canon(s)));
             // A struct is a record: its literal is a constructor, called with every field by name.
-            canon.facets.identity = Some(b.decides.identity(&name));
-            if prefix.is_empty() {
-                if let Some(fields) = b.decides.record(&s.ident.to_string()) {
-                    canon.facets.params = fields.iter().map(|(f, _)| Arc::from(f.as_str())).collect();
+            if let Some(scope) = &b.decides {
+                canon.facets.identity = Some(scope.identity(&name));
+                if prefix.is_empty() {
+                    if let Some(fields) = scope.record(&s.ident.to_string()) {
+                        canon.facets.params = fields.iter().map(|(f, _)| Arc::from(f.as_str())).collect();
+                    }
                 }
             }
             b.push(&CLASSES, name, &s.attrs, s.span(), 0, canon);
@@ -377,9 +386,11 @@ fn walk_item(item: &Item, prefix: &str, b: &mut Builder) {
                     }
                     let name = format!("{owner}::{}", tf.sig.ident);
                     let mut canon =
-                        DefCanon::callable(analyze_trait_fn(tf).expect("has a default body"), body, &b.imports);
+                        DefCanon::callable(analyze_trait_fn(tf, b.facets).expect("has a default body"), body, &b.imports);
                     // A trait's method is called through the trait, by whatever holds an implementor.
-                    decided(&mut canon, &b.decides, prefix, &name, &tf.sig, body, None, true);
+                    if let Some(scope) = &b.decides {
+                        decided(&mut canon, scope, prefix, &name, &tf.sig, body, None, true);
+                    }
                     b.push(
                         &METHODS,
                         name,
@@ -406,9 +417,11 @@ fn walk_item(item: &Item, prefix: &str, b: &mut Builder) {
                         b.push_lens(&format!("{owner}::{}", f.sig.ident), &f.attrs, f.span(), &facts);
                     }
                     let name = format!("{owner}::{}", f.sig.ident);
-                    let mut canon = DefCanon::callable(analyze_impl_fn(f), &f.block, &b.imports);
+                    let mut canon = DefCanon::callable(analyze_impl_fn(f, b.facets), &f.block, &b.imports);
                     let open = im.trait_.is_some() || registered(&f.attrs);
-                    decided(&mut canon, &b.decides, prefix, &name, &f.sig, &f.block, Some(&self_ty), open);
+                    if let Some(scope) = &b.decides {
+                        decided(&mut canon, scope, prefix, &name, &f.sig, &f.block, Some(&self_ty), open);
+                    }
                     b.push(
                         &METHODS,
                         name,
@@ -447,8 +460,14 @@ pub fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec<Def> {
     let Ok(ast) = syn::parse_file(source) else { return Vec::new() };
     let lines = LineMap::new(source);
     let mut out = Vec::new();
-    // The file's `use` table, resolved once: what each bound name stands for.
-    let imports: HashMap<String, Arc<str>> = crate::canon::file_imports(&ast).into_iter().collect();
+    let facets = opts.facets;
+    // The file's `use` table, resolved once: what each bound name stands for. Facets-only data —
+    // skipped when no pass reads reached paths.
+    let imports: HashMap<String, Arc<str>> = if facets {
+        crate::canon::file_imports(&ast).into_iter().collect()
+    } else {
+        HashMap::new()
+    };
     let lenses = dup_defs_core::lens::enabled_lenses(opts);
     // Every lens reads the file's own bound names, so they are collected once per file.
     let file_names = (!lenses.is_empty()).then(|| crate::lenses::file_bound_names(&ast));
@@ -456,10 +475,11 @@ pub fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec<Def> {
         source,
         lines: &lines,
         file,
+        facets,
         imports,
         lenses,
         file_names: file_names.unwrap_or_default(),
-        decides: crate::decides::FileScope::new(file, &ast),
+        decides: facets.then(|| crate::decides::FileScope::new(file, &ast)),
         out: &mut out,
     };
     walk_items(&ast.items, "", &mut b);
@@ -491,7 +511,7 @@ mod tests {
     fn lens_record(src: &str, name: &str) -> Vec<String> {
         let f: Arc<str> = Arc::from("t.rs");
         let kinds = vec!["lenses".to_owned()];
-        let opts = ScanOpts { kinds: Some(&kinds) };
+        let opts = ScanOpts { kinds: Some(&kinds), facets: true };
         scan_source(src, &f, &opts)
             .into_iter()
             .find(|d| d.kind.id == "lenses" && d.name == name)

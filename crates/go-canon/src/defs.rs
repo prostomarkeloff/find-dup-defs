@@ -27,6 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use dup_defs_core::lens::{enabled_lenses, lens_def, DefSite, Lens, LensFacts};
+use dup_defs_core::decide::DecisionFacts;
 use dup_defs_core::{count_loc, Analysis, AnalyzedFn, CanonDialect, Def, Facets, KindSpec, LineMap, ScanOpts};
 use tree_sitter::Node;
 
@@ -167,6 +168,9 @@ struct Builder<'a> {
     file_names: HashSet<String>,
     /// What the file's names stand for, as the decisions pass writes them.
     decides: FileScope,
+    /// Whether any pass this run reads facets — gates the statement stream, decide facts, reached
+    /// paths and identities that only those passes read.
+    facets: bool,
     out: Vec<Def>,
 }
 
@@ -222,9 +226,13 @@ impl Builder<'_> {
             let facts = crate::lenses::callable_facts(c, self.source, &self.imports, &locals, &self.file_names, scope);
             self.push_lens(&name, decl, &facts);
         }
-        let read = decides(&func, &self.decides, open);
+        let read = if self.facets {
+            decides(&func, &self.decides, open)
+        } else {
+            DecisionFacts::default()
+        };
         let AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, type_refs, type3_units, statements, size } =
-            analyze(&self.imports, own_name, &func);
+            analyze(&self.imports, own_name, &func, self.facets);
         let canon = DefCanon {
             cluster: Some(cluster_canonical),
             analysis: Some(Analysis {
@@ -237,9 +245,9 @@ impl Builder<'_> {
             }),
             facets: Facets {
                 statements,
-                reaches: reached_paths(c.body, self.source, &self.imports),
+                reaches: if self.facets { reached_paths(c.body, self.source, &self.imports) } else { Vec::new() },
                 decides: read.atoms,
-                identity: Some(self.decides.identity(&name)),
+                identity: if self.facets { Some(self.decides.identity(&name)) } else { None },
                 params: read.params,
                 calls: read.calls,
                 mentions: read.mentions,
@@ -284,10 +292,12 @@ impl Builder<'_> {
             let (kind, canon) = match (spec.kind(), ty.kind()) {
                 ("type_spec", "struct_type") => {
                     let mut canon = DefCanon::body(Some(struct_canon(self.source, name, type_params, ty)));
-                    // A struct is a record: its literal is a constructor, called with its fields.
-                    canon.facets.identity = Some(self.decides.identity(name));
-                    if let Some(fields) = self.decides.record(name) {
-                        canon.facets.params = fields.iter().map(|(f, _)| Arc::from(f.as_str())).collect();
+                    if self.facets {
+                        // A struct is a record: its literal is a constructor, called with its fields.
+                        canon.facets.identity = Some(self.decides.identity(name));
+                        if let Some(fields) = self.decides.record(name) {
+                            canon.facets.params = fields.iter().map(|(f, _)| Arc::from(f.as_str())).collect();
+                        }
                     }
                     (&CLASSES, canon)
                 }
@@ -328,6 +338,7 @@ pub fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec<Def> {
     let Some(tree) = parse(source) else { return Vec::new() };
     let root = tree.root_node();
     let lines = LineMap::new(source);
+    let facets = opts.facets;
     let lenses = enabled_lenses(opts);
     // Every lens reads the file's own names, so they are collected once per file — and only when asked.
     let file_names =
@@ -340,7 +351,8 @@ pub fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec<Def> {
         imports: HashMap::new(),
         lenses,
         file_names,
-        decides: FileScope::new(file, root, source, &imports),
+        decides: FileScope::new(file, root, source, &imports, facets),
+        facets,
         out: Vec::new(),
     };
     b.imports = imports;
@@ -624,7 +636,7 @@ func real(x int) int { y := x + 1; return y * 2 }
     fn lens_record(src: &str, name: &str) -> Vec<String> {
         let f: Arc<str> = Arc::from("t.go");
         let kinds = vec!["lenses".to_owned()];
-        let opts = ScanOpts { kinds: Some(&kinds) };
+        let opts = ScanOpts { kinds: Some(&kinds), facets: true };
         scan_source(src, &f, &opts)
             .into_iter()
             .find(|d| d.kind.id == "lenses" && d.name == name)

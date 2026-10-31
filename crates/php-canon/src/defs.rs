@@ -218,6 +218,9 @@ struct Builder<'a> {
     file_names: HashSet<String>,
     /// The kinds and names already reported: a second definition of one is another configuration's.
     seen: HashSet<(&'static str, String)>,
+    /// Whether the pipeline reads the per-definition facets: gate the statement stream, the decide
+    /// facts, the reached paths and the identity on it, as the perspective passes are the only readers.
+    facets: bool,
     out: Vec<Def>,
 }
 
@@ -279,22 +282,31 @@ impl Builder<'_> {
             self.push_lens(&name, decl, &facts);
         }
         // A method is dispatched through every class that inherits it, and a magic one by the runtime:
-        // no call names it alone.
-        let read = decides(func, scope, method || magic(own_name));
+        // no call names it alone. Every piece here beyond the canonicals is a facet — skipped when no
+        // pass will read it.
+        let read = if self.facets {
+            decides(func, scope, method || magic(own_name))
+        } else {
+            dup_defs_core::decide::DecisionFacts::default()
+        };
         let AnalyzedFn { cluster_canonical, xname_canonical, type3_lines, type_refs, type3_units, statements, size } =
-            analyze(own_name, func);
-        let identity = match owner {
-            Some(o) => scope.method_identity(&o.decl.name, own_name),
-            None => scope.identity(own_name),
+            analyze(own_name, func, self.facets);
+        let identity = if self.facets {
+            match owner {
+                Some(o) => Some(scope.method_identity(&o.decl.name, own_name)),
+                None => Some(scope.identity(own_name)),
+            }
+        } else {
+            None
         };
         let canon = DefCanon {
             cluster: Some(cluster_canonical),
             analysis: Some(Analysis { xname_canonical, type3_lines, type_refs, type3_units, size, canon_dialect: CanonDialect::Php }),
             facets: Facets {
                 statements,
-                reaches: reaches(func, scope.names, owner),
+                reaches: if self.facets { reaches(func, scope.names, owner) } else { Vec::new() },
                 decides: read.atoms,
-                identity: Some(identity),
+                identity,
                 params: read.params,
                 calls: read.calls,
                 mentions: read.mentions,
@@ -333,7 +345,7 @@ impl Builder<'_> {
         let parent = c.extends.first().map(|p| names.resolve(NameKind::Class, p).0);
         let scope = FileScope { names, class: Some(full), parent };
         let mut canon = DefCanon::body(Some(class_canon(&c)));
-        if c.kind != "interface" {
+        if c.kind != "interface" && self.facets {
             // A class is called with what its constructor takes.
             canon.facets.identity = Some(scope.identity(&c.name));
             let ctor = c.members.iter().find_map(|m| match m {
@@ -485,14 +497,15 @@ pub fn scan_source(source: &str, file: &Arc<str>, opts: &ScanOpts) -> Vec<Def> {
     let Some(tree) = parse(source) else { return Vec::new() };
     let root = tree.root_node();
     let lines = LineMap::new(source);
-    let namespaced = blocks(root, source);
+    let facets = opts.facets;
+    let namespaced = blocks(root, source, facets);
     let lenses = enabled_lenses(opts);
     let file_names = if lenses.is_empty() {
         HashSet::new()
     } else {
         namespaced.iter().flat_map(|(_, items)| file_bound_names(&top_items(items), source)).collect()
     };
-    let mut b = Builder { source, lines: &lines, file, lenses, file_names, seen: HashSet::new(), out: Vec::new() };
+    let mut b = Builder { source, lines: &lines, file, lenses, file_names, seen: HashSet::new(), facets, out: Vec::new() };
     for (names, items) in &namespaced {
         for item in top_items(items) {
             match item.kind() {
@@ -516,7 +529,7 @@ pub(crate) fn file_sites(source: &str, path: &str, known: &HashSet<&str>) -> Vec
     let Some(tree) = parse(source) else { return Vec::new() };
     let mut funcs = Vec::new();
     let mut top: Vec<Stmt> = Vec::new();
-    for (_, items) in blocks(tree.root_node(), source) {
+    for (_, items) in blocks(tree.root_node(), source, false) {
         for item in top_items(&items) {
             match item.kind() {
                 "function_definition" => funcs.push(lower_func(item, source)),
@@ -814,7 +827,7 @@ class Ctl {
     fn lens_record(src: &str, name: &str) -> Vec<String> {
         let f: Arc<str> = Arc::from("t.php");
         let kinds = vec!["lenses".to_owned()];
-        let opts = ScanOpts { kinds: Some(&kinds) };
+        let opts = ScanOpts { kinds: Some(&kinds), facets: true };
         scan_source(src, &f, &opts)
             .into_iter()
             .find(|d| d.kind.id == "lenses" && d.name == name)

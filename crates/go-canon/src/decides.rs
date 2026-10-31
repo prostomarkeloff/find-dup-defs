@@ -116,12 +116,17 @@ pub(crate) struct FileScope {
 }
 
 impl FileScope {
-    pub(crate) fn new(file: &str, root: Node<'_>, src: &str, imports: &HashMap<String, Arc<str>>) -> Self {
+    pub(crate) fn new(file: &str, root: Node<'_>, src: &str, imports: &HashMap<String, Arc<str>>, facets: bool) -> Self {
         let mut scope = Self {
             package: package_path(file),
             imports: imports.iter().map(|(k, v)| (k.clone(), v.to_string())).collect(),
             records: HashMap::new(),
         };
+        if !facets {
+            // The records walk serves only the decisions pass (a record's constructor params); a run
+            // that never reads facets skips it.
+            return scope;
+        }
         let mut records = HashMap::new();
         for decl in kids(root).into_iter().filter(|k| k.kind() == "type_declaration") {
             for spec in kids(decl).into_iter().filter(|k| k.kind() == "type_spec") {
@@ -1041,7 +1046,7 @@ mod tests {
         let tree = parse(src).expect("fixture parses");
         let root = tree.root_node();
         let imports = file_imports(root, src);
-        let scope = FileScope::new("shop/orders/orders.go", root, src, &imports);
+        let scope = FileScope::new("shop/orders/orders.go", root, src, &imports, true);
         let decl = kids(root)
             .into_iter()
             .find(|k| matches!(k.kind(), "function_declaration" | "method_declaration"))

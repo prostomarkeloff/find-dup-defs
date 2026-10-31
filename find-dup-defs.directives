@@ -96,7 +96,7 @@ de-escalate:<functions>analyze_item_fn@*canon/src/canon.rs=per-syn-item-type ent
 de-escalate:<functions>type3_walk@*canon/src/canon.rs=per-language statement walker, different node types
 de-escalate:<classes>UseWalk@*canon/src/canon.rs=per-language site walker, different node types
 de-escalate:<methods>UseWalk::site@*canon/src/canon.rs=per-language site walker over its own Dump
-de-escalate:<methods>Dump::{expr,anchoring,hunting,block,mention,type_name,elements,opt_expr,opt_ty,case,case_head}@*canon/src/canon.rs=thin per-crate Dump method
+de-escalate:<methods>Dump::{node,expr,anchoring,hunting,block,mention,type_name,elements,opt_expr,opt_ty,case,case_head}@*canon/src/canon.rs=thin per-crate Dump method
 
 # The normal forms. Each frontend rewrites a body over its own parser AST, so the rule walks — which
 # names a body reads, whether an expression can have effects, the substitution that inlines a

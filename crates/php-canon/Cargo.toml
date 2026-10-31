@@ -1,6 +1,6 @@
 [package]
 name = "php-canon"
-version = "0.1.0"
+version = "0.1.1"
 description = "PHP source → structural canonicalization + file-scope definition scan (tree-sitter parser). The PHP frontend for find-dup-defs."
 keywords = ["php", "ast", "canonicalize", "clone"]
 categories = ["parser-implementations", "development-tools"]
@@ -14,7 +14,7 @@ name = "php_canon"
 
 [dependencies]
 # The frontend↔engine contract (Def / KindSpec / Analysis / Frontend / LineMap) this crate implements.
-dup-defs-core = { path = "../dup-defs-core", features = ["tree-sitter"], version = "0.4.3" }
+dup-defs-core = { path = "../dup-defs-core", features = ["tree-sitter"], version = "0.4.6" }
 # tree-sitter: an error-recovering incremental parser; one bad declaration costs that declaration,
 # not the file. The PHP grammar is the tree-sitter project's own.
 tree-sitter = "0.27"

@@ -71,6 +71,13 @@ fn module_of(mut segments: Vec<String>) -> String {
 }
 
 impl FileScope {
+    /// A scope with no imports and no defined names — for a run that never reads facets.
+    pub(crate) fn empty(file: &str) -> Self {
+        let trimmed = file.strip_prefix("./").unwrap_or(file);
+        let module = module_of(trimmed.split(['/', '\\']).map(str::to_owned).collect());
+        Self { imports: HashMap::new(), module, defined: HashSet::new() }
+    }
+
     pub(crate) fn new(file: &str, program: &ast::Program<'_>) -> Self {
         let trimmed = file.strip_prefix("./").unwrap_or(file);
         let module = module_of(trimmed.split(['/', '\\']).map(str::to_owned).collect());
