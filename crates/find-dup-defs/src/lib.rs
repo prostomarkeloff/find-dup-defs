@@ -1590,3 +1590,402 @@ mod type3_tests {
         assert!(pairs(&defs).is_empty(), "one interface over two different steps is not one definition written twice");
     }
 }
+
+#[cfg(test)]
+mod pipeline_unit_tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use dup_defs_core::{Analysis, CanonDialect, Def, Facets, KindSpec};
+
+    use super::{
+        build_rationer, callable_kind, candidates, cluster, cluster_distinct, is_excluded_dir,
+        large_name_groups, one_per_content, pass_name_gated, pass_patternology, section_index,
+        type3_inputs, Finding, GpuMode, PipelineOpts, Severity, PATTERN_SECTION_OFFSET,
+    };
+
+    fn method_kind() -> &'static KindSpec {
+        &dup_defs_core::kinds::METHODS
+    }
+
+    fn function_kind() -> &'static KindSpec {
+        &dup_defs_core::kinds::FUNCTIONS
+    }
+
+    fn use_profile_kind() -> &'static KindSpec {
+        &dup_defs_core::kinds::USE_PROFILES
+    }
+
+    /// A body-kind `Def` with an alpha-renamed canonical, enough for the name-gated and thickness
+    /// machinery to cluster it and compute a thickness.
+    fn body_def(name: &str, kind: &'static KindSpec, canonical: &str, loc: usize, args: usize) -> Def {
+        Def {
+            lang: "test",
+            kind,
+            name: name.to_owned(),
+            file: Arc::from(format!("{name}.py")),
+            line: 0,
+            col: 0,
+            loc,
+            args,
+            text_orig: format!("def {name}(): pass"),
+            cluster_canonical: Some(canonical.to_owned()),
+            analysis: None,
+            thickness: None,
+            facets: Facets::default(),
+        }
+    }
+
+    // ── is_excluded_dir ───────────────────────────────────────────────────
+
+    #[test]
+    fn excluded_dirs_are_the_blacklist_plus_egg_info() {
+        assert!(is_excluded_dir("node_modules"), "blacklisted dir is excluded");
+        assert!(is_excluded_dir(".git"), "blacklisted vcs dir is excluded");
+        assert!(is_excluded_dir("pkg.egg-info"), "egg-info dirs are excluded by suffix");
+        assert!(!is_excluded_dir("src"), "a plain source dir is not excluded");
+        assert!(!is_excluded_dir("mynode_modules"), "a bare suffix match is not exclusion");
+    }
+
+    // ── Severity::from_index ──────────────────────────────────────────────
+
+    #[test]
+    fn severity_index_round_trips_and_clamps() {
+        assert_eq!(Severity::from_index(0), Severity::Error);
+        assert_eq!(Severity::from_index(1), Severity::Warning);
+        assert_eq!(Severity::from_index(2), Severity::Info);
+        assert_eq!(Severity::from_index(7), Severity::Info, "above the ladder clamps to INFO");
+        assert_eq!(Severity::from_index(-4), Severity::Error, "below the ladder clamps to ERROR");
+    }
+
+    // ── section_index ─────────────────────────────────────────────────────
+
+    #[test]
+    fn section_index_offsets_each_pass() {
+        let kind = function_kind();
+        let mut f = Finding {
+            pass: "name",
+            kind,
+            name: "n".to_owned(),
+            severity: Severity::Warning,
+            min_sim: Some(1.0),
+            loc: 1,
+            args: 0,
+            thickness: 0.0,
+            snippet: String::new(),
+            notes: Vec::new(),
+            members: Vec::new(),
+            pattern: None,
+            facets: Vec::new(),
+        };
+        assert_eq!(section_index(&f), 1, "name pass on a function has offset 0");
+        f.pass = "pattern";
+        assert_eq!(section_index(&f), 1 + PATTERN_SECTION_OFFSET, "patternology files as an appendix");
+        f.pass = "decision-family";
+        assert_eq!(
+            section_index(&f),
+            1 + crate::decide::DECISION_FAMILY_SECTION_OFFSET,
+            "decision families file past every other pass"
+        );
+        f.pass = "name";
+        f.kind = &dup_defs_core::kinds::CONSTANTS;
+        assert_eq!(section_index(&f), 0, "a non-fn_like kind never takes a pass offset");
+    }
+
+    // ── callable_kind ─────────────────────────────────────────────────────
+
+    #[test]
+    fn callable_kind_labels_all_method_groups_as_method() {
+        let defs = vec![body_def("m1", method_kind(), "a", 1, 0), body_def("m2", method_kind(), "a", 1, 0)];
+        assert_eq!(callable_kind(&defs, &[0, 1]).id, "methods");
+    }
+
+    #[test]
+    fn callable_kind_labels_a_mixed_group_as_function() {
+        let defs = vec![body_def("m", method_kind(), "a", 1, 0), body_def("f", function_kind(), "a", 1, 0)];
+        assert_eq!(callable_kind(&defs, &[0, 1]).id, "functions", "a method+function mix reports as a function");
+    }
+
+    #[test]
+    fn callable_kind_does_not_take_the_first_member_as_a_function_fallback() {
+        // A non-method, non-function kind first in the list: the function arm must still win over
+        // the first member's own kind.
+        let defs = vec![body_def("u", use_profile_kind(), "a", 1, 0), body_def("f", function_kind(), "a", 1, 0)];
+        assert_eq!(callable_kind(&defs, &[0, 1]).id, "functions");
+    }
+
+    // ── candidates ────────────────────────────────────────────────────────
+
+    #[test]
+    fn candidates_admits_partners_under_both_bounds() {
+        assert_eq!(candidates(&[], 0.5), Vec::<usize>::new(), "nothing has a partner");
+        assert_eq!(candidates(&["a", "b"], 0.0), vec![0, 1], "a non-positive threshold admits every pair");
+        assert_eq!(candidates(&["ab", "ab"], 0.5), vec![0, 1], "identical strings partner");
+        assert_eq!(candidates(&["", ""], 0.5), vec![0, 1], "two empty strings share the trivial bound");
+        assert_eq!(candidates(&["ab", "cd"], 0.9), Vec::<usize>::new(), "disjoint multisets never partner");
+        assert_eq!(candidates(&["abc", "abd"], 0.6), vec![0, 1], "a shared prefix passes the multiset bound");
+        assert_eq!(candidates(&["abc", "abd"], 0.9), Vec::<usize>::new(), "below the multiset bound there is no partner");
+        assert_eq!(candidates(&["a", "abcdefgh"], 0.9), Vec::<usize>::new(), "the length bound rejects a lopsided pair");
+        assert_eq!(candidates(&["ab", "ac", "xy"], 0.5), vec![0, 1], "only the shared character is a partner");
+        assert_eq!(candidates(&["bc", "ac"], 0.5), vec![0, 1], "the greater arm of the multiset merge is walked");
+    }
+
+    // ── cluster_distinct ──────────────────────────────────────────────────
+
+    fn cd(canons: &[&str], threshold: f64) -> Vec<(Vec<usize>, f64)> {
+        cluster_distinct(&build_rationer(GpuMode::Cpu), canons, threshold)
+    }
+
+    #[test]
+    fn cluster_distinct_handles_a_single_canonical() {
+        assert_eq!(cd(&["foo", "foo"], 0.5), vec![(vec![0, 1], 1.0)]);
+        assert_eq!(cd(&["foo"], 0.5), Vec::<(Vec<usize>, f64)>::new());
+    }
+
+    #[test]
+    fn cluster_distinct_clusters_two_similar_canonicals() {
+        let got = cd(&["foobar", "foobaz"], 0.5);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, vec![0, 1]);
+    }
+
+    #[test]
+    fn cluster_distinct_clusters_three_similar_canonicals() {
+        let got = cd(&["foobar", "foobaz", "foobat"], 0.5);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn cluster_distinct_keeps_both_orientations_of_a_repeated_canonical() {
+        // `aaba` occurs non-contiguously at positions 0 and 2, so its second representative must be
+        // kept: the reported minimum is the lower of ratio("aaba","baaa") = 0.75 and the reverse
+        // orientation 0.5.
+        assert_eq!(cd(&["aaba", "baaa", "aaba"], 0.5), vec![(vec![0, 1, 2], 0.5)]);
+    }
+
+    // ── large_name_groups ─────────────────────────────────────────────────
+
+    #[test]
+    fn large_name_groups_counts_by_kind_and_name() {
+        let defs = vec![
+            body_def("f", function_kind(), "a", 1, 0),
+            body_def("f", function_kind(), "b", 1, 0),
+            body_def("f", function_kind(), "c", 1, 0),
+            body_def("g", function_kind(), "a", 1, 0),
+            body_def("m", method_kind(), "a", 1, 0),
+        ];
+        let groups = large_name_groups(&defs, 2);
+        assert_eq!(groups.len(), 1, "only the tripled (functions, f) group reaches the floor");
+        assert_eq!(groups[0].1, "f");
+        assert_eq!(groups[0].2, 3);
+    }
+
+    // ── pass_name_gated ───────────────────────────────────────────────────
+
+    #[test]
+    fn max_name_group_drops_an_overlarge_group() {
+        let defs = vec![
+            body_def("f", function_kind(), "same", 2, 0),
+            body_def("f", function_kind(), "same", 2, 0),
+            body_def("f", function_kind(), "same", 2, 0),
+        ];
+        let rationer = build_rationer(GpuMode::Cpu);
+        let capped = pass_name_gated(&defs, 0.5, 0.85, 2, Some(2), &rationer);
+        assert!(capped.is_empty(), "a group above the cap is skipped");
+        let exact = pass_name_gated(&defs, 0.5, 0.85, 2, Some(3), &rationer);
+        assert_eq!(exact.len(), 1, "a group at the cap is clustered");
+    }
+
+    // ── type3_inputs (type3_rows) ─────────────────────────────────────────
+
+    #[test]
+    fn type3_inputs_excludes_fn_like_defs_without_lines() {
+        let a = py_canon::analyze_functions(&["def f():\n    return 1\n".to_owned()])
+            .pop()
+            .flatten()
+            .expect("a function");
+        let mut empty = body_def("f", function_kind(), "x", 2, 0);
+        empty.analysis = Some(Analysis {
+            xname_canonical: a.xname_canonical.clone(),
+            type3_lines: Vec::new(), // fn-like but no body lines
+            type_refs: Vec::new(),
+            type3_units: Vec::new(),
+            size: a.size,
+            canon_dialect: CanonDialect::CPythonAst,
+        });
+        let inputs = type3_inputs(&[empty]);
+        assert!(inputs.names.is_empty(), "a fn-like def with no type-3 lines is not a row");
+    }
+
+    // ── cluster (thickness demotion / escalation) ─────────────────────────
+
+    fn opts() -> PipelineOpts {
+        PipelineOpts::with_paths(vec![PathBuf::from(".")])
+    }
+
+    fn name_finding(defs: &[Def], opts: &PipelineOpts) -> Vec<Finding> {
+        cluster(defs.to_vec(), opts)
+    }
+
+    /// Two identical body defs form one name-gated ERROR cluster with a small (low-volume) thickness.
+    fn duplicated_defs() -> Vec<Def> {
+        vec![body_def("f", function_kind(), "canon", 2, 0), body_def("f", function_kind(), "canon", 2, 0)]
+    }
+
+    #[test]
+    fn error_thickness_demotes_a_thin_error_to_warning() {
+        let mut o = opts();
+        o.error_thickness = 0.5;
+        let findings = name_finding(&duplicated_defs(), &o);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].thickness < 0.5, "the duplicate is a thin two-liner");
+        assert_eq!(findings[0].severity, Severity::Warning, "a thin ERROR is demoted to WARNING");
+    }
+
+    #[test]
+    fn error_thickness_leaves_a_thick_error_alone() {
+        let mut o = opts();
+        o.error_thickness = 0.1;
+        let findings = name_finding(&duplicated_defs(), &o);
+        assert_eq!(findings[0].severity, Severity::Error, "a duplicate above the floor stays ERROR");
+    }
+
+    #[test]
+    fn warning_thickness_demotes_a_thin_warning_to_info() {
+        // Near-copies: similar but not identical canonicals cluster as WARNING.
+        let defs = vec![body_def("f", function_kind(), "foobar", 2, 0), body_def("f", function_kind(), "foobaz", 2, 0)];
+        let mut o = opts();
+        o.warning_thickness = 0.5;
+        let findings = name_finding(&defs, &o);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Info, "a thin WARNING is demoted to INFO");
+    }
+
+    #[test]
+    fn escalate_thickness_promotes_a_thick_warning_to_error() {
+        let defs = vec![body_def("f", function_kind(), "foobar", 2, 0), body_def("f", function_kind(), "foobaz", 2, 0)];
+        let mut o = opts();
+        o.escalate_thickness = 0.01;
+        let findings = name_finding(&defs, &o);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Error, "a thick non-ERROR is escalated to ERROR");
+    }
+
+    #[test]
+    fn pattern_min_thickness_drops_only_thin_pattern_findings() {
+        let a = "FunctionDef('_fn', arguments([], []), [Assign([Name('_v0', Store)], Call(Name('AuthRefreshToken', Load), [Constant('x')], [])), Expr(Call(Attribute(Name('session', Load), 'add', Load), [Name('_v0', Load)], [])), Return(Name('_v0', Load))], [], None)";
+        let b = "FunctionDef('_fn', arguments([], []), [Assign([Name('_v0', Store)], Call(Name('Clientspace', Load), [Constant('y')], [])), Expr(Call(Attribute(Name('session', Load), 'add', Load), [Name('_v0', Load)], [])), Return(Name('_v0', Load))], [], None)";
+        let defs = vec![
+            pattern_def("create", a, CanonDialect::CPythonAst),
+            pattern_def("create", b, CanonDialect::CPythonAst),
+        ];
+        let mut o = opts();
+        o.patternology = true;
+        o.pattern_min_thickness = 0.5;
+        let findings = cluster(defs, &o);
+        assert!(findings.iter().any(|f| f.pass == "name"), "the name-gated finding is not a pattern candidate and survives");
+        assert!(findings.iter().all(|f| f.pass != "pattern"), "a thin pattern candidate is dropped below the floor");
+    }
+
+    // ── pass_patternology ─────────────────────────────────────────────────
+
+    fn pattern_def(name: &str, canonical: &str, dialect: CanonDialect) -> Def {
+        let mut d = body_def(name, function_kind(), "unused", 3, 0);
+        d.analysis = Some(Analysis {
+            xname_canonical: canonical.to_owned(),
+            type3_lines: Vec::new(),
+            type_refs: Vec::new(),
+            type3_units: Vec::new(),
+            size: 0,
+            canon_dialect: dialect,
+        });
+        d
+    }
+
+    fn pattern_findings(defs: &[Def]) -> Vec<Finding> {
+        pass_patternology(defs, 0.7, 2, GpuMode::Cpu)
+    }
+
+    #[test]
+    fn patternology_emits_a_whole_function_helper() {
+        let a = "FunctionDef('_fn', arguments([], []), [Assign([Name('_v0', Store)], Call(Name('AuthRefreshToken', Load), [Constant('x')], [])), Expr(Call(Attribute(Name('session', Load), 'add', Load), [Name('_v0', Load)], [])), Return(Name('_v0', Load))], [], None)";
+        let b = "FunctionDef('_fn', arguments([], []), [Assign([Name('_v0', Store)], Call(Name('Clientspace', Load), [Constant('y')], [])), Expr(Call(Attribute(Name('session', Load), 'add', Load), [Name('_v0', Load)], [])), Return(Name('_v0', Load))], [], None)";
+        let defs = vec![
+            pattern_def("create_a", a, CanonDialect::CPythonAst),
+            pattern_def("create_b", b, CanonDialect::CPythonAst),
+        ];
+        let findings = pattern_findings(&defs);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].pass, "pattern");
+        // A tight family (two near-identical shapes) clears the WARNING theta.
+        assert_eq!(findings[0].severity, Severity::Warning);
+        let pat = findings[0].pattern.as_ref().expect("a pattern payload");
+        assert_eq!(pat.granularity, "whole-fn");
+        assert_eq!(pat.support, 2);
+        assert_eq!(findings[0].loc, 3, "a whole-fn helper removes the member's own length");
+        assert_eq!(pat.loc_saved, 3, "(support - 1) * per-site LOC");
+    }
+
+    #[test]
+    fn patternology_files_a_three_way_family() {
+        let a = "FunctionDef('_fn', arguments([], []), [Assign([Name('_v0', Store)], Call(Name('A1', Load), [Constant('x')], [])), Expr(Call(Attribute(Name('session', Load), 'add', Load), [Name('_v0', Load)], [])), Return(Name('_v0', Load))], [], None)";
+        let b = "FunctionDef('_fn', arguments([], []), [Assign([Name('_v0', Store)], Call(Name('A2', Load), [Constant('y')], [])), Expr(Call(Attribute(Name('session', Load), 'add', Load), [Name('_v0', Load)], [])), Return(Name('_v0', Load))], [], None)";
+        let c = "FunctionDef('_fn', arguments([], []), [Assign([Name('_v0', Store)], Call(Name('A3', Load), [Constant('z')], [])), Expr(Call(Attribute(Name('session', Load), 'add', Load), [Name('_v0', Load)], [])), Return(Name('_v0', Load))], [], None)";
+        let defs = vec![
+            pattern_def("a", a, CanonDialect::CPythonAst),
+            pattern_def("b", b, CanonDialect::CPythonAst),
+            pattern_def("c", c, CanonDialect::CPythonAst),
+        ];
+        let findings = pattern_findings(&defs);
+        assert!(!findings.is_empty(), "three mutually-similar shapes form a family");
+    }
+
+    #[test]
+    fn patternology_mines_a_subblock_motif_and_sizes_it_by_statement() {
+        let fa = "FunctionDef('_fn', arguments([], []), [Expr(Call(Name('log'), [Constant('a')], [])), Assign([Name('_v0', Store)], Call(Attribute(Name('self', Load), 'get', Load), [Name('_v1', Load)], [])), If(Compare(Name('_v0', Load), [Is], [Constant(None)]), [Raise(Call(Name('KeyError', Load), [Name('_v1', Load)], []))], []), Return(Name('_v0', Load))], [], None)";
+        let fb = "FunctionDef('_fn', arguments([], []), [AugAssign(Name('_v2', Store), Add, Constant(1)), Assign([Name('_v0', Store)], Call(Attribute(Name('self', Load), 'get', Load), [Name('_v1', Load)], [])), If(Compare(Name('_v0', Load), [Is], [Constant(None)]), [Raise(Call(Name('LookupError', Load), [Name('_v1', Load)], []))], []), Pass()], [], None)";
+        let defs = vec![
+            pattern_def("get_a", fa, CanonDialect::CPythonAst),
+            pattern_def("get_b", fb, CanonDialect::CPythonAst),
+        ];
+        let findings = pattern_findings(&defs);
+        assert_eq!(findings.len(), 1);
+        let pat = findings[0].pattern.as_ref().expect("a pattern payload");
+        assert_eq!(pat.granularity, "sub-block");
+        assert_eq!(pat.support, 2);
+        // per-site LOC = the motif's statement count (one `;`), not the host function's length.
+        assert_eq!(findings[0].loc, 2);
+        assert_eq!(pat.loc_saved, 2);
+    }
+
+    #[test]
+    fn patternology_routes_the_typescript_dialect() {
+        let make_user = "Func('_fn', Params(Param(Bind('_v0'))), Block(Var('const', [Decl(Bind('_v1'), New(Id('User'), [Id('_v0')]))]), Expr(Call(Member(Id('store'), 'add', ''), '', [Id('_v1')])), Return(Id('_v1'))), async=false gen=false)";
+        let make_order = "Func('_fn', Params(Param(Bind('_v0'))), Block(Var('const', [Decl(Bind('_v1'), New(Id('Order'), [Id('_v0')]))]), Expr(Call(Member(Id('store'), 'add', ''), '', [Id('_v1')])), Return(Id('_v1'))), async=false gen=false)";
+        let defs = vec![
+            pattern_def("make_user", make_user, CanonDialect::Other),
+            pattern_def("make_order", make_order, CanonDialect::Other),
+        ];
+        let findings = pattern_findings(&defs);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].pattern.as_ref().expect("payload").granularity, "whole-fn");
+    }
+
+    // ── one_per_content ───────────────────────────────────────────────────
+
+    #[test]
+    fn one_per_content_parses_identical_files_once() {
+        let dir = std::env::temp_dir().join(format!("fdd-onepc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let a = dir.join("a.py");
+        let b = dir.join("b.py");
+        std::fs::write(&a, b"def f():\n    return 1\n").expect("write a");
+        std::fs::write(&b, b"def f():\n    return 1\n").expect("write b");
+        let files: Vec<Arc<str>> = vec![Arc::from(a.to_string_lossy().as_ref()), Arc::from(b.to_string_lossy().as_ref())];
+        let (to_parse, twins) = one_per_content(&files);
+        assert_eq!(to_parse.len(), 1, "one representative is parsed");
+        assert_eq!(twins.len(), 1, "the copy is recorded as a twin");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

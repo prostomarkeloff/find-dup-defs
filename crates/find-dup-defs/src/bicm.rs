@@ -542,4 +542,119 @@ mod tests {
         assert_eq!(bh_threshold(&p, 10.0, 0.05), Some(0.008));
         assert_eq!(bh_threshold(&[0.9], 10.0, 0.05), None);
     }
+
+    #[test]
+    fn the_fit_handles_certain_rows_and_columns() {
+        // Two full rows (degree = n_cols = 5) and two full columns (degree = n_rows = 6): the
+        // certain-edge short-circuit and the certain subtractions both matter, and the non-full
+        // classes leave the fixed point with real work to do.
+        let rows = [5, 5, 3, 3, 4, 4];
+        let cols = [6, 6, 4, 4, 4];
+        let model = Bicm::fit(&rows, &cols);
+        assert_eq!(model.rows, [3, 4, 5]);
+        assert_eq!(model.cols, [4, 6]);
+        assert!(close(model.x[0], 0.474_676_041_495_367_2, 1e-12), "x0 {}", model.x[0]);
+        assert!(close(model.x[1], 1.898_704_164_784_100_3, 1e-12), "x1 {}", model.x[1]);
+        assert!(close(model.y[0], 1.053_349_982_716_547_1, 1e-12), "y0 {}", model.y[0]);
+        assert!(close(model.residual, 7.006_928_370_856_258e-11, 1e-12), "resid {}", model.residual);
+    }
+
+    #[test]
+    fn a_certain_binomial_places_all_mass_at_n() {
+        // q = 1.0: the whole law is the single outcome B = n, exercised both with upto past n
+        // (mass inside the vector) and upto before n (the tail stays one).
+        let (pmf, upper) = binomial_head(5, 1.0, 7);
+        assert_eq!(upper.len(), 8);
+        assert!(close(pmf[5], 1.0, 0.0), "pmf[5] {}", pmf[5]);
+        assert!(close(pmf[3], 0.0, 0.0), "pmf[3] {}", pmf[3]);
+        for (t, &u) in upper.iter().enumerate() {
+            assert!(close(u, if t <= 5 { 1.0 } else { 0.0 }, 0.0), "upper[{t}] {u}");
+        }
+
+        let (pmf, upper) = binomial_head(10, 1.0, 3);
+        assert_eq!(upper.len(), 4);
+        for (t, &p) in pmf.iter().enumerate() {
+            assert!(close(p, 0.0, 0.0), "pmf[{t}] {p}");
+        }
+        for (t, &u) in upper.iter().enumerate() {
+            assert!(close(u, 1.0, 0.0), "upper[{t}] {u}");
+        }
+    }
+
+    #[test]
+    fn a_binomial_upper_tail_at_the_head_complements_the_head() {
+        // Bin(10, 0.5), P(B >= 3) = 1 - P(B <= 2) = 1 - 56/1024 = 968/1024.
+        let (_, upper) = binomial_head(10, 0.5, 3);
+        assert!(close(upper[3], 968.0 / 1024.0, 1e-12), "{}", upper[3]);
+    }
+
+    #[test]
+    fn a_binomial_tail_with_upto_at_n_sums_from_the_mode() {
+        // upto == n: the tail is the single outcome B = n, taken through the log-summed branch.
+        let (_, upper) = binomial_head(6, 0.3, 6);
+        assert!(close(upper[6], 0.3_f64.powi(6), 1e-12), "{}", upper[6]);
+        assert!(close(upper[0], 1.0, 1e-12), "{}", upper[0]);
+    }
+
+    #[test]
+    fn the_saddle_expands_its_bracket_past_theta_two() {
+        // One class, n = 1, q = 0.5: K'(1) = 0.462 < 0.6 < max = 0.693, so the bracket must double
+        // past hi = 1 to reach the root, which sits at theta ≈ 2.69.
+        let law = Surprise::new(&[(1, 0.5)]);
+        assert!(close(law.saddle(0.6), 2.687_378_494_222_010_3, 1e-12), "saddle {}", law.saddle(0.6));
+    }
+
+    #[test]
+    fn the_saddlepoint_and_its_tail_at_reproduce_reference_values() {
+        let law = Surprise::new(&[(40, 0.01), (30, 0.03), (20, 0.1)]);
+        // A mid-range saddle below the bracket-expansion threshold.
+        assert!(close(law.saddle(20.0), 0.240_830_019_606_792_32, 1e-12), "saddle {}", law.saddle(20.0));
+        let (p, w) = law.tail_at(0.5);
+        assert!(close(p, 1.044_924_020_932_475e-6, 1e-12), "p {p}");
+        assert!(close(w, 44.811_654_048_631_695, 1e-12), "w {w}");
+        // Near the mean, where the Lugannani-Rice correction is still usable but small.
+        let (p_small, _) = law.tail_at(0.01);
+        assert!(close(p_small, 0.439_715_010_475_402_57, 1e-12), "p_small {p_small}");
+    }
+
+    #[test]
+    fn the_tail_at_falls_back_when_the_correction_is_not_usable() {
+        // A near-certain column (q = 0.99) leaves the Lugannani-Rice correction negative just above
+        // the mean: the tail must fall back to the plain normal tail instead of taking its log.
+        let law = Surprise::new(&[(1, 0.99)]);
+        let (p, _) = law.tail_at(0.0001);
+        assert!(close(p, 0.499_999_975_145_952_85, 1e-12), "p {p}");
+    }
+
+    #[test]
+    fn the_surprise_tail_is_one_at_or_below_the_mean() {
+        let law = Surprise::new(&[(40, 0.01), (30, 0.03), (20, 0.1)]);
+        let mean = law.mean();
+        assert!(close(law.tail(mean), 1.0, 1e-15), "tail(mean) {}", law.tail(mean));
+        assert!(close(law.tail(0.0), 1.0, 1e-15), "tail(0) {}", law.tail(0.0));
+    }
+
+    #[test]
+    fn the_surprise_tail_at_the_maximum_is_the_shared_set_probability() {
+        let law = Surprise::new(&[(40, 0.01), (30, 0.03), (20, 0.1)]);
+        let exact = 0.01_f64.powi(40) * 0.03_f64.powi(30) * 0.1_f64.powi(20);
+        assert!(close(law.tail(law.max()), exact, 1e-12), "{} vs {exact}", law.tail(law.max()));
+    }
+
+    #[test]
+    fn the_critical_value_reproduces_reference_values() {
+        let law = Surprise::new(&[(500, 0.001), (50, 0.02)]);
+        assert!(close(law.critical(1e-3), 33.672_317_339_365_94, 1e-9), "critical(1e-3) {}", law.critical(1e-3));
+        assert!(close(law.critical(1e-6), 54.068_477_372_476_714, 1e-9), "critical(1e-6) {}", law.critical(1e-6));
+        assert!(close(law.critical(1e-9), 71.659_548_309_164_69, 1e-9), "critical(1e-9) {}", law.critical(1e-9));
+    }
+
+    #[test]
+    fn the_critical_value_expands_its_bracket_for_a_small_law() {
+        // A two-column law whose K'(1) sits well below its max: alpha = 0.3 is under the whole
+        // law's tail floor, so the search must double its bracket past theta = 1 and cap out at
+        // the maximum instead of stopping short at K'(1).
+        let law = Surprise::new(&[(2, 0.8)]);
+        assert!(close(law.critical(0.3), law.max(), 1e-12), "critical(0.3) {}", law.critical(0.3));
+    }
 }

@@ -1037,4 +1037,102 @@ mod tests {
         // A literal holding the characters a rendering is written with stays one operand.
         assert_eq!(operands("=\u{1f}_.note\u{1f}\"a = b < c\""), vec!["_.note", "\"a = b < c\""]);
     }
+
+    // ── inference: module naming ──────────────────────────────────────────
+
+    #[test]
+    fn a_module_named_under_two_roots_takes_the_better_attested_one() {
+        // `src` is attested by two modules, `src.app` by one. A helper under `src.app.helpers`
+        // (nothing imports it) must be named under `src`, the root its neighbours attest more.
+        let mut m1 = def("m1", "src/app/models.py", &[]);
+        m1.facets.identity = Some(Arc::from("@~src.app.models~M1"));
+        m1.facets.reaches = vec![Arc::from("app.models")];
+        let mut m2 = def("m2", "src/app/rules.py", &[]);
+        m2.facets.identity = Some(Arc::from("@~src.app.rules~M2"));
+        m2.facets.reaches = vec![Arc::from("app.rules")];
+        let mut m3 = def("m3", "src/app/special.py", &[]);
+        m3.facets.identity = Some(Arc::from("@~src.app.special~M3"));
+        m3.facets.reaches = vec![Arc::from("special")];
+        let mut helper = callable("helper", &["= _.kind @~src.app.helpers~KIND"], &[], Vec::new(), &[]);
+        helper.facets.identity = Some(Arc::from("@~src.app.helpers~helper"));
+        let defs = vec![m1, m2, m3, helper];
+        assert_eq!(atoms_of(&defs, false, "helper"), vec!["@app.helpers.KIND = _.kind"]);
+    }
+
+    // ── inference: through-parameter / through-field marking ───────────────
+
+    #[test]
+    fn an_atom_filled_through_a_parameter_alone_is_marked_as_inferred() {
+        let defs = vec![
+            callable("helper", &["? $flag"], &["flag"], Vec::new(), &[]),
+            callable("one", &[], &[], vec![call("@app.helper", &[(None, "@app.cfg.on")])], &[]),
+        ];
+        let resolved = super::resolved_atoms(&defs, true);
+        let at = defs.iter().position(|d| d.name == "helper").unwrap();
+        assert_eq!(resolved.via[at].len(), 1, "the param-filled atom is held only through inference");
+    }
+
+    // ── corpus construction ───────────────────────────────────────────────
+
+    #[test]
+    fn corpus_of_drops_facts_only_one_member_tests() {
+        let defs = vec![
+            def("a", "a.py", &["= @app.State.OPEN _.state", "= @app.State.CLOSED _.state"]),
+            def("b", "b.py", &["= @app.State.OPEN _.state"]),
+        ];
+        let resolved = super::resolved_atoms(&defs, false);
+        let c = super::corpus_of(&defs, &resolved.atoms, &resolved.via);
+        for (m, own) in c.facts.iter().enumerate() {
+            for &f in own {
+                assert!(c.df[f as usize] > 1, "member {m} still holds a fact nothing else tests");
+            }
+        }
+    }
+
+    // ── thickness ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn thickness_is_zero_past_the_cut_or_a_unit_threshold() {
+        assert_eq!(thickness_of(0.9, 0.5), 0.0, "a p-value above the cut has no evidence to spare");
+        assert_eq!(thickness_of(0.3, 1.5), 0.0, "a threshold at or above one is not a cut at all");
+    }
+
+    // ── notes ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pair_notes_lists_where_each_side_parts_on_a_common_operand() {
+        // Both decide on `_.state`; `a` also rules the CLOSED value of it (which a third member
+        // tests too, so the fact is shared enough to stay in the corpus), so the pair note names
+        // where the two part — the fact `a` alone tests about an operand they both already test.
+        let defs = vec![
+            def("a", "a.py", &["= @app.State.OPEN _.state", "= @app.State.CLOSED _.state"]),
+            def("b", "b.py", &["= @app.State.OPEN _.state"]),
+            def("d", "d.py", &["= @app.State.CLOSED _.state"]),
+        ];
+        let resolved = super::resolved_atoms(&defs, false);
+        let c = super::corpus_of(&defs, &resolved.atoms, &resolved.via);
+        let model = crate::bicm::Bicm::fit(&c.size, &c.df);
+        let row_of: Vec<usize> = c.size.iter().map(|&k| model.row_class(k)).collect();
+        let cand = super::Candidate { a: 0, b: 1, shared: 1, surprise: 0.5, p: 1e-3 };
+        let verdict = super::Verdict { opts: &DecisionOpts::default(), threshold: 1e-6, tests: 1.0 };
+        let notes = super::pair_notes(&c, &defs, &model, &row_of, &cand, &verdict);
+        assert!(notes.iter().any(|n| n.contains("only a:")), "got: {notes:?}");
+    }
+
+    #[test]
+    fn family_notes_counts_the_core_and_marks_partial_facts() {
+        // OPEN is decided by all three; CLOSED by two of them — one common fact, one partial.
+        let defs = vec![
+            def("a", "a.py", &["= @app.State.OPEN _.state", "= @app.State.CLOSED _.state"]),
+            def("b", "b.py", &["= @app.State.OPEN _.state", "= @app.State.CLOSED _.state"]),
+            def("c", "c.py", &["= @app.State.OPEN _.state"]),
+        ];
+        let resolved = super::resolved_atoms(&defs, false);
+        let c = super::corpus_of(&defs, &resolved.atoms, &resolved.via);
+        let verdict = super::Verdict { opts: &DecisionOpts::default(), threshold: 1e-6, tests: 3.0 };
+        let (notes, core) = super::family_notes(&c, &defs, &[0, 1, 2], 1e-6, &verdict);
+        assert_eq!(core, 1, "exactly one fact is held by every member");
+        assert!(notes.iter().any(|n| n.contains("· @app.State.OPEN = _.state")), "the OPEN fact is the core: {notes:?}");
+        assert!(notes.iter().any(|n| n.contains("not all of them:")), "the CLOSED fact is partial: {notes:?}");
+    }
 }

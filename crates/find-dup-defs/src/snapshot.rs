@@ -288,3 +288,38 @@ pub fn load_findings(dir: &Path) -> std::io::Result<Vec<Finding>> {
         .collect();
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{dialect_from, dialect_tag};
+    use dup_defs_core::CanonDialect;
+
+    #[test]
+    fn every_serialized_dialect_round_trips_through_its_tag() {
+        let cases = [
+            (CanonDialect::CPythonAst, "cpython_ast"),
+            (CanonDialect::Rust, "rust"),
+            (CanonDialect::Go, "go"),
+            (CanonDialect::C, "c"),
+            (CanonDialect::Php, "php"),
+            (CanonDialect::Java, "java"),
+        ];
+        for (dialect, tag) in cases {
+            assert_eq!(dialect_tag(dialect), tag, "tag of {dialect:?}");
+            assert_eq!(dialect_from(tag, false), dialect, "dialect for {tag:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_dialects_fall_back_to_other_and_empty_tag() {
+        assert_eq!(dialect_tag(CanonDialect::Other), "");
+        assert_eq!(dialect_from("not-a-dialect", false), CanonDialect::Other);
+    }
+
+    #[test]
+    fn the_legacy_bool_is_read_only_when_the_tag_is_empty() {
+        // A pre-tristate snapshot stored only `cpython_ast: true`; an empty tag defers to it.
+        assert_eq!(dialect_from("", true), CanonDialect::CPythonAst);
+        assert_eq!(dialect_from("", false), CanonDialect::Other);
+    }
+}

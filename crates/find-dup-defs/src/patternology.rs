@@ -6005,4 +6005,856 @@ mod tests {
         let none = whole_fn_helpers(&JavaDialect, &[sum, qty], 0.7, &ExtractCfg::default(), Concurrency::Cpu);
         assert!(none.is_empty(), "a varying field name must not extract, got: {none:?}");
     }
+
+    // ── Renderer helpers (direct renderer tests) ────────────────────────────
+
+    fn rs(s: &str) -> String {
+        let mut out = String::new();
+        let mut b = LGG_NODE_BUDGET;
+        rs_render(&parse_term(s), &mut out, &mut b);
+        out
+    }
+    fn go(s: &str) -> String {
+        let mut out = String::new();
+        let mut b = LGG_NODE_BUDGET;
+        go_render(&parse_term(s), &mut out, &mut b);
+        out
+    }
+    fn c(s: &str) -> String {
+        let mut out = String::new();
+        let mut b = LGG_NODE_BUDGET;
+        c_render(&parse_term(s), &mut out, &mut b);
+        out
+    }
+    fn php(s: &str) -> String {
+        let mut out = String::new();
+        let mut b = LGG_NODE_BUDGET;
+        php_render(&parse_term(s), &mut out, &mut b);
+        out
+    }
+    fn ts(s: &str) -> String {
+        let mut out = String::new();
+        let mut b = LGG_NODE_BUDGET;
+        ts_render(&parse_term(s), &mut out, &mut b);
+        out
+    }
+    fn py(s: &str) -> String {
+        let mut out = String::new();
+        let mut b = LGG_NODE_BUDGET;
+        super::py(&parse_term(s), &mut out, &mut b);
+        out
+    }
+
+    #[test]
+    fn go_renderer_covers_every_node_kind() {
+        assert_eq!(go("Func('_fn', Params(Param(Bind('_v0'), Ty('int'))), Results(Ty('int')), Block(Return(Bind('_v0'))))"), "func _fn(_v0 int) (int) { return _v0 }");
+        assert_eq!(go("Tuple(Bind('_v0'), Bind('_v1'))"), "_v0, _v1");
+        assert_eq!(go("Results(Ty('int'), Ty('bool'))"), "(int, bool)");
+        assert_eq!(go("Let(PatType(Bind('_v0'), Ty('int')), Call(Path('f')))"), "var _v0 int = f()");
+        assert_eq!(go("LocalConst(Bind('_v0'), Int('1'))"), "const _v0 = 1");
+        assert_eq!(go("RecvStmt(Bind('_v0'), Recv(Bind('_v1')))"), "_v0 := <-_v1");
+        assert_eq!(go("Assign(Bind('_v0'), Bind('_v1'))"), "_v0 = _v1");
+        assert_eq!(go("Bin(Bind('_v0'), '+', Bind('_v1'))"), "_v0 + _v1");
+        assert_eq!(go("Inc(Bind('_v0'))"), "_v0++");
+        assert_eq!(go("Dec(Bind('_v0'))"), "_v0--");
+        assert_eq!(go("Send(Bind('_v0'), Bind('_v1'))"), "_v0 <- _v1");
+        assert_eq!(go("Return(Bind('_v0'))"), "return _v0");
+        assert_eq!(go("Go(Call(Path('f')))"), "go f()");
+        assert_eq!(go("Defer(Call(Path('f')))"), "defer f()");
+        assert_eq!(go("Break()"), "break");
+        assert_eq!(go("Continue()"), "continue");
+        assert_eq!(go("Goto('lbl')"), "goto lbl");
+        assert_eq!(go("Fallthrough()"), "fallthrough");
+        assert_eq!(go("If('', Bind('_v0'), Block(), Block())"), "if _v0 {  } else {  }");
+        assert_eq!(go("Loop(Block())"), "for {  }");
+        assert_eq!(go("While(Bind('_v0'), Block())"), "for _v0 {  }");
+        assert_eq!(go("For(Bind('_v0'), Bind('_v1'), Block())"), "for _v0 := range _v1 {  }");
+        assert_eq!(go("ForC(Bind('_v0'), Bind('_v1'), Bind('_v2'), Block())"), "for _v0; _v1; _v2 {  }");
+        assert_eq!(go("Switch('', Bind('_v0'))"), "switch _v0 {  }");
+        assert_eq!(go("TypeSwitch('', Bind('_v0'), Bind('_v1'))"), "switch _v0 := _v1.(type) {  }");
+        assert_eq!(go("Select(CommCase(Send(Bind('_v0'), Bind('_v1')), Block()))"), "select { case _v0 <- _v1:  }");
+        assert_eq!(go("Case(Bind('_v0'), Block())"), "case _v0: ");
+        assert_eq!(go("Default(Block())"), "default: ");
+        assert_eq!(go("Labeled('lbl', Block())"), "lbl: {  }");
+        assert_eq!(go("Path('foo')"), "foo");
+        assert_eq!(go("Bind('_v0')"), "_v0");
+        assert_eq!(go("Int('42')"), "42");
+        assert_eq!(go("Wild()"), "_");
+        assert_eq!(go("Nil()"), "nil");
+        assert_eq!(go("Iota()"), "iota");
+        assert_eq!(go("Str('abc')"), "\"abc\"");
+        assert_eq!(go("Char('x')"), "'x'");
+        assert_eq!(go("Unary('-', Bind('_v0'))"), "-_v0");
+        assert_eq!(go("Ref(Bind('_v0'))"), "&_v0");
+        assert_eq!(go("Recv(Bind('_v0'))"), "<-_v0");
+        assert_eq!(go("Spread(Bind('_v0'))"), "_v0...");
+        assert_eq!(go("Call(Path('f'))"), "f()");
+        assert_eq!(go("Method(Bind('_v0'), 'run')"), "_v0.run()");
+        assert_eq!(go("Field(Bind('_v0'), 'x')"), "_v0.x");
+        assert_eq!(go("Index(Bind('_v0'), Int('1'))"), "_v0[1]");
+        assert_eq!(go("Slice(Bind('_v0'), Int('1'), Int('2'), '')"), "_v0[1:2]");
+        assert_eq!(go("Assert(Bind('_v0'), Ty('T'))"), "_v0.(T)");
+        assert_eq!(go("Cast(Bind('_v0'), Ty('T'))"), "T(_v0)");
+        assert_eq!(go("Composite(Path('S'), FieldVal('x', Bind('_v0')))"), "S{x: _v0}");
+        assert_eq!(go("FieldVal('x', Bind('_v0'))"), "x: _v0");
+        assert_eq!(go("KV(Bind('_v0'), Bind('_v1'))"), "_v0: _v1");
+        assert_eq!(go("Ty('map')"), "map");
+        assert_eq!(go("TyPtr(Ty('int'))"), "*int");
+        assert_eq!(go("TySlice(Ty('int'))"), "[]int");
+        assert_eq!(go("TyChan('', Ty('int'))"), "chan int");
+        assert_eq!(go("TyVariadic(Ty('int'))"), "...int");
+        assert_eq!(go("TyFn()"), "func(?)");
+        assert_eq!(go("TyStruct()"), "struct{…}");
+        assert_eq!(go("TyIface()"), "interface{…}");
+    }
+    #[test]
+    fn c_renderer_covers_every_node_kind() {
+        assert_eq!(c("Func('_fn', Params(Param(Bind('_v0'), Ty('int'))), Ty('int'), Block(Return(Bind('_v0'))))"), "int _fn(int _v0) { return _v0 }");
+        assert_eq!(c("Seq(Bind('_v0'), Bind('_v1'))"), "_v0, _v1");
+        assert_eq!(c("Block(Return(Bind('_v0')))"), "{ return _v0 }");
+        assert_eq!(c("Let(Bind('_v0'), Bind('_v1'))"), "_v0 = _v1");
+        assert_eq!(c("Assign(Bind('_v0'), Bind('_v1'))"), "_v0 = _v1");
+        assert_eq!(c("Bin(Bind('_v0'), '+', Bind('_v1'))"), "_v0 + _v1");
+        assert_eq!(c("Inc(Bind('_v0'))"), "_v0++");
+        assert_eq!(c("PreInc(Bind('_v0'))"), "++_v0");
+        assert_eq!(c("ExprStmt(Call(Path('f')))"), "f()");
+        assert_eq!(c("Break()"), "break");
+        assert_eq!(c("Continue()"), "continue");
+        assert_eq!(c("Goto('lbl')"), "goto lbl");
+        assert_eq!(c("If(Bind('_v0'), Block(), Block())"), "if (_v0) {  } else {  }");
+        assert_eq!(c("While(Bind('_v0'), Block())"), "while (_v0) {  }");
+        assert_eq!(c("DoWhile(Block(), Bind('_v0'))"), "do {  } while (_v0)");
+        assert_eq!(c("ForC(Bind('_v0'), Bind('_v1'), Bind('_v2'), Block())"), "for (_v0; _v1; _v2) {  }");
+        assert_eq!(c("Switch(Bind('_v0'))"), "switch (_v0) {  }");
+        assert_eq!(c("Case(Bind('_v0'), Block())"), "case _v0: ");
+        assert_eq!(c("Default(Block())"), "default: ");
+        assert_eq!(c("Labeled('lbl', Block())"), "lbl: {  }");
+        assert_eq!(c("PreIf(Branch('if', Block()))"), "#if {  } #endif");
+        assert_eq!(c("Branch('if', Block())"), "#if {  }");
+        assert_eq!(c("MacroLoop(Bind('_v0'), Block())"), "_v0 {  }");
+        assert_eq!(c("Path('foo')"), "foo");
+        assert_eq!(c("Ty('int')"), "int");
+        assert_eq!(c("Nil()"), "NULL");
+        assert_eq!(c("Str('abc')"), "\"abc\"");
+        assert_eq!(c("Char('x')"), "'x'");
+        assert_eq!(c("Unary('-', Bind('_v0'))"), "-_v0");
+        assert_eq!(c("Ref(Bind('_v0'))"), "&_v0");
+        assert_eq!(c("Cond(Bind('_v0'), Bind('_v1'), Bind('_v2'))"), "_v0 ? _v1 : _v2");
+        assert_eq!(c("Call(Path('f'))"), "f()");
+        assert_eq!(c("Method(Bind('_v0'), 'run')"), "_v0->run()");
+        assert_eq!(c("Field(Bind('_v0'), 'x')"), "_v0->x");
+        assert_eq!(c("Index(Bind('_v0'), Int('1'))"), "_v0[1]");
+        assert_eq!(c("Cast(Bind('_v0'), Ty('T'))"), "(T)_v0");
+        assert_eq!(c("SizeOf(Ty('int'))"), "sizeof(int)");
+        assert_eq!(c("AlignOf(Ty('int'))"), "alignof(int)");
+        assert_eq!(c("OffsetOf(Ty('T'), 'field')"), "offsetof(T, field)");
+        assert_eq!(c("Composite(Ty('T'), FieldVal('x', Bind('_v0')))"), "(T){.x = _v0}");
+        assert_eq!(c("FieldVal('x', Bind('_v0'))"), ".x = _v0");
+        assert_eq!(c("KV(Bind('_v0'), Bind('_v1'))"), "[_v0] = _v1");
+        assert_eq!(c("StmtExpr(Block(Return(Bind('_v0'))))"), "({ return _v0 })");
+        assert_eq!(c("TyPtr(Ty('int'))"), "int *");
+        assert_eq!(c("TyArray(Ty('int'), Int('4'))"), "int[4]");
+        assert_eq!(c("TyVariadic()"), "...");
+        assert_eq!(c("TyFn()"), "fn(?)");
+        assert_eq!(c("TyRecord('S')"), "S {…}");
+        assert_eq!(c("TyEnum()"), "enum {…}");
+        assert_eq!(c("Asm()"), "asm(…)");
+        assert_eq!(c("NestedItem()"), "/* nested type */");
+    }
+    #[test]
+    fn php_renderer_covers_every_node_kind() {
+        assert_eq!(php("Func('_fn', Params(Param(Bind('_v0'), Ty('int'))), Ty('int'), Block(Return(Bind('_v0'))))"), "function _fn(int $_v0): int { return $_v0 }");
+        assert_eq!(php("Seq(Bind('_v0'), Bind('_v1'))"), "$_v0, $_v1");
+        assert_eq!(php("Assign(Bind('_v0'), Bind('_v1'))"), "$_v0 = $_v1");
+        assert_eq!(php("AssignRef(Bind('_v0'), Bind('_v1'))"), "$_v0 =& $_v1");
+        assert_eq!(php("Bin(Bind('_v0'), '+', Bind('_v1'))"), "$_v0 + $_v1");
+        assert_eq!(php("Inc(Bind('_v0'))"), "$_v0++");
+        assert_eq!(php("PreInc(Bind('_v0'))"), "++$_v0");
+        assert_eq!(php("Echo(Str('hi'))"), "echo 'hi'");
+        assert_eq!(php("Unset(Bind('_v0'))"), "unset($_v0)");
+        assert_eq!(php("Global(Bind('_v0'))"), "global $_v0");
+        assert_eq!(php("Return(Bind('_v0'))"), "return $_v0");
+        assert_eq!(php("Throw(Call(Path('E')))"), "throw E()");
+        assert_eq!(php("Break()"), "break");
+        assert_eq!(php("Continue()"), "continue");
+        assert_eq!(php("Goto('lbl')"), "goto lbl");
+        assert_eq!(php("YieldFrom(Bind('_v0'))"), "yield from $_v0");
+        assert_eq!(php("Print(Bind('_v0'))"), "print $_v0");
+        assert_eq!(php("Clone(Bind('_v0'))"), "clone $_v0");
+        assert_eq!(php("If(Bind('_v0'), Block(), Block())"), "if ($_v0) {  } else {  }");
+        assert_eq!(php("While(Bind('_v0'), Block())"), "while ($_v0) {  }");
+        assert_eq!(php("DoWhile(Block(), Bind('_v0'))"), "do {  } while ($_v0)");
+        assert_eq!(php("ForC(Bind('_v0'), Bind('_v1'), Bind('_v2'), Block())"), "for ($_v0; $_v1; $_v2) {  }");
+        assert_eq!(php("For(Bind('_v0'), Bind('_v1'), Block())"), "foreach ($_v1 as $_v0) {  }");
+        assert_eq!(php("KV(Bind('_v0'), Bind('_v1'))"), "$_v0 => $_v1");
+        assert_eq!(php("Switch(Bind('_v0'))"), "switch ($_v0) {  }");
+        assert_eq!(php("Case(Bind('_v0'), Block())"), "case $_v0: ");
+        assert_eq!(php("Default(Block())"), "default: ");
+        assert_eq!(php("Try(Block(), Catch(Types(Ty('E')), Bind('_v0'), Block()))"), "try {  } finally { catch (E $_v0) {  } }");
+        assert_eq!(php("Catch(Types(Ty('E')), Bind('_v0'), Block())"), "catch (E $_v0) {  }");
+        assert_eq!(php("Types(Ty('A'), Ty('B'))"), "A | B");
+        assert_eq!(php("Labeled('lbl')"), "lbl:");
+        assert_eq!(php("Path('foo')"), "foo");
+        assert_eq!(php("Bind('_v0')"), "$_v0");
+        assert_eq!(php("Int('42')"), "42");
+        assert_eq!(php("Nil()"), "null");
+        assert_eq!(php("Str('abc')"), "'abc'");
+        assert_eq!(php("Interp(Str('id='), Bind('_v0'))"), "\"id={$_v0}\"");
+        assert_eq!(php("Shell(Str('ls'))"), "`ls`");
+        assert_eq!(php("Unary('-', Bind('_v0'))"), "-$_v0");
+        assert_eq!(php("Ref(Bind('_v0'))"), "&$_v0");
+        assert_eq!(php("Spread(Bind('_v0'))"), "...$_v0");
+        assert_eq!(php("Silence(Bind('_v0'))"), "@$_v0");
+        assert_eq!(php("Cond(Bind('_v0'), Bind('_v1'), Bind('_v2'))"), "$_v0 ? $_v1 : $_v2");
+        assert_eq!(php("Call(Path('f'))"), "f()");
+        assert_eq!(php("Method(Bind('_v0'), 'run')"), "$_v0->run()");
+        assert_eq!(php("NullsafeMethod(Bind('_v0'), 'run')"), "$_v0?->run()");
+        assert_eq!(php("StaticCall(Path('C'), 'run')"), "C::run()");
+        assert_eq!(php("Field(Bind('_v0'), 'x')"), "$_v0->x");
+        assert_eq!(php("NullsafeField(Bind('_v0'), 'x')"), "$_v0?->x");
+        assert_eq!(php("StaticField(Path('C'), 'x')"), "C::$x");
+        assert_eq!(php("ClassConst(Path('C'), 'X')"), "C::X");
+        assert_eq!(php("Index(Bind('_v0'), Int('1'))"), "$_v0[1]");
+        assert_eq!(php("Arr(Bind('_v0'), Bind('_v1'))"), "[$_v0, $_v1]");
+        assert_eq!(php("New(Path('C'))"), "new C()");
+        assert_eq!(php("Kw('foo', Bind('_v0'))"), "foo: $_v0");
+        assert_eq!(php("Closure(Params(Param(Bind('_v0'))), Uses(Bind('_v1')), Block())"), "function ($_v0) use ($_v1) {  }");
+        assert_eq!(php("Arrow(Params(Param(Bind('_v0'))), Bind('_v0'))"), "fn ($_v0) => $_v0");
+        assert_eq!(php("Match(Bind('_v0'), Arm(Bind('_v1'), Bind('_v2')))"), "match ($_v0) { $_v1 => $_v2 }");
+        assert_eq!(php("Cast(Bind('_v0'), 'int')"), "(int) $_v0");
+        assert_eq!(php("Include('include', Str('f.php'))"), "include 'f.php'");
+        assert_eq!(php("Yield('')"), "yield");
+        assert_eq!(php("DynVar(Bind('_v0'))"), "${$_v0}");
+        assert_eq!(php("TyOpt(Ty('T'))"), "?T");
+        assert_eq!(php("TyUnion(Ty('A'), Ty('B'))"), "A|B");
+        assert_eq!(php("TyInter(Ty('A'), Ty('B'))"), "A&B");
+        assert_eq!(php("AnonClass()"), "new class {…}");
+        assert_eq!(php("NestedItem()"), "/* nested declaration */");
+        assert_eq!(php("RefParam(Bind('_v0'), Ty('int'))"), "int &$_v0");
+        assert_eq!(php("Variadic(Bind('_v0'), Ty('int'))"), "int ...$_v0");
+    }
+    #[test]
+    fn ts_renderer_covers_every_node_kind() {
+        assert_eq!(ts("Func('_fn', Params(Param(Bind('_v0'))), Block(Return(Bind('_v0'))))"), "function _fn(_v0) { return _v0 }");
+        assert_eq!(ts("Arrow(Params(Param(Bind('_v0'))), Block(Return(Bind('_v0'))))"), "(_v0) => { return _v0 }");
+        assert_eq!(ts("Params(Param(Bind('_v0')))"), "(_v0)");
+        assert_eq!(ts("Annot(Bind('_v0'), TSArray(Ty('string')))"), "_v0: Ty(string)[]");
+        assert_eq!(ts("TApp(Id('Map'), Ty('string'), Ty('int'))"), "Map<Ty(string), Ty(int)>");
+        assert_eq!(ts("Decl(Bind('_v0'), Bind('_v1'))"), "_v0 = _v1");
+        assert_eq!(ts("Rest(Bind('_v0'))"), "..._v0");
+        assert_eq!(ts("Spread(Bind('_v0'))"), "..._v0");
+        assert_eq!(ts("Id('foo')"), "foo");
+        assert_eq!(ts("Num('42')"), "42");
+        assert_eq!(ts("This()"), "this");
+        assert_eq!(ts("Super()"), "super");
+        assert_eq!(ts("Null()"), "null");
+        assert_eq!(ts("Str('abc')"), "\"abc\"");
+        assert_eq!(ts("Regex('ab+c')"), "/ab+c/");
+        assert_eq!(ts("Tpl(Atom('x='), Id('_v0'))"), "`${Atom(x=)}${_v0}`");
+        assert_eq!(ts("Block(Return(Id('_v0')))"), "{ return _v0 }");
+        assert_eq!(ts("Var('const', [Decl(Bind('_v0'), Num('1'))])"), "const _v0 = 1");
+        assert_eq!(ts("If(Id('_v0'), Block(), Block())"), "if (_v0) {  } else {  }");
+        assert_eq!(ts("For(Id('_v0'), Id('_v1'), Id('_v2'), Block())"), "for (_v0; _v1; _v2) {  }");
+        assert_eq!(ts("ForIn(Bind('_v0'), Id('_v1'), Block())"), "for (_v0 in _v1) {  }");
+        assert_eq!(ts("While(Id('_v0'), Block())"), "while (_v0) {  }");
+        assert_eq!(ts("DoWhile(Block(), Id('_v0'))"), "do {  } while (_v0)");
+        assert_eq!(ts("Return(Id('_v0'))"), "return _v0");
+        assert_eq!(ts("Throw(Id('_v0'))"), "throw _v0");
+        assert_eq!(ts("Break()"), "break");
+        assert_eq!(ts("Continue()"), "continue");
+        assert_eq!(ts("Try(Block(), Catch(Bind('_v0'), Block()))"), "try {  } catch (_v0) {  }");
+        assert_eq!(ts("Catch(Bind('_v0'), Block())"), "catch (_v0) {  }");
+        assert_eq!(ts("Switch(Id('_v0'))"), "switch (_v0) {  }");
+        assert_eq!(ts("Case(Id('_v0'), Block())"), "case _v0: {  }");
+        assert_eq!(ts("Label('lbl', Block())"), "lbl: {  }");
+        assert_eq!(ts("With(Id('_v0'), Block())"), "with (_v0) {  }");
+        assert_eq!(ts("Bin(Id('_v0'), 'Addition', Id('_v1'))"), "_v0 + _v1");
+        assert_eq!(ts("Logic(Id('_v0'), 'And', Id('_v1'))"), "_v0 && _v1");
+        assert_eq!(ts("Unary('UnaryNegation', Id('_v0'))"), "-_v0");
+        assert_eq!(ts("Update('Increment', 'post', Id('_v0'))"), "_v0++");
+        assert_eq!(ts("Assign('Addition', Id('_v0'), Id('_v1'))"), "_v0 += _v1");
+        assert_eq!(ts("Cond(Id('_v0'), Id('_v1'), Id('_v2'))"), "_v0 ? _v1 : _v2");
+        assert_eq!(ts("Call(Id('f'), '', [Id('_v0')])"), "f(_v0)");
+        assert_eq!(ts("New(Id('T'), [Id('_v0')])"), "new T(_v0)");
+        assert_eq!(ts("Member(Id('_v0'), 'x')"), "_v0.x");
+        assert_eq!(ts("CMember(Id('_v0'), Id('_v1'))"), "_v0[_v1]");
+        assert_eq!(ts("Await(Id('_v0'))"), "await _v0");
+        assert_eq!(ts("Yield(Id('_v0'))"), "yield _v0");
+        assert_eq!(ts("Arr(Id('_v0'), Id('_v1'))"), "[_v0, _v1]");
+        assert_eq!(ts("Obj(ObjProp(Str('x'), Id('_v0')))"), "{ \"x\": _v0 }");
+        assert_eq!(ts("ObjProp(Str('x'), Id('_v0'))"), "\"x\": _v0");
+        assert_eq!(ts("BindDefault(Bind('_v0'), Num('1'))"), "_v0 = 1");
+        assert_eq!(ts("TSAs(Id('_v0'), Ty('T'))"), "_v0 as Ty(T)");
+        assert_eq!(ts("TSSat(Id('_v0'), Ty('T'))"), "_v0 satisfies Ty(T)");
+        assert_eq!(ts("TSNonNull(Id('_v0'))"), "_v0!");
+        assert_eq!(ts("TSAssert(Id('_v0'), Ty('T'))"), "<Ty(T)>_v0");
+        assert_eq!(ts("JSXFragment([Text('hi')])"), "<>hi</>");
+        assert_eq!(ts("SpreadAttr(Id('_v0'))"), "{..._v0}");
+        assert_eq!(ts("TSTypeAlias('T', Ty('string'))"), "type T = Ty(string)");
+        assert_eq!(ts("TSArray(Ty('string'))"), "Ty(string)[]");
+        assert_eq!(ts("TSUnion(Ty('A'), Ty('B'))"), "Ty(A) | Ty(B)");
+    }
+    #[test]
+    fn py_renderer_covers_every_node_kind() {
+        assert_eq!(py("Pass()"), "pass");
+        assert_eq!(py("Break()"), "break");
+        assert_eq!(py("Continue()"), "continue");
+        assert_eq!(py("AnnAssign(Name('_v0'), Name('int'), Constant(1))"), "_v0: int = 1");
+        assert_eq!(py("AugAssign(Name('_v0'), 'Add', Constant(1))"), "_v0 += 1");
+        assert_eq!(py("For(Name('_v0'), Name('rows'), [Pass])"), "for _v0 in rows: pass");
+        assert_eq!(py("While(Name('_v0'), [Pass])"), "while _v0: pass");
+        assert_eq!(py("With([withitem(Name('_v0'), Name('_v1'))], [Pass])"), "with _v0 as _v1: pass");
+        assert_eq!(py("withitem(Name('_v0'), Name('_v1'))"), "_v0 as _v1");
+        assert_eq!(py("Try([Pass], [ExceptHandler(Name('E'), Name('_v0'), [Pass])])"), "try: pass; except E as ?: pass");
+        assert_eq!(py("ExceptHandler(Name('E'), Name('_v0'), [Pass])"), "except E as ?: pass");
+        assert_eq!(py("keyword('x', Constant(1))"), "x=1");
+        assert_eq!(py("BoolOp('And', [Name('_v0'), Name('_v1')])"), "_v0 and _v1");
+        assert_eq!(py("UnaryOp(Not, Name('_v0'))"), "not _v0");
+        assert_eq!(py("Set([Name('_v0')])"), "{_v0}");
+        assert_eq!(py("Dict([Name('_v0')], [Constant(1)])"), "{_v0: 1}");
+        assert_eq!(py("Await(Name('_v0'))"), "await _v0");
+        assert_eq!(py("Yield(Name('_v0'))"), "yield _v0");
+        assert_eq!(py("YieldFrom(Name('_v0'))"), "yield from _v0");
+        assert_eq!(py("Starred(Name('_v0'))"), "*_v0");
+        assert_eq!(py("Lambda(arguments([], [arg('_v0')]), Name('_v0'))"), "lambda _v0: _v0");
+        assert_eq!(py("IfExp(Name('_v0'), Name('_v1'), Name('_v2'))"), "_v1 if _v0 else _v2");
+        assert_eq!(py("SetComp(Name('_v0'), [comprehension(Name('_v0'), Name('rows'), [], '0')])"), "{_v0 for _v0 in rows}");
+        assert_eq!(py("GeneratorExp(Name('_v0'), [comprehension(Name('_v0'), Name('rows'), [], '0')])"), "(_v0 for _v0 in rows)");
+        assert_eq!(py("DictComp(Name('_v0'), Name('_v1'), [comprehension(Name('_v0'), Name('rows'), [], '0')])"), "{_v0: _v1 for _v0 in rows}");
+        assert_eq!(py("FormattedValue(Name('_v0'), -1)"), "{_v0}");
+        assert_eq!(py("Delete([Name('_v0')])"), "del _v0");
+        assert_eq!(py("Assert(Name('_v0'), Constant('msg'))"), "assert _v0, 'msg'");
+        assert_eq!(py("Import([alias('os')])"), "import os");
+        assert_eq!(py("MatchStar('rest')"), "*rest");
+        assert_eq!(py("MatchOr([MatchAs('a'), MatchAs('b')])"), "a | b");
+        assert_eq!(py("FunctionDef('_fn', Atom('arguments'), [Pass], [], None)"), "def _fn(Atom('arguments')): pass");
+    }
+    #[test]
+    fn rs_renderer_covers_every_node_kind() {
+        assert_eq!(rs("Func('_fn', Params(Param(Bind('_v0'))), '', '', Block(Return(Bind('_v0'))))"), "fn _fn(_v0) { return _v0 }");
+        assert_eq!(rs("Param(Bind('_v0'), Ty('i32'))"), "_v0: i32");
+        assert_eq!(rs("Block(Return(Bind('_v0')))"), "{ return _v0 }");
+        assert_eq!(rs("Let(Bind('_v0'), Call(Path('f')))"), "let _v0 = f()");
+        assert_eq!(rs("ExprStmt(Call(Path('f')))"), "f()");
+        assert_eq!(rs("Path('foo')"), "foo");
+        assert_eq!(rs("Int('42')"), "42");
+        assert_eq!(rs("Wild()"), "_");
+        assert_eq!(rs("Rest()"), "..");
+        assert_eq!(rs("Str('abc')"), "\"abc\"");
+        assert_eq!(rs("Char('x')"), "'x'");
+        assert_eq!(rs("Bin(Bind('_v0'), '+', Bind('_v1'))"), "_v0 + _v1");
+        assert_eq!(rs("Unary('-', Bind('_v0'))"), "-_v0");
+        assert_eq!(rs("Assign(Bind('_v0'), Bind('_v1'))"), "_v0 = _v1");
+        assert_eq!(rs("Call(Path('f'))"), "f()");
+        assert_eq!(rs("Method(Bind('_v0'), 'run')"), "_v0.run()");
+        assert_eq!(rs("Field(Bind('_v0'), 'x')"), "_v0.x");
+        assert_eq!(rs("Index(Bind('_v0'), Int('1'))"), "_v0[1]");
+        assert_eq!(rs("If(Bind('_v0'), Block(), Block())"), "if _v0 {  } else {  }");
+        assert_eq!(rs("Match(Bind('_v0'))"), "match _v0 {  }");
+        assert_eq!(rs("Arm(PatPath('x'), Bind('_v0'))"), "x if _v0 => _v0");
+        assert_eq!(rs("For(PatPath('_v0'), Bind('_v1'), Block())"), "for _v0 in _v1 {  }");
+        assert_eq!(rs("While(Bind('_v0'), Block())"), "while _v0 {  }");
+        assert_eq!(rs("Loop(Block())"), "loop {  }");
+        assert_eq!(rs("Return(Bind('_v0'))"), "return _v0");
+        assert_eq!(rs("Break()"), "break");
+        assert_eq!(rs("Continue()"), "continue");
+        assert_eq!(rs("Ref('', Bind('_v0'))"), "&_v0");
+        assert_eq!(rs("Ref('mut', Bind('_v0'))"), "&mut _v0");
+        assert_eq!(rs("Try(Bind('_v0'))"), "_v0?");
+        assert_eq!(rs("Await(Bind('_v0'))"), "_v0.await");
+        assert_eq!(rs("Cast(Bind('_v0'), Ty('i32'))"), "_v0 as i32");
+        assert_eq!(rs("Unsafe(Block())"), "unsafe {  }");
+        assert_eq!(rs("Async(Block())"), "async {  }");
+        assert_eq!(rs("TryBlock(Block())"), "try {  }");
+        assert_eq!(rs("Tuple(Bind('_v0'), Bind('_v1'))"), "(_v0, _v1)");
+        assert_eq!(rs("Array(Bind('_v0'), Bind('_v1'))"), "[_v0, _v1]");
+        assert_eq!(rs("Range(Bind('_v0'), Bind('_v1'))"), "_v0.._v1");
+        assert_eq!(rs("StructLit(Path('S'), FieldVal('x', Bind('_v0')))"), "? { x: _v0 }");
+        assert_eq!(rs("FieldVal('x', Bind('_v0'))"), "x: _v0");
+        assert_eq!(rs("Closure(Param(Bind('_v0')), Param(Bind('_v1')), Block())"), "|_v0, _v1| {  }");
+        assert_eq!(rs("Macro('vec')"), "vec!(…)");
+        assert_eq!(rs("Ty('Vec')"), "Vec");
+        assert_eq!(rs("PatRef(Bind('_v0'))"), "&_v0");
+        assert_eq!(rs("PatTupleStruct(Path('Ok'), Bind('_v0'))"), "?(_v0)");
+        assert_eq!(rs("PatType(Bind('_v0'), Ty('i32'))"), "_v0: i32");
+        assert_eq!(rs("TySlice(Ty('u8'))"), "[u8]");
+        assert_eq!(rs("TyArray(Ty('u8'))"), "[u8; _]");
+        assert_eq!(rs("TyPtr(Ty('u8'))"), "*u8");
+        assert_eq!(rs("TyImpl()"), "impl ?");
+        assert_eq!(rs("TyDyn()"), "dyn ?");
+        assert_eq!(rs("TyNever()"), "!");
+        assert_eq!(rs("TyFn()"), "fn(?)");
+        assert_eq!(rs("Repeat(Bind('_v0'), Int('4'))"), "[_v0; 4]");
+        assert_eq!(rs("UnknownTag()"), "UnknownTag");
+    }
+
+
+    // ── Engine helpers: node_type_seq / packing / tfidf / clustering ─────────
+
+    #[test]
+    fn node_type_seq_edges_of_identifier_and_quote_scans() {
+        // An uppercase identifier NOT followed by `(` is a bareword (a value like `True`), not a
+        // constructor; a lowercase identifier followed by `(` is a keyword/field, never a node tag.
+        assert_eq!(node_type_seq("Constant(True)"), vec!["Constant"]);
+        assert_eq!(node_type_seq("arg('_v0')"), Vec::<&str>::new());
+        // A bare uppercase identifier at end-of-input and a leading quote exercise the scan bounds.
+        assert!(node_type_seq("Name").is_empty(), "a bare constructor at end-of-input must not push");
+        assert!(node_type_seq("'x'").is_empty(), "a leading quote yields no constructors");
+        // An unterminated quote must scan to end-of-input and stop there: `<` vs `<=` in the
+        // quote-scan loop is the off-by-one that would read past the buffer.
+        assert!(node_type_seq("'abc").is_empty(), "an unterminated quote must not overrun");
+    }
+
+    #[test]
+    fn pack_grams_are_exact_lossless_codes() {
+        // Exact bit layout: arity tag (1/2) in the top 2 bits, ids packed at TAG_ID_BITS stride.
+        assert_eq!(pack_bigram(1, 2), (1u64 << 60) | (1u64 << 20) | 2);
+        assert_eq!(pack_trigram(1, 2, 3), (2u64 << 60) | (1u64 << 40) | (2u64 << 20) | 3);
+    }
+
+    #[test]
+    fn tfidf_rows_weights_runs_and_norm() {
+        // seq [1,1,2] with idf [_, 0.5, 2.0]: the run of two 1s collapses to tf·idf, the norm is the
+        // L2 of the weighted entries.
+        let (rows, norms) = tfidf_rows(&[vec![1, 1, 2]], &[0.0, 0.5, 2.0]);
+        assert_eq!(rows, vec![vec![(1, 1.0), (2, 2.0)]]);
+        assert_eq!(norms, vec![5.0f64.sqrt()]);
+    }
+
+    #[test]
+    fn pattern_families_respects_idf_weighting() {
+        // `X(Y(Z(P())))` vs `X(Y(Z(Q())))`: shared prefix grams get df=2. Under the real `ln(n/df)+1`
+        // idf their cosine sits below θ=0.6; the (mutated) `ln(n·df)+1` would boost the shared grams
+        // across the threshold. The pass must report no family.
+        let a = "X(Y(Z(P())))".to_owned();
+        let b = "X(Y(Z(Q())))".to_owned();
+        assert!(pattern_families(&PyDialect, &[a, b], 0.6, Concurrency::Cpu).is_empty());
+    }
+
+    #[test]
+    fn pattern_families_keeps_a_three_member_clique() {
+        // Three identical skeletons form a K3 clique → one 3-member family (the < vs > guard on the
+        // size filter must not drop it).
+        let c = "X(Y(Z()))".to_owned();
+        let fams = pattern_families(&PyDialect, &[c.clone(), c.clone(), c.clone()], 0.7, Concurrency::Cpu);
+        assert_eq!(fams.len(), 1);
+        assert_eq!(fams[0].members, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn skeleton_key_separates_children_with_commas() {
+        // A node with two children joins them with a comma; the skeleton flattens atoms to `?`.
+        assert_eq!(skeleton_key(&parse_term("Call(Name('f'), Name('_v0'))")), "Call(Name(?),Name(?))");
+    }
+
+    #[test]
+    fn rs_block_inner_joins_statements_and_respects_budget() {
+        // Two statements are joined with `; ` (the `i > 0` separator).
+        let t = parse_term("Block(Return(Bind('_v0')), Return(Bind('_v1')))");
+        let mut out = String::new();
+        let mut b = LGG_NODE_BUDGET;
+        rs_block_inner(Some(&t), &mut out, &mut b);
+        assert_eq!(out, "return _v0; return _v1");
+        // An exhausted budget truncates at the first statement instead of rendering through it.
+        let mut out = String::new();
+        rs_block_inner(Some(&t), &mut out, &mut 0);
+        assert_eq!(out, "…");
+    }
+
+    #[test]
+    fn pattern_families_requires_two_members() {
+        let one = "X(Y(Z()))".to_owned();
+        assert!(pattern_families(&PyDialect, &[one], 0.7, Concurrency::Cpu).is_empty());
+        assert!(pattern_families(&PyDialect, &[], 0.7, Concurrency::Cpu).is_empty());
+    }
+
+    // ── TermParser edge cases ─────────────────────────────────────────────────
+
+    #[test]
+    fn term_parser_barewords_and_bounds() {
+        // A multi-char bareword reads whole; a bare identifier at end-of-input and an unterminated
+        // quote exercise the scan guards; a leading space and a truncated node list are tolerated.
+        assert_eq!(parse_term("42"), Term::Atom("42".to_owned()));
+        assert_eq!(parse_term("X"), Term::Atom("X".to_owned()));
+        assert_eq!(parse_term(" "), Term::Atom(String::new()));
+        assert_eq!(parse_term("'abc"), Term::Atom("'abc".to_owned()));
+        assert_eq!(parse_term("'a\\'b'"), Term::Atom("'a\\'b'".to_owned()));
+        assert_eq!(parse_term("'\\''"), Term::Atom("'\\''".to_owned()));
+        assert_eq!(parse_term("X("), parse_term("X()"));
+    }
+
+    // ── Anti-unification: compatible / lcs / lgg_list ─────────────────────────
+
+    #[test]
+    fn compatible_treats_holes_lists_and_atoms_as_expected() {
+        assert!(compatible(&Term::Hole, &parse_term("A()")));
+        assert!(compatible(&parse_term("A()"), &Term::Hole));
+        assert!(compatible(&parse_term("[a]"), &parse_term("[b]")));
+        assert!(compatible(&parse_term("A()"), &parse_term("A()")));
+        assert!(compatible(&parse_term("'x'"), &parse_term("'x'")));
+        assert!(!compatible(&parse_term("'x'"), &parse_term("'y'")));
+        assert!(!compatible(&parse_term("A()"), &parse_term("B()")));
+    }
+
+    #[test]
+    fn lcs_align_returns_increasing_matched_pairs() {
+        let a = parse_term("[A(), B(), C()]");
+        let b = parse_term("[A(), C()]");
+        let Term::List(ca) = &a else { panic!("a list") };
+        let Term::List(cb) = &b else { panic!("a list") };
+        assert_eq!(lcs_align(ca, cb), vec![(0, 0), (2, 1)]);
+    }
+
+    #[test]
+    fn lgg_list_aligns_gaps_and_remainders() {
+        // Deletion in the second list → hole in the middle.
+        let a = parse_term("[A(), B(), C()]");
+        let b = parse_term("[A(), C()]");
+        let Term::List(ca) = &a else { panic!("a list") };
+        let Term::List(cb) = &b else { panic!("a list") };
+        let mut out = String::new();
+        let mut budget = LGG_NODE_BUDGET;
+        render_term(&lgg_list(&PyDialect, ca, cb), &mut out, &mut budget);
+        assert_eq!(out, "[A, ?, C]");
+
+        // Insertion in the second list → hole in the middle.
+        let a = parse_term("[A(), C()]");
+        let b = parse_term("[A(), B(), C()]");
+        let Term::List(ca) = &a else { panic!("a list") };
+        let Term::List(cb) = &b else { panic!("a list") };
+        let mut out = String::new();
+        let mut budget = LGG_NODE_BUDGET;
+        render_term(&lgg_list(&PyDialect, ca, cb), &mut out, &mut budget);
+        assert_eq!(out, "[A, ?, C]");
+
+        // Trailing remainder (first list longer).
+        let a = parse_term("[A(), B()]");
+        let b = parse_term("[A()]");
+        let Term::List(ca) = &a else { panic!("a list") };
+        let Term::List(cb) = &b else { panic!("a list") };
+        let mut out = String::new();
+        let mut budget = LGG_NODE_BUDGET;
+        render_term(&lgg_list(&PyDialect, ca, cb), &mut out, &mut budget);
+        assert_eq!(out, "[A, ?]");
+
+        // Trailing remainder (second list longer).
+        let a = parse_term("[A()]");
+        let b = parse_term("[A(), B()]");
+        let Term::List(ca) = &a else { panic!("a list") };
+        let Term::List(cb) = &b else { panic!("a list") };
+        let mut out = String::new();
+        let mut budget = LGG_NODE_BUDGET;
+        render_term(&lgg_list(&PyDialect, ca, cb), &mut out, &mut budget);
+        assert_eq!(out, "[A, ?]");
+    }
+
+    #[test]
+    fn lgg_list_giant_input_falls_back_to_prefix_zip() {
+        // 128 × 32 = 4096 cells — exactly the fallback boundary. An early insertion means the
+        // prefix-zip fallback and the full LCS disagree (33 vs 34 elements).
+        let ca: Vec<Term> = std::iter::once(parse_term("A()"))
+            .chain(std::iter::repeat_with(|| parse_term("B()")).take(127))
+            .collect();
+        let cb: Vec<Term> = std::iter::repeat_with(|| parse_term("B()")).take(32).collect();
+        let Term::List(items) = lgg_list(&PyDialect, &ca, &cb) else { panic!("a list") };
+        assert_eq!(items.len(), 34, "LCS aligns the leading A and the trailing B-run");
+    }
+
+    #[test]
+    fn render_truncates_beyond_budget() {
+        let deep = |tag: &str| {
+            let mut t = Term::Atom("'x'".to_owned());
+            for _ in 0..90 {
+                t = Term::Node(tag.to_owned(), vec![t]);
+            }
+            t
+        };
+        let mut out = String::new();
+        let mut budget = LGG_NODE_BUDGET;
+        render_term(&deep("W"), &mut out, &mut budget);
+        assert!(out.contains('…'), "render_term must truncate: {out}");
+    }
+
+    // ── Slot classification ───────────────────────────────────────────────────
+
+    #[test]
+    fn py_is_stmt_slot_classifies_body_slots() {
+        assert!(py_is_stmt_slot("Module", 0));
+        assert!(py_is_stmt_slot("FunctionDef", 2));
+        assert!(py_is_stmt_slot("For", 2));
+        assert!(py_is_stmt_slot("ExceptHandler", 2));
+        assert!(py_is_stmt_slot("While", 1));
+        assert!(py_is_stmt_slot("With", 1));
+        assert!(py_is_stmt_slot("If", 1));
+        assert!(py_is_stmt_slot("If", 2));
+        assert!(py_is_stmt_slot("Try", 0));
+        assert!(py_is_stmt_slot("Try", 3));
+        assert!(py_is_stmt_slot("ClassDef", 3));
+        assert!(!py_is_stmt_slot("If", 0));
+        assert!(!py_is_stmt_slot("Try", 4));
+        assert!(!py_is_stmt_slot("Assign", 0));
+    }
+
+    #[test]
+    fn py_is_selector_slot_flags_member_and_kwarg_names() {
+        assert!(py_is_selector_slot("Attribute", 1));
+        assert!(py_is_selector_slot("keyword", 0));
+        assert!(!py_is_selector_slot("Attribute", 0));
+        assert!(!py_is_selector_slot("keyword", 1));
+    }
+
+    #[test]
+    fn rust_slot_ctx_classifies_statement_selector_annotation() {
+        assert!(RustDialect.slot_ctx("Block", 0) == Ctx::Stmt);
+        assert!(RustDialect.slot_ctx("Method", 1) == Ctx::Selector);
+        assert!(RustDialect.slot_ctx("Field", 1) == Ctx::Selector);
+        assert!(RustDialect.slot_ctx("FieldVal", 0) == Ctx::Selector);
+        assert!(RustDialect.slot_ctx("PatField", 0) == Ctx::Selector);
+        assert!(RustDialect.slot_ctx("Param", 1) == Ctx::Anno);
+        assert!(RustDialect.slot_ctx("PatType", 1) == Ctx::Anno);
+        assert!(RustDialect.slot_ctx("Func", 0) == Ctx::Anno);
+        assert!(RustDialect.slot_ctx("Func", 2) == Ctx::Anno);
+        assert!(RustDialect.slot_ctx("Func", 3) == Ctx::Anno);
+        assert!(RustDialect.slot_ctx("Call", 0) == Ctx::Expr);
+    }
+
+    #[test]
+    fn go_slot_ctx_classifies_statement_selector_annotation() {
+        assert!(GoDialect.slot_ctx("Block", 0) == Ctx::Stmt);
+        assert!(GoDialect.slot_ctx("Method", 1) == Ctx::Selector);
+        assert!(GoDialect.slot_ctx("Field", 1) == Ctx::Selector);
+        assert!(GoDialect.slot_ctx("FieldVal", 0) == Ctx::Selector);
+        assert!(GoDialect.slot_ctx("Param", 1) == Ctx::Anno);
+        assert!(GoDialect.slot_ctx("PatType", 1) == Ctx::Anno);
+        assert!(GoDialect.slot_ctx("Func", 0) == Ctx::Anno);
+        assert!(GoDialect.slot_ctx("Func", 2) == Ctx::Anno);
+        assert!(GoDialect.slot_ctx("Call", 0) == Ctx::Expr);
+    }
+
+    #[test]
+    fn c_slot_ctx_classifies_statement_selector_annotation() {
+        assert!(CDialect.slot_ctx("Block", 0) == Ctx::Stmt);
+        assert!(CDialect.slot_ctx("Method", 1) == Ctx::Selector);
+        assert!(CDialect.slot_ctx("Field", 1) == Ctx::Selector);
+        assert!(CDialect.slot_ctx("OffsetOf", 1) == Ctx::Selector);
+        assert!(CDialect.slot_ctx("FieldVal", 0) == Ctx::Selector);
+        assert!(CDialect.slot_ctx("Goto", 0) == Ctx::Selector);
+        assert!(CDialect.slot_ctx("Labeled", 0) == Ctx::Selector);
+        assert!(CDialect.slot_ctx("Param", 1) == Ctx::Anno);
+        assert!(CDialect.slot_ctx("PatType", 1) == Ctx::Anno);
+        assert!(CDialect.slot_ctx("Func", 0) == Ctx::Anno);
+        assert!(CDialect.slot_ctx("Func", 2) == Ctx::Anno);
+        assert!(CDialect.slot_ctx("Call", 0) == Ctx::Expr);
+    }
+
+    #[test]
+    fn php_slot_ctx_classifies_statement_selector_annotation() {
+        assert!(PhpDialect.slot_ctx("Block", 0) == Ctx::Stmt);
+        assert!(PhpDialect.slot_ctx("Method", 1) == Ctx::Selector);
+        assert!(PhpDialect.slot_ctx("NullsafeMethod", 1) == Ctx::Selector);
+        assert!(PhpDialect.slot_ctx("Field", 1) == Ctx::Selector);
+        assert!(PhpDialect.slot_ctx("NullsafeField", 1) == Ctx::Selector);
+        assert!(PhpDialect.slot_ctx("StaticCall", 1) == Ctx::Selector);
+        assert!(PhpDialect.slot_ctx("StaticField", 1) == Ctx::Selector);
+        assert!(PhpDialect.slot_ctx("ClassConst", 1) == Ctx::Selector);
+        assert!(PhpDialect.slot_ctx("Kw", 0) == Ctx::Selector);
+        assert!(PhpDialect.slot_ctx("Goto", 0) == Ctx::Selector);
+        assert!(PhpDialect.slot_ctx("Labeled", 0) == Ctx::Selector);
+        assert!(PhpDialect.slot_ctx("Param", 1) == Ctx::Anno);
+        assert!(PhpDialect.slot_ctx("Param", 3) == Ctx::Anno);
+        assert!(PhpDialect.slot_ctx("RefParam", 1) == Ctx::Anno);
+        assert!(PhpDialect.slot_ctx("Variadic", 1) == Ctx::Anno);
+        assert!(PhpDialect.slot_ctx("Func", 0) == Ctx::Anno);
+        assert!(PhpDialect.slot_ctx("Func", 2) == Ctx::Anno);
+        assert!(PhpDialect.slot_ctx("Call", 0) == Ctx::Expr);
+    }
+
+    #[test]
+    fn ts_slot_ctx_classifies_statement_selector_annotation() {
+        assert!(TsDialect.slot_ctx("Block", 0) == Ctx::Stmt);
+        assert!(TsDialect.slot_ctx("If", 1) == Ctx::Stmt);
+        assert!(TsDialect.slot_ctx("If", 2) == Ctx::Stmt);
+        assert!(TsDialect.slot_ctx("For", 3) == Ctx::Stmt);
+        assert!(TsDialect.slot_ctx("ForIn", 2) == Ctx::Stmt);
+        assert!(TsDialect.slot_ctx("DoWhile", 0) == Ctx::Stmt);
+        assert!(TsDialect.slot_ctx("While", 1) == Ctx::Stmt);
+        assert!(TsDialect.slot_ctx("Catch", 1) == Ctx::Stmt);
+        assert!(TsDialect.slot_ctx("Member", 1) == Ctx::Selector);
+        assert!(TsDialect.slot_ctx("ObjProp", 0) == Ctx::Selector);
+        assert!(TsDialect.slot_ctx("Func", 0) == Ctx::Anno);
+        assert!(TsDialect.slot_ctx("Func", 3) == Ctx::Anno);
+        assert!(TsDialect.slot_ctx("Arrow", 2) == Ctx::Anno);
+        assert!(TsDialect.slot_ctx("Decl", 0) == Ctx::Anno);
+        assert!(TsDialect.slot_ctx("Annot", 1) == Ctx::Anno);
+        assert!(TsDialect.slot_ctx("TSAs", 1) == Ctx::Anno);
+        assert!(TsDialect.slot_ctx("Call", 0) == Ctx::Expr);
+    }
+
+    // ── Function-body extraction ──────────────────────────────────────────────
+
+    #[test]
+    fn py_parse_function_body_skips_quoted_parens_in_signature() {
+        // A quoted `)` inside the discarded `arguments` slot must not close the skip early.
+        let canon = "FunctionDef('_fn', arguments([], [arg('_v0', Constant('a)b'))]), [Return(Constant(None))], [], None)";
+        assert_eq!(py_parse_function_body(canon).len(), 1, "the body must survive the quoted `)`");
+    }
+
+    #[test]
+    fn subblock_mines_a_leading_motif_across_three_functions() {
+        // The get-or-raise motif is the FIRST two statements (start=0) and recurs in three functions
+        // (support exceeds the minimum). The window-width arithmetic and the support guard both hold.
+        let f = |exn: &str| format!("FunctionDef('_fn', arguments([], []), [Assign([Name('_v0')], Call(Attribute(Name('self'), 'get'), [Name('_v1')])), If(Compare(Name('_v0'), [Is], [Constant(None)]), [Raise(Call(Name('{exn}'), [Name('_v1')]))], []), Return(Name('_v0'))], [], None)");
+        let cands = subblock_helpers(&PyDialect, &[f("A"), f("B"), f("C")], 2, &ExtractCfg::default());
+        assert_eq!(cands.len(), 1, "the leading 3-supported motif must be mined: {cands:?}");
+    }
+
+    #[test]
+    fn py_parse_function_body_rejects_non_function_forms() {
+        // A bare identifier (no `(`) exercises the tag-scan bound; a non-FunctionDef node with a
+        // body-shaped slot-2 list must not be parsed as a function body.
+        assert!(py_parse_function_body("Module").is_empty(), "a bare non-Func tag has no body");
+        assert!(py_parse_function_body("FunctionDef('_fn'").is_empty(), "a truncated Func has no body");
+        assert!(py_parse_function_body("ClassDef('C', [Pass], [Expr(Constant(1))])").is_empty(), "a ClassDef must not be parsed as a FunctionDef");
+    }
+
+    #[test]
+    fn rs_parse_function_body_matches_full_parse() {
+        let canon = "Func('_fn', Params(Param(Bind('_v0'), Ty('i32'))), Ty('i32'), 'async', Block(Return(Bind('_v0'))))";
+        let body = rs_parse_function_body(canon);
+        assert_eq!(body.len(), 1);
+        assert_eq!(body[0], parse_term("Return(Bind('_v0'))"));
+        assert!(rs_parse_function_body("Module").is_empty(), "a non-Func canonical has no body");
+        assert!(rs_parse_function_body("Foo('n', 'p', 'r', 'f', Block(Return(Bind('_v0'))))").is_empty(), "a non-Func tag must not be parsed as a Func");
+    }
+
+    #[test]
+    fn go_parse_function_body_skips_signature_slots() {
+        let canon = "Func('_fn', Params(Param(Bind('_v0'), Ty('int'))), Ty('int'), Block(Return(Bind('_v0'))))";
+        let body = go_parse_function_body(canon);
+        assert_eq!(body.len(), 1);
+        assert!(go_parse_function_body("Module").is_empty(), "a non-Func canonical has no body");
+        assert!(go_parse_function_body("Foo('n', 'p', 'r', Block(Return(Bind('_v0'))))").is_empty(), "a non-Func tag must not be parsed as a Func");
+    }
+
+    #[test]
+    fn ts_parse_function_body_handles_func_arrow_and_var() {
+        assert_eq!(ts_parse_function_body("Func('_fn', Params(Param(Bind('_v0'))), Block(Return(Bind('_v0'))))").len(), 1);
+        assert_eq!(ts_parse_function_body("Arrow(Params(Param(Bind('_v0'))), Block(Return(Bind('_v0'))))").len(), 1);
+        let var = "Var('const', [Decl(Bind('_fn'), Func('_fn', Params(Param(Bind('_v0'))), Block(Return(Bind('_v0')))))])";
+        assert_eq!(ts_parse_function_body(var).len(), 1);
+        assert!(ts_parse_function_body("Module([Pass])").is_empty(), "a non-function term has no body");
+    }
+
+    #[test]
+    fn block_inner_renders_non_blank_children() {
+        let t = parse_term("'x'");
+        let mut out = String::new();
+        let mut b = LGG_NODE_BUDGET;
+        block_inner(Some(&t), &mut out, &mut b, go_render);
+        assert_eq!(out, "x");
+    }
+
+    // ── Operator / renderer leaf helpers ──────────────────────────────────────
+
+    #[test]
+    fn op_of_and_unary_of_accept_both_node_and_atom_operators() {
+        // `Add` as a node and as a bareword both map to `+`.
+        assert_eq!(op_of(Some(&parse_term("Add"))), "+");
+        assert_eq!(op_of(Some(&parse_term("Add()"))), "+");
+        assert_eq!(op_of(Some(&Term::Hole)), "?");
+        // `Not` as a node and as a bareword both map to the `not ` prefix.
+        assert_eq!(unary_of(Some(&parse_term("Not"))), "not ");
+        assert_eq!(unary_of(Some(&parse_term("Not()"))), "not ");
+        assert_eq!(unary_of(Some(&Term::Hole)), "?");
+    }
+
+    #[test]
+    fn ts_assign_op_covers_every_compound_operator() {
+        let sym = |s: &str| ts_assign_op(Some(&Term::Atom(format!("'{s}'"))));
+        assert_eq!(sym("Addition"), "+=");
+        assert_eq!(sym("Subtraction"), "-=");
+        assert_eq!(sym("Multiplication"), "*=");
+        assert_eq!(sym("Division"), "/=");
+        assert_eq!(sym("Remainder"), "%=");
+        assert_eq!(sym("Exponential"), "**=");
+        assert_eq!(sym("ShiftLeft"), "<<=");
+        assert_eq!(sym("ShiftRight"), ">>=");
+        assert_eq!(sym("ShiftRightZeroFill"), ">>>=");
+        assert_eq!(sym("BitwiseOR"), "|=");
+        assert_eq!(sym("BitwiseXOR"), "^=");
+        assert_eq!(sym("BitwiseAnd"), "&=");
+        assert_eq!(sym("LogicalOr"), "||=");
+        assert_eq!(sym("LogicalAnd"), "&&=");
+        assert_eq!(sym("LogicalNullish"), "??=");
+        assert_eq!(ts_assign_op(Some(&Term::Hole)), "=");
+        assert_eq!(ts_assign_op(Some(&parse_term("Assign"))), "=");
+    }
+
+    // ── measure / extractability / unq ────────────────────────────────────────
+
+    #[test]
+    fn measure_tallies_fixed_holes_and_anchors() {
+        // A function with an expression-hole (holed Call arg) and a statement-hole (holed body
+        // element), plus fixed nodes and a shared anchor.
+        let term = Term::Node(
+            "FunctionDef".to_owned(),
+            vec![
+                Term::Atom("'_fn'".to_owned()),
+                Term::Node("arguments".to_owned(), vec![Term::List(vec![]), Term::List(vec![])]),
+                Term::List(vec![
+                    Term::Node("Expr".to_owned(), vec![Term::Node(
+                        "Call".to_owned(),
+                        vec![
+                            Term::Node("Name".to_owned(), vec![Term::Atom("'log'".to_owned())]),
+                            Term::List(vec![Term::Hole]),
+                            Term::List(vec![]),
+                        ],
+                    )]),
+                    Term::Hole,
+                ]),
+                Term::List(vec![]),
+                Term::Atom("None".to_owned()),
+            ],
+        );
+        let mut m = Measure::default();
+        measure(&PyDialect, &term, Ctx::Expr, &mut m);
+        assert_eq!(m.expr_holes, 1);
+        assert_eq!(m.stmt_holes, 1);
+        assert!(m.fixed > 0, "the fixed skeleton is non-empty");
+        assert!(m.anchors.contains("log"), "the shared callee name is an anchor: {:?}", m.anchors);
+    }
+
+    #[test]
+    fn is_placeholder_only_accepts_digit_suffixes() {
+        assert!(is_placeholder("_v0"));
+        assert!(is_placeholder("_v42"));
+        assert!(!is_placeholder("_v"));
+        assert!(!is_placeholder("_vfoo"));
+        assert!(!is_placeholder("_w0"));
+        assert!(!is_placeholder("v0"));
+        assert!(!is_placeholder(""));
+    }
+
+    #[test]
+    fn unq_strips_one_layer_of_quotes() {
+        assert_eq!(unq("'name'"), "name");
+        assert_eq!(unq("\"name\""), "name");
+        assert_eq!(unq("name"), "name");
+        assert_eq!(unq("'a'b'"), "a'b");
+    }
+
+    #[test]
+    fn seq_into_joins_a_list_and_a_lone_hole() {
+        let list = parse_term("[Name('_v0'), Name('_v1')]");
+        let mut out = String::new();
+        let mut b = LGG_NODE_BUDGET;
+        let mut first = true;
+        seq_into(Some(&list), &mut first, &mut out, &mut b, super::py);
+        assert_eq!(out, "_v0, _v1");
+        let mut out = String::new();
+        let mut b = LGG_NODE_BUDGET;
+        let mut first = true;
+        seq_into(Some(&Term::Hole), &mut first, &mut out, &mut b, super::py);
+        assert_eq!(out, "?");
+    }
 }

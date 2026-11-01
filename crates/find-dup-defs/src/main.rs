@@ -354,6 +354,403 @@ mod directive_helper_tests {
     }
 }
 
+#[cfg(test)]
+mod unit_tests {
+    use std::path::Path;
+
+    use dup_defs_core::kinds::{CONSTANTS, FUNCTIONS};
+    use dup_defs_core::{Frontend, KindSpec, ScanOpts};
+    use find_dup_defs::{Finding, Severity};
+
+    fn finding(
+        name: &str,
+        pass: &'static str,
+        kind: &'static KindSpec,
+        severity: Severity,
+        thickness: f64,
+        members: Vec<(String, usize, usize)>,
+    ) -> Finding {
+        Finding {
+            pass,
+            kind,
+            name: name.to_owned(),
+            severity,
+            min_sim: Some(1.0),
+            loc: 3,
+            args: 1,
+            thickness,
+            snippet: "def f():\n    return 1".to_owned(),
+            notes: Vec::new(),
+            members,
+            pattern: None,
+            facets: Vec::new(),
+        }
+    }
+
+    // ── path predicates: each term gets its own "only this marker" input, so a `||`→`&&` flip
+    //    at any junction turns at least one true case false (or one false case true). ──
+
+    #[test]
+    fn path_is_i18n_recognizes_each_locale_convention_independently() {
+        for p in ["a/locale/b.py", "a/locales/b.py", "a/i18n/b.py", "a/translations/b.py"] {
+            assert!(super::path_is_i18n(p), "{p:?}");
+        }
+        assert!(!super::path_is_i18n("src/util/strings.py"));
+    }
+
+    #[test]
+    fn path_is_test_recognizes_each_tree_and_file_convention_independently() {
+        for p in [
+            "a/tests/b.py",
+            "a/test/b.py",
+            "a/__tests__/b.py",
+            "a/test_cases/b.py",
+            "a/test-cases/b.py",
+            "a/__fixtures__/b.py",
+            "a/fixtures/b.py",
+            "a/integration/b.py",
+            "a/e2e/b.py",
+        ] {
+            assert!(super::path_is_test(p), "dir marker {p:?}");
+        }
+        for p in ["test_foo.py", "foo_test.py", "foo.test.ts", "foo.spec.ts"] {
+            assert!(super::path_is_test(p), "file marker {p:?}");
+        }
+        assert!(!super::path_is_test("src/util/helper.py"));
+        assert!(!super::path_is_test("foo.ts"));
+    }
+
+    #[test]
+    fn path_is_generated_recognizes_each_codegen_suffix_independently() {
+        for p in [
+            "x_pb2.py",
+            "x_grpc.py",
+            "x.gen.py",
+            "x.generated.ts",
+            "x.generated.tsx",
+            "x.generated.js",
+            "x.generated.jsx",
+            "a/_generated/x.py",
+            "a/generated/x.py",
+            "a/__generated__/x.py",
+        ] {
+            assert!(super::path_is_generated(p), "{p:?}");
+        }
+        assert!(!super::path_is_generated("src/util/helper.py"));
+    }
+
+    #[test]
+    fn path_is_migration_recognizes_each_migration_root() {
+        assert!(super::path_is_migration("db/migrations/001.py"));
+        assert!(super::path_is_migration("db/alembic/versions/001.py"));
+        assert!(!super::path_is_migration("db/models.py"));
+    }
+
+    #[test]
+    fn path_is_dts_recognizes_each_declaration_suffix() {
+        for p in ["foo.d.ts", "foo.d.tsx", "foo.d.mts", "foo.d.cts"] {
+            assert!(super::path_is_dts(p), "{p:?}");
+        }
+        assert!(!super::path_is_dts("foo.ts"));
+    }
+
+    #[test]
+    fn path_is_doc_example_recognizes_each_example_convention_independently() {
+        for p in [
+            "a/docs_src/b.py",
+            "a/docs/src/b.py",
+            "a/examples/b.py",
+            "a/example/b.py",
+            "a/tutorial/b.py",
+            "a/tutorials/b.py",
+            "a/samples/b.py",
+        ] {
+            assert!(super::path_is_doc_example(p), "{p:?}");
+        }
+        assert!(!super::path_is_doc_example("src/util/helper.py"));
+    }
+
+    #[test]
+    fn split_path_splits_the_last_component() {
+        assert_eq!(super::split_path("src/a.py"), ("a.py", "src"));
+        assert_eq!(super::split_path("a/b/c.py"), ("c.py", "a/b"));
+        assert_eq!(super::split_path("a.py"), ("a.py", ""));
+    }
+
+    #[test]
+    fn same_filename_across_dirs_is_the_fork_signature() {
+        let f = finding(
+            "d", "name", &FUNCTIONS, Severity::Error, 0.5,
+            vec![("src/a.py".to_owned(), 1, 0), ("ext/a.py".to_owned(), 1, 0)],
+        );
+        assert!(super::cluster_is_same_filename_across_dirs(&f));
+        let f2 = finding(
+            "d", "name", &FUNCTIONS, Severity::Error, 0.5,
+            vec![("src/a.py".to_owned(), 1, 0), ("ext/b.py".to_owned(), 1, 0)],
+        );
+        assert!(!super::cluster_is_same_filename_across_dirs(&f2), "different filenames are not a fork");
+        let f3 = finding(
+            "d", "name", &FUNCTIONS, Severity::Error, 0.5,
+            vec![("src/a.py".to_owned(), 1, 0), ("src/a.py".to_owned(), 2, 0)],
+        );
+        assert!(!super::cluster_is_same_filename_across_dirs(&f3), "one directory is not a fork");
+    }
+
+    #[test]
+    fn split_at_shared_suffix_splits_on_the_longest_common_suffix() {
+        let cases = [
+            ("a/b/c", "x/b/c", "a", "x"),
+            ("a/b/c", "a/b/c", "", ""),
+            ("a/b/c", "c", "a/b", ""),
+            ("a/b", "c/d", "a/b", "c/d"),
+            ("x", "x", "", ""),
+            ("", "", "", ""),
+            ("a/x", "x", "a", ""),
+            ("b/c", "x/b/c", "", "x"),
+            ("a/b/c/d/e", "x/y/d/e", "a/b/c", "x/y"),
+            ("x/y/d/e", "a/b/c/d/e", "x/y", "a/b/c"),
+        ];
+        for (a, b, ap, bp) in cases {
+            assert_eq!(super::split_at_shared_suffix(a, b), (ap.to_owned(), bp.to_owned()), "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn vendored_score_counts_each_marker_exactly() {
+        let cases = [
+            ("a/fixtures/b", 10),
+            ("a/__fixtures__/b", 10),
+            ("a/test/b", 5),
+            ("a/tests/b", 5),
+            ("a/__tests__/b", 5),
+            ("a/vendor/b", 8),
+            ("a/vendored/b", 8),
+            ("a/third_party/b", 8),
+            ("a/util/b", 1),
+            ("a/util/vs/b", 5),
+            ("a/extensions/b", 1),
+            ("a/extension/b", 1),
+            ("src/pages/dashboard", 0),
+        ];
+        for (dir, expected) in cases {
+            assert_eq!(super::vendored_score(dir), expected, "{dir:?}");
+        }
+    }
+
+    // ── calibration / display ──
+
+    #[test]
+    fn thickness_histogram_bins_boundaries_and_saturation() {
+        let hist = super::thickness_histogram(&[0.1, 1.0]);
+        assert_eq!(hist.len(), 10);
+        assert_eq!(hist[0].count, 0, "0.1 is not inside [0.0, 0.1)");
+        assert_eq!(hist[1].count, 1, "0.1 lands in [0.1, 0.2)");
+        assert_eq!(hist[9].count, 1, "1.0 saturates into the top bin");
+        let total: usize = hist.iter().map(|b| b.count).sum();
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn dedent_python_def_body_strips_class_indent_keeping_blank_lines() {
+        assert_eq!(super::dedent_python_def_body("def m():\n        body"), "def m():\n    body");
+        assert_eq!(
+            super::dedent_python_def_body("def m():\n            body\n\n            more"),
+            "def m():\n    body\n\n    more"
+        );
+    }
+
+    #[test]
+    fn snippet_box_elides_long_bodies() {
+        let out = super::snippet_box("a\nb\nc", 2);
+        assert!(out.contains("(+1 more lines)"), "{out:?}");
+    }
+
+    #[test]
+    fn fmt_member_locations_collapses_same_file_and_truncates() {
+        assert_eq!(super::fmt_member_locations(&["a.py:1".to_owned(), "a.py:2".to_owned()], 5), "a.py:1, :2");
+        let tail = super::fmt_member_locations(
+            &["a.py:1".to_owned(), "b.py:2".to_owned(), "c.py:3".to_owned(), "d.py:4".to_owned()],
+            2,
+        );
+        assert!(tail.contains("(+2 more)"), "{tail:?}");
+    }
+
+    #[test]
+    fn format_calibration_runs_tiers_when_only_one_severity_is_present() {
+        let root = Path::new("/__fdd_no_such_root__");
+        let f = finding("dup", "name", &FUNCTIONS, Severity::Error, 0.5, vec![("src/file.py".to_owned(), 1, 0)]);
+        let all = vec![f];
+        let errs: Vec<&Finding> = all.iter().collect();
+        let warns: Vec<&Finding> = Vec::new();
+        let out = super::format_calibration(&errs, &warns, &all, &[], root);
+        assert!(out.contains("1 clusters analyzed"), "errors-only still renders the ERROR tier:\n{out}");
+    }
+
+    #[test]
+    fn cross_name_passes_are_the_three_name_agnostic_ones() {
+        assert!(super::is_cross_name("cross-name"));
+        assert!(super::is_cross_name("type-3"));
+        assert!(super::is_cross_name("pattern"));
+        assert!(!super::is_cross_name("name"));
+    }
+
+    #[test]
+    fn report_sections_offsets_cross_name_and_type3_from_the_name_pass() {
+        let frontends: Vec<&dyn Frontend> = vec![&py_canon::Python, &ts_canon::TypeScript];
+        let scan_opts = ScanOpts { kinds: None, facets: false };
+        let sections = super::report_sections(&frontends, 0.5, 0.85, false, false, false, &scan_opts);
+        let func_xname = sections
+            .iter()
+            .find(|(_, h)| h.starts_with("duplicate functions (cross-name, exact"))
+            .expect("cross-name section");
+        assert_eq!(func_xname.0, 2, "functions cross-name sits one past the name pass (section 1)");
+        let func_t3 = sections
+            .iter()
+            .find(|(_, h)| h.starts_with("duplicate functions (cross-name Type-3"))
+            .expect("type-3 section");
+        assert_eq!(func_t3.0, 3, "functions Type-3 sits two past the name pass");
+    }
+
+    // ── directive inference ──
+
+    #[test]
+    fn infer_directives_suggests_a_cap_for_large_name_groups() {
+        let root = Path::new("/__fdd_no_such_root__");
+        let five: Vec<(&'static KindSpec, String, usize)> =
+            (0..5).map(|i| (&FUNCTIONS, format!("shared{i}"), 300)).collect();
+        let dirs = super::infer_directives(&[], &five, root);
+        let cap = dirs.iter().find(|d| d.directive == "settings:max-name-group=256").expect("cap suggestion");
+        assert!(cap.rationale.contains("+1 more"), "five groups truncate the sample: {}", cap.rationale);
+        assert_eq!(cap.affects_total, 1500);
+
+        let four: Vec<(&'static KindSpec, String, usize)> =
+            (0..4).map(|i| (&FUNCTIONS, format!("shared{i}"), 300)).collect();
+        let dirs = super::infer_directives(&[], &four, root);
+        let cap = dirs.iter().find(|d| d.directive == "settings:max-name-group=256").expect("cap suggestion");
+        assert!(!cap.rationale.contains("more"), "four groups need no ellipsis: {}", cap.rationale);
+        assert_eq!(cap.affects_total, 1200);
+    }
+
+    #[test]
+    fn infer_directives_counts_the_thin_patternology_tail() {
+        let root = Path::new("/__fdd_no_such_root__");
+        let thickness: [(f64, Severity); 10] = [
+            (0.0, Severity::Warning),
+            (0.1, Severity::Warning),
+            (0.2, Severity::Warning),
+            (0.3, Severity::Info),
+            (0.4, Severity::Info),
+            (0.5, Severity::Info),
+            (0.6, Severity::Warning),
+            (0.6, Severity::Info),
+            (0.6, Severity::Error),
+            (0.7, Severity::Error),
+        ];
+        let findings: Vec<Finding> = thickness
+            .iter()
+            .enumerate()
+            .map(|(i, &(t, sev))| {
+                finding(&format!("pat-{i}"), "pattern", &FUNCTIONS, sev, t, vec![("src/foo.py".to_owned(), 1, 0)])
+            })
+            .collect();
+        let dirs = super::infer_directives(&findings, &[], root);
+        let floor = dirs
+            .iter()
+            .find(|d| d.directive.starts_with("settings:pattern-min-thickness="))
+            .expect("pattern floor suggestion");
+        assert_eq!(floor.affects_total, 6);
+        assert_eq!(floor.affects_warning, 3);
+        assert_eq!(floor.affects_info, 3);
+        assert_eq!(floor.affects_error, 0);
+    }
+
+    #[test]
+    fn infer_directives_uses_the_majority_locale_heuristic() {
+        let root = Path::new("/__fdd_no_such_root__");
+        let mut findings: Vec<Finding> = Vec::new();
+        for i in 0..5 {
+            findings.push(finding(
+                &format!("c{i}"), "name", &CONSTANTS, Severity::Error, 0.5,
+                vec![("src/locale/a.py".to_owned(), 1, 0)],
+            ));
+        }
+        findings.push(finding(
+            "not-locale", "name", &CONSTANTS, Severity::Error, 0.5,
+            vec![("src/util/a.py".to_owned(), 1, 0)],
+        ));
+        findings.push(finding(
+            "mixed", "name", &CONSTANTS, Severity::Error, 0.5,
+            vec![("src/locale/a.py".to_owned(), 1, 0), ("src/util/a.py".to_owned(), 1, 0)],
+        ));
+        findings.push(finding(
+            "fn-locale", "name", &FUNCTIONS, Severity::Error, 0.5,
+            vec![("src/locale/b.py".to_owned(), 1, 0)],
+        ));
+        findings.push(finding(
+            "fn-locale2", "name", &FUNCTIONS, Severity::Error, 0.5,
+            vec![("src/locale/c.py".to_owned(), 1, 0)],
+        ));
+
+        let dirs = super::infer_directives(&findings, &[], root);
+        let locale = dirs
+            .iter()
+            .find(|d| d.directive == "suppress:<constants>*@*locale*=i18n locale tables, duplication is by design")
+            .expect("constants-locale suggestion");
+        assert_eq!(locale.affects_total, 5, "only the 5 ≥80%-locale constants match");
+    }
+
+    #[test]
+    fn infer_directives_distinguishes_test_naming_from_test_dirs() {
+        let root = Path::new("/__fdd_no_such_root__");
+        let findings: Vec<Finding> = (0..3)
+            .map(|i| {
+                finding(
+                    &format!("t{i}"), "name", &FUNCTIONS, Severity::Warning, 0.5,
+                    vec![(format!("src/foo{i}.test.ts"), 1, 0)],
+                )
+            })
+            .collect();
+        let dirs = super::infer_directives(&findings, &[], root);
+        let named = dirs
+            .iter()
+            .find(|d| d.directive == "de-escalate:*@*.{test,spec}.*=test files by .test.* / .spec.* naming")
+            .expect("test-naming suggestion");
+        assert_eq!(named.affects_total, 3);
+    }
+
+    #[test]
+    fn infer_vendored_directives_rolls_snapshots_to_their_deepest_root() {
+        let root = Path::new("/__fdd_no_such_root__");
+        let mut findings: Vec<Finding> = Vec::with_capacity(60);
+        for i in 0..30 {
+            findings.push(finding(
+                &format!("one-{i}"), "name", &FUNCTIONS, Severity::Error, 0.5,
+                vec![
+                    (format!("root/src/a{i}.py"), 1, 0),
+                    (format!("root/vendor/one/a{i}.py"), 1, 0),
+                ],
+            ));
+            findings.push(finding(
+                &format!("sub-{i}"), "name", &FUNCTIONS, Severity::Error, 0.5,
+                vec![
+                    (format!("root/src/b{i}.py"), 1, 0),
+                    (format!("root/vendor/one/sub/b{i}.py"), 1, 0),
+                ],
+            ));
+        }
+        let dirs = super::infer_vendored_directives(&findings, root);
+        assert_eq!(dirs.len(), 1, "one snapshot root survives the parent-drop");
+        assert_eq!(
+            dirs[0].directive,
+            "suppress:*@*root/vendor/one/sub*=likely vendored / fork snapshot mirroring root/src"
+        );
+        assert_eq!(dirs[0].affects_total, 30);
+        assert_eq!(dirs[0].affects_error, 30);
+        assert_eq!(dirs[0].affects_warning, 0);
+        assert_eq!(dirs[0].affects_info, 0);
+    }
+}
+
 /// Loop a single pipeline pass over already-scanned `defs` and report min/median (ms). Driven by
 /// the `FDD_BENCH` env hook in `main` so a change to one pass is A/B'd across rebuilds without the
 /// full pipeline. CPU `Rationer` (matches the default backend). Dev-only perf scaffolding.
