@@ -62,3 +62,51 @@ pub fn components(n: usize, edges: &[(usize, usize)]) -> Vec<Vec<usize>> {
     }
     groups.into_values().collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::cosine;
+
+    fn assert_cos(a: &[(u32, f64)], b: &[(u32, f64)], na: f64, nb: f64, expected: f64) {
+        let got = cosine(a, b, na, nb);
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "cosine({a:?}, {b:?}, na={na}, nb={nb}) = {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn zero_norms_short_circuit_to_zero() {
+        // One zero norm returns 0.0 whatever the shared ids — the dot would divide by zero.
+        assert_cos(&[(1, 1.0)], &[(1, 1.0)], 0.0, 1.0, 0.0);
+        assert_cos(&[(1, 1.0)], &[(1, 1.0)], 1.0, 0.0, 0.0);
+    }
+
+    #[test]
+    fn a_single_shared_id_is_its_product_over_the_norms() {
+        // dot = 2·3 = 6, na·nb = 2·3 = 6 → exactly 1.0. The division and both multiplications
+        // must be the ones above or the answer moves.
+        assert_cos(&[(1, 2.0)], &[(1, 3.0)], 2.0, 3.0, 1.0);
+    }
+
+    #[test]
+    fn the_merge_advances_both_cursors_only_on_shared_ids() {
+        // ids 1 and 2 shared: dot = 2·3 + 4·5 = 26 over na·nb = 30.
+        assert_cos(&[(1, 2.0), (2, 4.0)], &[(1, 3.0), (2, 5.0)], 5.0, 6.0, 26.0 / 30.0);
+    }
+
+    #[test]
+    fn the_merge_skips_unmatched_ids_on_either_side() {
+        // Only id 3 is shared (Less arm advances a, Greater arm advances b): dot = 4·6 = 24 over 20.
+        assert_cos(&[(1, 2.0), (3, 4.0)], &[(2, 5.0), (3, 6.0)], 4.0, 5.0, 24.0 / 20.0);
+    }
+
+    #[test]
+    fn a_repeated_shared_id_is_counted_once_per_match() {
+        // b carries id 1 twice; the Equal arm must advance i (and only then j) so the pair is
+        // counted once: dot = 2·3 = 6 over 2·5 = 10.
+        assert_cos(&[(1, 2.0)], &[(1, 3.0), (1, 4.0)], 2.0, 5.0, 6.0 / 10.0);
+        // Mirror: a carries id 1 twice — the Equal arm must advance j to stop re-matching.
+        assert_cos(&[(1, 2.0), (1, 5.0)], &[(1, 3.0)], 5.0, 3.0, 6.0 / 15.0);
+    }
+}

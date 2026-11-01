@@ -2773,7 +2773,11 @@ pub fn pass_converge(defs: &[Def], top: usize, cap: usize) -> Vec<Finding> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clique_cover, pass_converge, tokens, Tok, Vocab};
+    use super::{
+        anti_unify, clique_cover, corpus_of, derive, fork_term, group_of, intern, is_slot, pass_converge,
+        run_starts, shared_subject, shape, skeleton, slice, tokens, tokens_into, Corpus, Gap, Pair,
+        Renaming, Run, RunFork, SubjectFork, Tok, Vocab,
+    };
     use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
     use dup_defs_core::{Analysis, CanonDialect, Def, Facets, KindSpec, Statement};
     use std::sync::Arc;
@@ -3038,5 +3042,797 @@ mod tests {
     fn a_definition_does_not_diverge_from_itself() {
         let a = def("a", "one.py", &body(&[("_v1 = f(_v0)", 1), ("_v1 = f(_v0)", 1), ("return _v1", 1)]), &[]);
         assert!(pass_converge(&[a], 0, super::SEED_CAP).is_empty(), "a repeated statement inside one body is not a pair");
+    }
+
+    // ------------------------------------------------------------------
+    // Helpers for the focused unit tests below.
+    // ------------------------------------------------------------------
+
+    /// A `Corpus` where only the name rarities matter; everything else is empty.
+    fn corpus_of_names(name_rarities: &[(&str, f64)]) -> Corpus {
+        let mut name_id = HashMap::default();
+        let name = name_rarities
+            .iter()
+            .enumerate()
+            .map(|(i, (s, r))| {
+                name_id.insert((*s).to_owned(), u32::try_from(i).expect("name index fits u32"));
+                *r
+            })
+            .collect();
+        Corpus {
+            key: Vec::new(),
+            shape: Vec::new(),
+            name,
+            unknown_name: 3.0,
+            name_id,
+            subject: Vec::new(),
+            subject_count: Vec::new(),
+        }
+    }
+
+    /// Render tokens as `tag:text` so they compare and print without a `Debug` impl on `Tok`.
+    fn spell(toks: &[Tok<'_>]) -> Vec<String> {
+        toks.iter()
+            .map(|tok| {
+                let (tag, s) = match tok {
+                    Tok::Name(s) => ("n", *s),
+                    Tok::Slot(s) => ("s", *s),
+                    Tok::Lit(s) => ("l", *s),
+                    Tok::Punct(s) => ("p", *s),
+                };
+                format!("{tag}:{s}")
+            })
+            .collect()
+    }
+
+    /// `n` `Tok::Punct("x")` tokens followed by `names` name tokens.
+    fn big_toks(punct: usize, names: &[&'static str]) -> Vec<Tok<'static>> {
+        let mut v: Vec<Tok<'static>> = std::iter::repeat_n(Tok::Punct("x"), punct).collect();
+        v.extend(names.iter().map(|n| Tok::Name(n)));
+        v
+    }
+
+    /// A line of `n` "a" tokens (one space between each), plus a trailing "a" when `extra`.
+    /// `n` names + `n` spaces = `2n` tokens; with `extra` it is `2n + 1`.
+    fn run_of_a(n: usize, extra: bool) -> String {
+        let mut s = "a ".repeat(n);
+        if extra {
+            s.push('a');
+        }
+        s
+    }
+
+    // ------------------------------------------------------------------
+    // Tokens: is_slot
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn is_slot_recognizes_slots_and_rejects_near_misses() {
+        assert!(is_slot("_"));
+        assert!(is_slot("_fn"));
+        assert!(is_slot("_v0"));
+        assert!(is_slot("_s12"));
+        assert!(is_slot("_T3"));
+        assert!(!is_slot("_v"));
+        assert!(!is_slot("_v0x"));
+        assert!(!is_slot("_s"));
+        assert!(!is_slot("name"));
+    }
+
+    // ------------------------------------------------------------------
+    // Tokens: tokens / tokens_into
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn numbers_lex_as_one_literal_including_a_decimal_point() {
+        assert_eq!(spell(&tokens("123.45", Vocab::Source)), vec!["l:123.45"]);
+        assert_eq!(spell(&tokens("_v1 = 42", Vocab::Source)), vec!["s:_v1", "p: ", "p:=", "p: ", "l:42"]);
+    }
+
+    #[test]
+    fn an_unclosed_quote_is_reported_not_closed() {
+        let mut out = Vec::new();
+        assert!(!tokens_into("'abc", Vocab::Source, &mut out), "an open quote is not closed");
+        let mut out2 = Vec::new();
+        assert!(!tokens_into("'", Vocab::Source, &mut out2), "a lone quote is not closed");
+        let mut out3 = Vec::new();
+        assert!(tokens_into("'ok'", Vocab::Source, &mut out3), "a shut quote is closed");
+    }
+
+    // ------------------------------------------------------------------
+    // Tokens: skeleton
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn an_attribute_chain_collapses_to_one_hole() {
+        assert_eq!(skeleton(&tokens("foo.bar", Vocab::Source), 7), "_");
+        assert_eq!(skeleton(&tokens("foo.bar.baz", Vocab::Source), 11), "_");
+        assert_eq!(skeleton(&tokens("foo.", Vocab::Source), 4), "_.");
+    }
+
+    // ------------------------------------------------------------------
+    // Tokens: slot_normalize / skeleton hole shapes
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_literal_loses_its_delimiters_but_a_name_is_a_hole() {
+        // Keywords, slots and names are all holes; only the punctuation survives.
+        assert_eq!(skeleton(&tokens("if _v0 is None:", Vocab::Source), 15), "_ _ _ _:");
+        // A numeric literal is a hole too, and the spacing is the grammar it keeps.
+        assert_eq!(skeleton(&tokens("_v0 = 42", Vocab::Source), 8), "_ = _");
+    }
+
+    // ------------------------------------------------------------------
+    // Intern
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn intern_sorts_distinct_strings_when_asked() {
+        let (text, ids) = intern(&["zeta", "alpha", "zeta"], true);
+        assert_eq!(text, vec!["alpha", "zeta"]);
+        assert_eq!(ids, vec![1, 0, 1]);
+        let (text2, ids2) = intern(&["zeta", "alpha", "zeta"], false);
+        assert_eq!(text2.len(), 2, "two distinct spellings");
+        assert_eq!(ids2[0], ids2[2], "equal text shares one id");
+        assert_ne!(ids2[0], ids2[1], "distinct text has distinct ids");
+    }
+
+    // ------------------------------------------------------------------
+    // slice
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn slice_clamps_to_the_input() {
+        assert!(slice(&[1, 2, 3], 5, 1).is_empty(), "past the end is empty");
+        assert!(slice(&[1, 2, 3], 0, 0).is_empty(), "zero length is empty");
+        assert_eq!(slice(&[1, 2, 3], 1, 5), &[2, 3], "clamped at the end");
+    }
+
+    // ------------------------------------------------------------------
+    // shared_subject
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn shared_subject_returns_the_rarest_common_node() {
+        let corpus = Corpus {
+            key: Vec::new(),
+            shape: Vec::new(),
+            name: Vec::new(),
+            unknown_name: 0.0,
+            name_id: HashMap::default(),
+            subject: vec![1.0, 2.0, 3.0],
+            subject_count: Vec::new(),
+        };
+        let shared = shared_subject(&[0, 1, 2], &[1, 2], &corpus);
+        assert!((shared - 3.0).abs() < 1e-9, "the rarest common node: {shared}");
+        assert!((shared_subject(&[0], &[1], &corpus)).abs() < 1e-9, "nothing shared is zero");
+    }
+
+    // ------------------------------------------------------------------
+    // run_starts
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn run_starts_walks_runs_of_equal_keys() {
+        let items = [1, 1, 2, 2, 2, 3];
+        assert_eq!(run_starts(&items, |x, y| x == y), vec![0, 2, 5, 6]);
+    }
+
+    // ------------------------------------------------------------------
+    // group_of
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn group_of_partitions_the_cluster_id_space() {
+        let no_run = Pair { a: 0, b: 1, run: None, subject: None };
+        assert_eq!(group_of(&no_run, 7, 10), (10u64) + (1u64 << 16) + 7);
+
+        let run = Run { a_at: 0, b_at: 0, len: 3, gap_a: 0, gap_b: 0, run2: 0 };
+        let nameless = Pair {
+            a: 0,
+            b: 1,
+            run: Some(RunFork { run, flip: false, sharpness: 1.0, anchor: None, peak: 0.0 }),
+            subject: None,
+        };
+        assert_eq!(group_of(&nameless, 7, 10), (10u64) + 3);
+
+        let anchored = Pair {
+            a: 0,
+            b: 1,
+            run: Some(RunFork {
+                run,
+                flip: false,
+                sharpness: 1.0,
+                anchor: Some(42),
+                peak: 0.0,
+            }),
+            subject: None,
+        };
+        assert_eq!(group_of(&anchored, 7, 10), 42);
+    }
+
+    // ------------------------------------------------------------------
+    // anti_unify
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn anti_unify_splits_holes_along_the_lcs() {
+        let f = anti_unify("foo bar", "foo baz", Vocab::Source);
+        assert_eq!(f.holes_a, vec!["bar"]);
+        assert_eq!(f.holes_b, vec!["baz"]);
+    }
+
+    #[test]
+    fn anti_unify_falls_back_to_the_multiset_past_the_cap() {
+        // 161 tokens on the left: the multiset branch reports no holes (both name sets are {a}).
+        let big = run_of_a(80, true);
+        assert!(tokens(&big, Vocab::Source).len() > 160);
+        let f = anti_unify(&big, "a", Vocab::Source);
+        assert!(f.holes_a.is_empty(), "multiset difference is empty: {:?}", f.holes_a);
+        assert_eq!(f.holes_b, Vec::<String>::new());
+    }
+
+    #[test]
+    fn anti_unify_reads_exactly_at_the_cap_with_the_lcs() {
+        // 160 tokens: still the exact DP, so the unmatched a's fall into the left holes.
+        let at_cap = run_of_a(80, false);
+        assert_eq!(tokens(&at_cap, Vocab::Source).len(), 160);
+        let f = anti_unify(&at_cap, "a", Vocab::Source);
+        assert_eq!(f.holes_a, vec!["a"]);
+        assert_eq!(f.holes_b, Vec::<String>::new());
+    }
+
+    #[test]
+    fn anti_unify_reads_exactly_at_the_right_cap_with_the_lcs() {
+        let at_cap = run_of_a(80, false); // 160 tokens on the right
+        let f = anti_unify("a", &at_cap, Vocab::Source);
+        assert_eq!(f.holes_a, Vec::<String>::new());
+        assert_eq!(f.holes_b, vec!["a"]);
+    }
+
+    #[test]
+    fn anti_unify_falls_back_to_the_multiset_on_a_long_right_side() {
+        let big = run_of_a(80, true); // 161 tokens on the right
+        let f = anti_unify("a", &big, Vocab::Source);
+        assert_eq!(f.holes_a, Vec::<String>::new());
+        assert_eq!(f.holes_b, Vec::<String>::new());
+    }
+
+    // ------------------------------------------------------------------
+    // fork_term
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn fork_term_pins_alignment_and_peak_on_the_lcs() {
+        let corpus = corpus_of_names(&[("bar", 2.0), ("baz", 3.0)]);
+        let term = fork_term(&tokens("foo bar", Vocab::Source), &tokens("foo baz", Vocab::Source), &corpus);
+        assert_eq!(term.aligned, 4);
+        assert_eq!(term.tokens_a, 3);
+        assert_eq!(term.tokens_b, 3);
+        assert!((term.peak - 3.0).abs() < 1e-9, "the rarest name in the holes: {}", term.peak);
+    }
+
+    #[test]
+    fn fork_term_stays_exact_at_the_left_cap() {
+        let corpus = corpus_of_names(&[]);
+        let left = big_toks(157, &["a", "b", "c"]); // 160 tokens
+        let right = vec![Tok::Name("c"), Tok::Name("b"), Tok::Name("a")];
+        let term = fork_term(&left, &right, &corpus);
+        assert_eq!(term.aligned, 2, "exact LCS, not the multiset");
+    }
+
+    #[test]
+    fn fork_term_stays_exact_at_the_right_cap() {
+        let corpus = corpus_of_names(&[]);
+        let left = vec![Tok::Name("a"), Tok::Name("b"), Tok::Name("c")];
+        let right = big_toks(157, &["c", "b", "a"]); // 160 tokens
+        let term = fork_term(&left, &right, &corpus);
+        assert_eq!(term.aligned, 2);
+    }
+
+    #[test]
+    fn fork_term_uses_the_multiset_past_the_cap() {
+        let corpus = corpus_of_names(&[]);
+        let left = big_toks(158, &["a", "b", "c"]); // 161 tokens
+        let right = vec![Tok::Name("c"), Tok::Name("b"), Tok::Name("a")];
+        let term = fork_term(&left, &right, &corpus);
+        assert_eq!(term.aligned, 6, "three names intersect, counted twice");
+    }
+
+    #[test]
+    fn fork_term_uses_the_multiset_on_a_long_right_side() {
+        let corpus = corpus_of_names(&[]);
+        let left = vec![Tok::Name("a"), Tok::Name("b"), Tok::Name("c")];
+        let right = big_toks(158, &["c", "b", "a"]); // 161 tokens
+        let term = fork_term(&left, &right, &corpus);
+        assert_eq!(term.aligned, 6);
+    }
+
+    // ------------------------------------------------------------------
+    // shape
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn identical_bodies_share_one_body_id() {
+        let a = def("a", "a.py", &body(&[("_v1 = f(_v0)", 1), ("return _v1", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("_v1 = f(_v0)", 1), ("return _v1", 1)]), &[]);
+        let defs = [a, b];
+        let shaped = shape(&defs).expect("two eligible bodies");
+        assert_eq!(shaped.bodies.len(), 1, "equal text is one body");
+    }
+
+    #[test]
+    fn different_bodies_are_not_merged() {
+        let a = def("a", "a.py", &body(&[("_v1 = f(_v0)", 1), ("return _v1", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("_v1 = g(_v0)", 1), ("return _v1", 1)]), &[]);
+        let defs = [a, b];
+        let shaped = shape(&defs).expect("two eligible bodies");
+        assert_eq!(shaped.bodies.len(), 2, "distinct text is two bodies");
+    }
+
+    #[test]
+    fn a_short_body_is_filtered_out() {
+        let a = def("a", "a.py", &body(&[("_v1 = f(_v0)", 1), ("return _v1", 1)]), &[]);
+        let short = def("short", "s.py", &body(&[]), &[]);
+        assert!(shape(&[a, short]).is_none(), "a header-only definition cannot diverge");
+    }
+
+    #[test]
+    fn a_body_at_the_statement_cap_is_still_eligible() {
+        let lines: Vec<String> = (0..super::MAX_STATEMENTS).map(|i| format!("_v{i} = f(_v0)")).collect();
+        let refs: Vec<(&str, u16)> = lines.iter().map(|l| (l.as_str(), 1u16)).collect();
+        let a = def("a", "a.py", &body(&refs), &[]);
+        let b = def("b", "b.py", &body(&refs), &[]);
+        assert!(shape(&[a, b]).is_some(), "the cap is inclusive, not a cutoff");
+    }
+
+    #[test]
+    fn identical_reach_sets_share_one_subject_set() {
+        let a = def("a", "a.py", &body(&[("_v1 = f(_v0)", 1), ("return _v1", 1)]), &["mod.x"]);
+        let b = def("b", "b.py", &body(&[("_v1 = g(_v0)", 1), ("return _v1", 1)]), &["mod.x"]);
+        let defs = [a, b];
+        let shaped = shape(&defs).expect("two eligible bodies");
+        assert_eq!(shaped.subject_sets.len(), 1, "twins reach alike");
+    }
+
+    // ------------------------------------------------------------------
+    // corpus_of
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn corpus_of_counts_each_key_per_view() {
+        let a = def("a", "a.py", &body(&[("_v1 = f(_v0)", 1), ("return _v1", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("_v1 = f(_v0)", 1), ("_v2 = g(_v1)", 1), ("return _v2", 1)]), &[]);
+        let defs = [a, b];
+        let shaped = shape(&defs).expect("two bodies");
+        let corpus = corpus_of(&shaped);
+        // `_v1 = f(_v0)` occurs in both bodies: 2 of 5 total lines.
+        let key_id = shaped.bodies[0].keys[0];
+        let expected = (5.0f64 / 2.0).ln();
+        assert!(
+            (corpus.key[key_id as usize] - expected).abs() < 1e-9,
+            "a key in two of five lines weighs {} != {expected}",
+            corpus.key[key_id as usize]
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // derive
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn derive_anchors_the_rarest_name_of_each_line() {
+        let a = def("a", "a.py", &body(&[("_v1 = rare_thing(common_thing)", 1), ("return _v1", 1)]), &[]);
+        let b = def(
+            "b",
+            "b.py",
+            &body(&[
+                ("_v2 = common_thing(common_thing)", 1),
+                ("_v2 = common_thing(common_thing)", 1),
+                ("_v2 = common_thing(common_thing)", 1),
+                ("return _v2", 1),
+            ]),
+            &[],
+        );
+        let defs = [a, b];
+        let mut shaped = shape(&defs).expect("two bodies");
+        let corpus = corpus_of(&shaped);
+        for body in &mut shaped.bodies {
+            derive(body, &corpus);
+        }
+        // `rare_thing` occurs once, `common_thing` seven times: the rarer name anchors the line.
+        let anchor = shaped.bodies[0].anchor[0].expect("a named line has an anchor");
+        assert!((anchor.0 - (8.0f64).ln()).abs() < 1e-9, "the rarest name wins: {}", anchor.0);
+        assert!(shaped.bodies[0].named[0], "a line with names is named");
+    }
+
+    // ------------------------------------------------------------------
+    // clique_cover
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn clique_cover_pins_the_greedy_seed_order() {
+        let g = graph(&[(1, 2), (1, 3), (2, 3), (1, 4), (2, 4), (5, 6), (5, 7), (6, 7)]);
+        let cover = clique_cover(&[1, 2, 3, 4, 5, 6, 7], &g);
+        assert_eq!(cover, vec![vec![1, 2, 3], vec![5, 6, 7], vec![4]]);
+    }
+
+    // ------------------------------------------------------------------
+    // Renaming::accepts
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_node_tag_does_not_bind_a_slot() {
+        let mut renaming = Renaming::default();
+        let a = tokens("Path('x')", Vocab::SExpr);
+        let b = tokens("_v0('x')", Vocab::SExpr);
+        assert!(!renaming.accepts(&a, &b), "a node tag is grammar, not a bindable slot");
+    }
+
+    #[test]
+    fn a_slot_that_rebinds_differently_is_rejected() {
+        let mut renaming = Renaming::default();
+        assert!(renaming.accepts(&tokens("_v0 = _v0", Vocab::Source), &tokens("_v5 = _v5", Vocab::Source)));
+        assert!(
+            !renaming.accepts(&tokens("_v0 = _v0", Vocab::Source), &tokens("_v6 = _v6", Vocab::Source)),
+            "a slot already bound elsewhere cannot be rebound"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // run_forward / extend_block
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn run_forward_counts_the_matching_prefix() {
+        let a = def("a", "a.py", &body(&[("x = f(_v0)", 1), ("y = g(_v0)", 1), ("return y", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("x = f(_v0)", 1), ("y = g(_v0)", 1), ("return z", 1)]), &[]);
+        let defs = [a, b];
+        let shaped = shape(&defs).expect("two bodies");
+        let mut renaming = Renaming::default();
+        let n = super::run_forward(&shaped.bodies[0], &shaped.bodies[1], 1, 1, 0, &mut renaming);
+        assert_eq!(n, 1, "only the line at index 1 matches");
+    }
+
+    #[test]
+    fn extend_block_pins_the_run_and_its_rejoin() {
+        let a = def(
+            "a",
+            "a.py",
+            &body(&[("x = f(_v0)", 1), ("y = g(_v0)", 1), ("mid_a = 1", 1), ("z = h(_v0)", 1), ("return z", 1)]),
+            &[],
+        );
+        let b = def(
+            "b",
+            "b.py",
+            &body(&[("x = f(_v0)", 1), ("y = g(_v0)", 1), ("mid_b = 2", 1), ("z = h(_v0)", 1), ("return z", 1)]),
+            &[],
+        );
+        let defs = [a, b];
+        let shaped = shape(&defs).expect("two bodies");
+        let run = super::extend_block(&shaped.bodies[0], &shaped.bodies[1], 0, 0).expect("a run exists");
+        assert_eq!((run.a_at, run.b_at, run.len), (0, 0, 2));
+        assert_eq!((run.gap_a, run.gap_b, run.run2), (1, 1, 2));
+    }
+
+    #[test]
+    fn extend_block_grows_backwards_from_a_mid_seed() {
+        let a = def("a", "a.py", &body(&[("common(_v0)", 1), ("shared(_v0)", 1), ("a = 1", 1), ("return a", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("common(_v0)", 1), ("shared(_v0)", 1), ("b = 2", 1), ("return b", 1)]), &[]);
+        let defs = [a, b];
+        let shaped = shape(&defs).expect("two bodies");
+        let run = super::extend_block(&shaped.bodies[0], &shaped.bodies[1], 1, 1).expect("a run exists");
+        assert_eq!((run.a_at, run.b_at, run.len), (0, 0, 2), "the block grew backwards over the shared line");
+    }
+
+    // ------------------------------------------------------------------
+    // fork_key
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn fork_key_reads_the_gap_line_ids() {
+        let a = def("a", "a.py", &body(&[("l0", 1), ("l1", 1), ("l2", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("m0", 1), ("m1", 1), ("m2", 1)]), &[]);
+        let defs = [a, b];
+        let shaped = shape(&defs).expect("two bodies");
+        let run = Run { a_at: 0, b_at: 0, len: 1, gap_a: 2, gap_b: 1, run2: 0 };
+        let key = super::fork_key(&shaped.bodies, 0, 1, run);
+        let (l, r) = (&shaped.bodies[0].line_ids, &shaped.bodies[1].line_ids);
+        assert_eq!(key.a, [l[1], l[2], u32::MAX]);
+        assert_eq!(key.b, [r[1], u32::MAX, u32::MAX]);
+    }
+
+    // ------------------------------------------------------------------
+    // Gap::tokens
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn gap_tokens_joins_lines_with_a_separator() {
+        let a = def("a", "a.py", &body(&[("_v1 = f(_v0)", 1), ("return _v1", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("_v1 = g(_v0)", 1), ("return _v1", 1)]), &[]);
+        let defs = [a, b];
+        let shaped = shape(&defs).expect("two bodies");
+        let gap = Gap { body: shaped.views[0].body, from: 0, n: 2 };
+        let mut out = Vec::new();
+        assert!(gap.tokens(&shaped.bodies, &mut out));
+        assert_eq!(spell(&out), spell(&tokens("_v1 = f(_v0); return _v1", Vocab::Source)));
+    }
+
+    #[test]
+    fn gap_tokens_rejects_an_unclosed_line() {
+        let a = def("a", "a.py", &body(&[("_v1 = f('open", 1), ("return _v1", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("_v1 = g(_v0)", 1), ("return _v1", 1)]), &[]);
+        let defs = [a, b];
+        let shaped = shape(&defs).expect("two bodies");
+        let gap = Gap { body: shaped.views[0].body, from: 0, n: 1 };
+        let mut out = Vec::new();
+        assert!(!gap.tokens(&shaped.bodies, &mut out), "an unclosed quote cannot be lexed exactly");
+    }
+
+    // ------------------------------------------------------------------
+    // seeds_for_key
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn seeds_for_key_memoizes_by_body_pair() {
+        let b0 = def("b0", "b0.py", &body(&[("s(_v0)", 1), ("a(_v0)", 1), ("b(_v0)", 1), ("c(_v0)", 1)]), &[]);
+        let b1 = def("b1", "b1.py", &body(&[("s(_v0)", 1), ("a(_v0)", 1), ("d(_v0)", 1), ("e(_v0)", 1)]), &[]);
+        let b2 = def("b2", "b2.py", &body(&[("s(_v0)", 1), ("a(_v0)", 1), ("b(_v0)", 1), ("f(_v0)", 1)]), &[]);
+        let defs = [b0, b1, b2];
+        let shaped = shape(&defs).expect("three bodies");
+        let sites: Vec<(u32, u16, u32)> = vec![(0, 0, 0), (1, 0, 1), (2, 0, 2)];
+        let mut out = Vec::new();
+        super::seeds_for_key(&sites, 3, &shaped.views, &shaped.bodies, &mut out);
+        assert_eq!(out.len(), 3);
+        let len_of = |a: u32, b: u32| -> u16 {
+            out.iter().find(|s| s.a == a && s.b == b).map(|s| s.run.len).expect("pair seeded")
+        };
+        assert_eq!(len_of(0, 1), 2);
+        assert_eq!(len_of(0, 2), 3);
+        assert_eq!(len_of(1, 2), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // weigh_signature
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn weigh_signature_pins_sharpness() {
+        let a = def("a", "a.py", &body(&[("x = f(_v0)", 1), ("return x", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("x = f(_v0)", 1), ("return y", 1)]), &[]);
+        let defs = [a, b];
+        let mut shaped = shape(&defs).expect("two bodies");
+        let corpus = corpus_of(&shaped);
+        for body in &mut shaped.bodies {
+            derive(body, &corpus);
+        }
+        let run = Run { a_at: 0, b_at: 0, len: 1, gap_a: 1, gap_b: 1, run2: 0 };
+        let fork = super::ForkTerm { aligned: 0, tokens_a: 3, tokens_b: 3, peak: 1.0 };
+        let weighed = super::weigh_signature(&shaped.bodies, fork, 0, 1, run);
+        // agreed = 8 + 8 = 16 tokens, gap = 6 -> sharpness = 16 / 22.
+        assert!((weighed.sharpness - 16.0 / 22.0).abs() < 1e-9, "{}", weighed.sharpness);
+    }
+
+    #[test]
+    fn weigh_signature_anchors_the_rarest_name_of_the_run() {
+        // Two shared lines: line 0 names `rare1`, line 1 names `rare2`. A filler repeats `rare1`
+        // so `rare2` stays rarer, and the run must anchor on it.
+        let a = def("a", "a.py", &body(&[("_v1 = rare1(common)", 1), ("_v2 = rare2(common)", 1), ("return _v1", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("_v1 = rare1(common)", 1), ("_v2 = rare2(common)", 1), ("return _v2", 1)]), &[]);
+        let filler = def("filler", "filler.py", &body(&[("_v1 = rare1(common)", 1), ("return _v1", 1)]), &[]);
+        let defs = [a, b, filler];
+        let mut shaped = shape(&defs).expect("three bodies");
+        let corpus = corpus_of(&shaped);
+        for body in &mut shaped.bodies {
+            derive(body, &corpus);
+        }
+        let run = Run { a_at: 0, b_at: 0, len: 2, gap_a: 1, gap_b: 1, run2: 0 };
+        let fork = super::ForkTerm { aligned: 0, tokens_a: 3, tokens_b: 3, peak: 1.0 };
+        let weighed = super::weigh_signature(&shaped.bodies, fork, shaped.views[0].body, shaped.views[1].body, run);
+        let anchor = weighed.anchor.expect("a named run has an anchor");
+        let anchor_rarity = corpus.name[anchor as usize];
+        assert!(
+            (anchor_rarity - corpus.name_of("rare2")).abs() < 1e-9,
+            "the rarer name anchors the run: {anchor_rarity} != {}",
+            corpus.name_of("rare2")
+        );
+    }
+
+    #[test]
+    fn weigh_signature_yields_unit_sharpness_on_an_empty_fork() {
+        let a = def("a", "a.py", &body(&[("x = f(_v0)", 1), ("return x", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("x = f(_v0)", 1), ("return y", 1)]), &[]);
+        let defs = [a, b];
+        let mut shaped = shape(&defs).expect("two bodies");
+        let corpus = corpus_of(&shaped);
+        for body in &mut shaped.bodies {
+            derive(body, &corpus);
+        }
+        let run = Run { a_at: 0, b_at: 0, len: 1, gap_a: 0, gap_b: 0, run2: 0 };
+        let fork = super::ForkTerm { aligned: 0, tokens_a: 0, tokens_b: 0, peak: 1.0 };
+        let weighed = super::weigh_signature(&shaped.bodies, fork, 0, 1, run);
+        assert!((weighed.sharpness - 1.0).abs() < 1e-9, "agreed-only fork is fully sharp: {}", weighed.sharpness);
+    }
+
+    // ------------------------------------------------------------------
+    // merge_pairs
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn merge_pairs_merges_matching_pairs_and_keeps_fork_only() {
+        let rf = |_i: u16| RunFork {
+            run: Run { a_at: 0, b_at: 0, len: 1, gap_a: 1, gap_b: 1, run2: 0 },
+            flip: false,
+            sharpness: 1.0,
+            anchor: None,
+            peak: 0.0,
+        };
+        let runs = vec![(0u32, 1u32, rf(0)), (2u32, 3u32, rf(0))];
+        let sf = SubjectFork { node: 0, sites: 2, peak: 0.0 };
+        let forks = vec![(0u32, 1u32, sf), (2u32, 3u32, sf), (4u32, 5u32, sf)];
+        let pairs = super::merge_pairs(&runs, &forks);
+        assert_eq!(pairs.len(), 3);
+        assert!(pairs[0].run.is_some() && pairs[0].subject.is_some(), "(0,1) is both");
+        assert!(pairs[1].run.is_some() && pairs[1].subject.is_some(), "(2,3) is both");
+        assert!(pairs[2].run.is_none() && pairs[2].subject.is_some(), "(4,5) is subject-only");
+    }
+
+    // ------------------------------------------------------------------
+    // seed_by_statement: the cap
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_statement_in_too_many_places_is_not_seeded() {
+        // Three distinct bodies sharing one statement: with cap 2 it is an idiom, not a pair.
+        let mut defs = Vec::new();
+        for i in 0..3 {
+            defs.push(def(&format!("f{i}"), &format!("f{i}.py"), &body(&[("shared(_v0)", 1), ("return _v1", 1)]), &[]));
+        }
+        let shaped = shape(&defs).expect("three bodies");
+        let corpus = corpus_of(&shaped);
+        let runs = super::seed_by_statement(&shaped, &corpus, 2);
+        assert!(runs.is_empty(), "three sites exceed the cap");
+    }
+
+    #[test]
+    fn seed_by_subject_respects_the_cap() {
+        let f0 = def("f0", "f0.py", &body(&[("_v1 = f0(_v0)", 1), ("return _v1", 1)]), &["mod.x"]);
+        let f1 = def("f1", "f1.py", &body(&[("_v1 = f1(_v0)", 1), ("return _v1", 1)]), &["mod.x"]);
+        let f2 = def("f2", "f2.py", &body(&[("_v1 = f2(_v0)", 1), ("return _v1", 1)]), &["mod.x"]);
+        let three = [f0, f1, f2];
+        let mut shaped = shape(&three).expect("three bodies");
+        let corpus = corpus_of(&shaped);
+        for body in &mut shaped.bodies {
+            derive(body, &corpus);
+        }
+        let subjects = super::seed_by_subject(&shaped, &corpus, 2);
+        assert!(subjects.is_empty(), "three sites exceed the subject cap");
+
+        let a = def("a", "a.py", &body(&[("_v1 = alpha(_v0)", 1), ("return _v1", 1)]), &["mod.x"]);
+        let b = def("b", "b.py", &body(&[("_v1 = beta(_v0)", 1), ("return _v1", 1)]), &["mod.x"]);
+        let two = [a, b];
+        let mut shaped2 = shape(&two).expect("two bodies");
+        let corpus2 = corpus_of(&shaped2);
+        for body in &mut shaped2.bodies {
+            derive(body, &corpus2);
+        }
+        let subjects2 = super::seed_by_subject(&shaped2, &corpus2, 2);
+        assert_eq!(subjects2.len(), 1, "two sites sit exactly at the subject cap");
+    }
+
+    #[test]
+    fn seed_by_statement_seeds_every_distinct_pair() {
+        let b0 = def("b0", "b0.py", &body(&[("s(_v0)", 1), ("a0", 1)]), &[]);
+        let b1 = def("b1", "b1.py", &body(&[("s(_v0)", 1), ("a1", 1)]), &[]);
+        let b2 = def("b2", "b2.py", &body(&[("s(_v0)", 1), ("a2", 1)]), &[]);
+        let defs = [b0, b1, b2];
+        let mut shaped = shape(&defs).expect("three bodies");
+        let corpus = corpus_of(&shaped);
+        for body in &mut shaped.bodies {
+            derive(body, &corpus);
+        }
+        let runs = super::seed_by_statement(&shaped, &corpus, 3);
+        assert_eq!(runs.len(), 3, "three distinct pairs are each seeded once");
+    }
+
+    #[test]
+    fn a_statement_at_the_cap_is_still_seeded() {
+        let a = def("a", "a.py", &body(&[("shared(_v0)", 1), ("return a", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("shared(_v0)", 1), ("return b", 1)]), &[]);
+        let defs = [a, b];
+        let mut shaped = shape(&defs).expect("two bodies");
+        let corpus = corpus_of(&shaped);
+        for body in &mut shaped.bodies {
+            derive(body, &corpus);
+        }
+        let runs = super::seed_by_statement(&shaped, &corpus, 2);
+        assert_eq!(runs.len(), 1, "two sites sit exactly at the cap");
+    }
+
+    // ------------------------------------------------------------------
+    // body_evidence
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn body_evidence_pins_jaccard_and_shape_overlap() {
+        let a = def("a", "a.py", &body(&[("x = f(_v0)", 1), ("y = g(_v0)", 1), ("return x", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("x = f(_v0)", 1), ("z = h(_v0)", 1), ("return y", 1)]), &[]);
+        let defs = [a, b];
+        let mut shaped = shape(&defs).expect("two bodies");
+        let corpus = corpus_of(&shaped);
+        for body in &mut shaped.bodies {
+            derive(body, &corpus);
+        }
+        let (shape_ev, jaccard) = super::body_evidence(&shaped.bodies[0], &shaped.bodies[1], &corpus);
+        // Keys: {x=f, y=g, return x} vs {x=f, z=h, return y}: one shared key of five.
+        assert!((jaccard - 0.2).abs() < 1e-9, "jaccard = {jaccard}");
+        // Two common shapes, each held by one non-identical line on each side: cover is 1.0, so
+        // the shape term is twice the sum of their rarities ln(6/4) + ln(6/2).
+        let expected = 2.0 * (1.5f64.ln() + 3.0f64.ln());
+        assert!((shape_ev - expected).abs() < 1e-9, "shape evidence = {shape_ev} != {expected}");
+    }
+
+    // ------------------------------------------------------------------
+    // evidence
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn evidence_sums_the_run_and_its_rejoin() {
+        let a = def("a", "a.py", &body(&[("x = f(_v0)", 1), ("y = g(_v0)", 1), ("return y", 1), ("w = h(_v0)", 1)]), &[]);
+        let b = def("b", "b.py", &body(&[("x = f(_v0)", 1), ("y = g(_v0)", 1), ("return z", 1), ("w = h(_v0)", 1)]), &[]);
+        let filler = def("filler", "filler.py", &body(&[("y = g(_v0)", 1), ("return q", 1)]), &[]);
+        let defs = [a, b, filler];
+        let mut shaped = shape(&defs).expect("three bodies");
+        let corpus = corpus_of(&shaped);
+        for body in &mut shaped.bodies {
+            derive(body, &corpus);
+        }
+        let a_body = shaped.views[0].body;
+        let run = Run { a_at: 0, b_at: 0, len: 2, gap_a: 1, gap_b: 1, run2: 1 };
+        let ev = super::evidence(&shaped.bodies[a_body as usize], &[], &[], &corpus, Some(&run), (0.5, 0.5));
+        // The run covers lines 0..2, the rejoin line 3 (a_at + len + gap_a = 3).
+        let body = &shaped.bodies[a_body as usize];
+        let expected = body.key_rarity[0] + body.key_rarity[1] + body.key_rarity[3];
+        assert!((ev.text - expected).abs() < 1e-9, "{} != {expected}", ev.text);
+    }
+
+    // ------------------------------------------------------------------
+    // common_shapes / tighten / families (via the pass)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn common_shapes_weighs_the_intersection() {
+        let a = def("a", "a.py", &body(&[("_v1 = alpha(_v0)", 1), ("if _v1 is None:", 1), ("return True", 2)]), &[]);
+        let b = def("b", "b.py", &body(&[("_v1 = beta(_v0)", 1), ("if _v1 is None:", 1), ("return True", 2)]), &[]);
+        let c = def("c", "c.py", &body(&[("_v1 = gamma(_v0)", 1), ("if _v1 is None:", 1), ("return True", 2)]), &[]);
+        let defs = [a, b, c];
+        let mut shaped = shape(&defs).expect("three bodies");
+        let corpus = corpus_of(&shaped);
+        for body in &mut shaped.bodies {
+            derive(body, &corpus);
+        }
+        let (common_mass, common_shapes) = super::common_shapes(&[0, 1, 2], &shaped, &corpus);
+        assert!(common_mass > 0.0, "three siblings share shape mass: {common_mass}");
+        assert!(!common_shapes.is_empty(), "and at least one shared shape");
+    }
+
+    #[test]
+    fn three_subject_seeded_siblings_form_one_family() {
+        let a = def("f1", "f1.py", &body(&[("_v1 = alpha(_v0)", 1), ("if _v1 is None:", 1), ("return True", 2)]), &["billing.plans.policy_get"]);
+        let b = def("f2", "f2.py", &body(&[("_v1 = beta(_v0)", 1), ("if _v1 is None:", 1), ("return True", 2)]), &["billing.plans.policy_get"]);
+        let c = def("f3", "f3.py", &body(&[("_v1 = gamma(_v0)", 1), ("if _v1 is None:", 1), ("return True", 2)]), &["billing.plans.policy_get"]);
+        let mut defs = vec![a, b, c];
+        for i in 0..8 {
+            defs.push(def(
+                &format!("filler{i}"),
+                "filler.py",
+                &body(&[("_v9 = unrelated()", 1), ("return _v9", 1)]),
+                &["somewhere.else"],
+            ));
+        }
+        let found = pass_converge(&defs, 0, super::SEED_CAP);
+        let families: Vec<_> = found.iter().filter(|f| f.pass == "converge-family").collect();
+        assert_eq!(families.len(), 1, "{families:?}", families = families.iter().map(|f| &f.name).collect::<Vec<_>>());
+        assert_eq!(families[0].name, "f1 / f2 / f3", "the three siblings are one family");
     }
 }

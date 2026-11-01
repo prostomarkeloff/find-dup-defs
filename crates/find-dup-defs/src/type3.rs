@@ -649,3 +649,78 @@ pub fn type3_clusters(
         })
         .collect()
 }
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{is_sync_async, tokenize, weighted_row, Significance};
+
+    // ── tokenize ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn tokenize_walks_identifiers_numbers_and_symbols() {
+        assert_eq!(tokenize("a"), vec!["a"], "a single identifier");
+        assert_eq!(tokenize("1"), vec!["1"], "a single number");
+        assert_eq!(tokenize("ab cd"), vec!["ab", "cd"], "identifiers split on whitespace");
+        assert_eq!(tokenize("12 34"), vec!["12", "34"], "numbers split on whitespace");
+        assert_eq!(tokenize("x_1 = 2"), vec!["x_1", "=", "2"], "a mixed assignment");
+    }
+
+    // ── is_sync_async ─────────────────────────────────────────────────────
+
+    #[test]
+    fn is_sync_async_recognises_the_naming_twin() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("afoo", "foo", true),
+            ("foo", "afoo", true),
+            ("a", "", true),
+            ("", "a", true),
+            ("foo", "bar", false),
+            ("afoo", "abar", false),
+            ("ab", "a", false),
+            ("a", "ab", false),
+            ("", "", false),
+            ("foo", "foo", false),
+        ];
+        for &(a, b, expected) in cases {
+            assert_eq!(is_sync_async(a, b), expected, "is_sync_async({a:?}, {b:?})");
+        }
+    }
+
+    // ── weighted_row ──────────────────────────────────────────────────────
+
+    #[test]
+    fn weighted_row_accumulates_weight_and_takes_the_l2_norm() {
+        // id 0 twice at weight 2.0 → entry (0, 4.0), norm = sqrt(4.0 * 4.0) = 4.0.
+        let (row, norm) = weighted_row(&[0, 0], &[2.0]);
+        assert_eq!(row, vec![(0, 4.0)]);
+        assert_eq!(norm, 4.0);
+    }
+
+    #[test]
+    fn weighted_row_sorts_entries_by_id() {
+        let (row, norm) = weighted_row(&[1, 0], &[3.0, 5.0]);
+        assert_eq!(row, vec![(0, 3.0), (1, 5.0)]);
+        assert_eq!(norm, (9.0_f64 + 25.0).sqrt());
+    }
+
+    // ── Significance ──────────────────────────────────────────────────────
+
+    #[test]
+    fn exact_p_is_evidence_not_certainty() {
+        // Two one-unit functions sharing nothing: the whole unit set is worth a surprise strictly
+        // between certainty and zero.
+        let sig = Significance::fit(vec![vec![0], vec![1]], 2);
+        let p = sig.exact_p(0);
+        assert!(p > 0.0 && p < 1.0, "exact_p should sit strictly inside (0, 1), got {p}");
+    }
+
+    #[test]
+    fn shared_surprise_terminates_when_one_set_is_exhausted() {
+        // left is a strict subset of right: the merge must exhaust left first and not run off its end.
+        let sig = Significance::fit(vec![vec![0], vec![0, 1]], 2);
+        assert!(sig.shared_surprise(0, 1) >= 0.0);
+        // and the mirror image.
+        let sig = Significance::fit(vec![vec![0, 1], vec![0]], 2);
+        assert!(sig.shared_surprise(0, 1) >= 0.0);
+    }
+}

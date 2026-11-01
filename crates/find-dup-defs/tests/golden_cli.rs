@@ -358,3 +358,56 @@ fn known_kind_still_scans() {
     let doc: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is json");
     assert!(!doc["groups"].as_array().expect("groups[]").is_empty(), "a valid kind still finds things");
 }
+
+// ───────────────────────── arg parsing / gate edges ─────────────────────────
+
+#[test]
+fn unknown_only_code_exits_nonzero() {
+    // Same loud-failure policy as `--kinds`: a typo'd language code must not ship an empty report.
+    let (stdout, stderr, code) = run_status(FIX, &["--only", "zz"]);
+    assert_eq!(code, 2, "unknown --only code must fail loudly");
+    assert!(stderr.contains("unknown language code \"zz\""), "stderr names the offending code: {stderr:?}");
+    assert!(stdout.is_empty(), "no report is emitted for an invalid selection");
+}
+
+#[test]
+fn errors_only_reports_only_errors() {
+    let out = run(&["--errors-only"]);
+    assert!(out.contains("# summary: 12 ERROR, 0 WARNING groups"), "errors-only strips the WARNING tier:\n{out}");
+    assert!(!out.contains("[WARNING]"), "no WARNING finding survives --errors-only:\n{out}");
+}
+
+#[test]
+fn report_default_without_show_info_matches_golden() {
+    // The default human report hides INFO; the mixed fixture has none, so it is byte-identical to
+    // the `--show-info` golden. Exercising the no-flag path keeps the INFO filter honest.
+    assert_golden(&run(&[]), include_str!("golden/report.txt"), "report.txt");
+}
+
+#[test]
+fn error_findings_fail_the_gate() {
+    let (_, _, code) = run_status(FIX, &[]);
+    assert_eq!(code, 1, "a run with ERROR findings exits 1");
+}
+
+#[test]
+fn no_error_findings_exit_zero() {
+    // De-escalating everything leaves only WARNING/INFO: the gate must exit 0, not 1.
+    let (_, _, code) = run_status(FIX, &["-D", "de-escalate:*=everything"]);
+    assert_eq!(code, 0, "a run with no ERROR findings exits 0");
+}
+
+#[test]
+fn decision_fdr_accepts_rates_in_the_open_unit_interval() {
+    let (_, stderr, code) = run_status(FIX, &["-D", "set:decision-fdr=0.5"]);
+    assert_ne!(code, 2, "a rate in (0, 1) parses and runs (stderr: {stderr})");
+}
+
+#[test]
+fn decision_fdr_rejects_boundary_and_out_of_range_rates() {
+    for bad in ["0.0", "1.0", "1.5"] {
+        let (_, stderr, code) = run_status(FIX, &["-D", &format!("set:decision-fdr={bad}")]);
+        assert_eq!(code, 2, "rate {bad:?} must be rejected");
+        assert!(stderr.contains("decision-fdr"), "stderr names the setting: {stderr:?}");
+    }
+}
