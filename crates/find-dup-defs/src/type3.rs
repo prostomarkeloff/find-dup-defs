@@ -69,9 +69,15 @@
 use difflib_fast::simjoin::{cosine_join_double, cosine_join_with, Corpus};
 use difflib_fast::Concurrency;
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bicm::{Bicm, Surprise};
+
+/// Float guard for the bound-based skips: the bounds' own rounding error is ~1e-14 of their
+/// magnitude, so a floor shrunk by 1e-9 (phase 1/2 aborts) or a cap inflated by 1e-9 (the
+/// min-loop diagonal floor) keeps every decision an exact implication, not a heuristic.
+const SKIP_MARGIN: f64 = 1.0 - 1e-9;
+const MIN_MARGIN: f64 = 1.0 + 1e-9;
 use crate::simgraph::components;
 
 /// Tokenize one line like Python's `re.compile(r"[A-Za-z_]\w*|\d+|\S")` — Unicode-aware, matching
@@ -194,17 +200,117 @@ fn kernel(x: u32, y: u32, line_parts: &[Vec<u32>]) -> f64 {
 
 /// `Σ_x Σ_y c_x c_y w_x w_y k(x, y)` over the distinct lines of two functions (counts and weights
 /// folded into each vector's entries) — the soft inner product.
+///
+/// Two phases, both exact. Phase 1 is a parts-weight bound: `Σ_p (Σ_{x∋p} w_x)(Σ_{y∋p} w_y)` —
+/// every line pair is counted once per shared part, and the kernel never exceeds the number of
+/// shared parts, so this is an upper bound on the dot, computed in O(parts) with no pair
+/// materialization. Phase 2 enumerates exactly the pairs that share a part, in the same `(x, y)`
+/// order the direct double loop visits them, so the accumulated sum is bit-identical to the
+/// O(|a|·|b|) scan — and aborts the instant even the maximal remaining contribution (the product
+/// of the untouched suffix weights; every term is non-negative) cannot reach `needed`. An exact
+/// upper bound, never an approximation: a pair that can reach the floor computes its full dot.
+#[allow(clippy::too_many_lines)]
+fn soft_dot_bounded(
+    a: &[(u32, f64)],
+    b: &[(u32, f64)],
+    line_parts: &[Vec<u32>],
+    needed: f64,
+) -> Option<f64> {
+    // The parts-weight map, built once per call, then the shared two-phase walk.
+    let mut wb: FxHashMap<u32, f64> = FxHashMap::default();
+    for &(line, w) in b {
+        for &p in &line_parts[line as usize] {
+            *wb.entry(p).or_insert(0.0) += w;
+        }
+    }
+    soft_dot_bounded_maps(a, b, &wb, line_parts, needed)
+}
+
+/// The soft inner product, exact and complete — the bounded walk with an unreachable floor.
 fn soft_dot(a: &[(u32, f64)], b: &[(u32, f64)], line_parts: &[Vec<u32>]) -> f64 {
-    let mut acc = 0.0;
-    for &(x, wx) in a {
-        for &(y, wy) in b {
-            let k = kernel(x, y, line_parts);
-            if k > 0.0 {
-                acc += wx * wy * k;
+    soft_dot_bounded(a, b, line_parts, f64::NEG_INFINITY).unwrap_or(0.0)
+}
+
+/// [`soft_dot_bounded`] with the parts-weight maps precomputed (the min-loop's hot form): phase 1
+/// accumulates in `a`'s row order — the same order the map-building entry point used, so the bound
+/// (and every skip decision it makes) is bit-identical. Phase 2 is shared.
+fn soft_dot_bounded_maps(
+    a: &[(u32, f64)],
+    b: &[(u32, f64)],
+    wb: &FxHashMap<u32, f64>,
+    line_parts: &[Vec<u32>],
+    needed: f64,
+) -> Option<f64> {
+    // Phase 1 — the parts-weight bound: Σ over `a`'s rows and their parts of `w_a · wb[p]`.
+    let mut bound = 0.0f64;
+    for &(line, w) in a {
+        for &p in &line_parts[line as usize] {
+            if let Some(&w2) = wb.get(&p) {
+                bound += w * w2;
             }
         }
     }
-    acc
+    if bound <= needed * SKIP_MARGIN {
+        return None;
+    }
+    phase_two(a, b, line_parts, needed)
+}
+
+/// Phase 2 of the bounded walk: the exact dot over pairs that share a part, in direct-scan order,
+/// aborted the instant even the maximal remaining contribution cannot reach `needed`.
+fn phase_two(a: &[(u32, f64)], b: &[(u32, f64)], line_parts: &[Vec<u32>], needed: f64) -> Option<f64> {
+    let mut b_inv: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (y, &(line, _)) in b.iter().enumerate() {
+        for &p in &line_parts[line as usize] {
+            b_inv.entry(p).or_default().push(y as u32);
+        }
+    }
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    let mut seen: FxHashSet<(u32, u32)> = FxHashSet::default();
+    for (x, &(line, _)) in a.iter().enumerate() {
+        for &p in &line_parts[line as usize] {
+            if let Some(ys) = b_inv.get(&p) {
+                for &y in ys {
+                    if seen.insert((x as u32, y)) {
+                        pairs.push((x as u32, y));
+                    }
+                }
+            }
+        }
+    }
+    pairs.sort_unstable_by_key(|&(x1, y1)| (x1, y1));
+    let suffix_a: Vec<f64> = {
+        let mut s = vec![0.0f64; a.len() + 1];
+        for i in (0..a.len()).rev() {
+            s[i] = s[i + 1] + a[i].1;
+        }
+        s
+    };
+    let suffix_b: Vec<f64> = {
+        let mut s = vec![0.0f64; b.len() + 1];
+        for i in (0..b.len()).rev() {
+            s[i] = s[i + 1] + b[i].1;
+        }
+        s
+    };
+    let total_b = suffix_b[0];
+    let mut acc = 0.0f64;
+    for &(x, y) in &pairs {
+        let (lx, wx) = a[x as usize];
+        let (ly, wy) = b[y as usize];
+        let remaining = suffix_a[x as usize + 1] * total_b + wx * suffix_b[y as usize + 1];
+        // The current term's own maximum is `wx * wy` (kernel <= 1): it must be inside the
+        // abort condition, or a pair whose deciding contribution is this very term would be
+        // rejected while its dot exceeds the floor.
+        if acc + wx * wy + remaining <= needed * SKIP_MARGIN {
+            return None;
+        }
+        let k = kernel(lx, ly, line_parts);
+        if k > 0.0 {
+            acc += wx * wy * k;
+        }
+    }
+    Some(acc)
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +656,9 @@ pub fn type3_clusters(
     candidates.extend(part_pairs);
     candidates.par_sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     candidates.dedup_by(|a, b| (a.0, a.1) == (b.0, b.1));
+    if std::env::var_os("FDD_TIMING").is_some() {
+        eprintln!("    [type3-join] raw candidates={}", candidates.len());
+    }
 
     // Keep cross-name, non-twin pairs the exact pass does not own (other passes own same-name /
     // sync-async / equal-canonical clones), then weigh each: its p-value under the null and its soft
@@ -564,6 +673,9 @@ pub fn type3_clusters(
         })
         .map(|(j, i, _)| (j, i))
         .collect();
+    if std::env::var_os("FDD_TIMING").is_some() {
+        eprintln!("    [type3-filter] surviving pairs={}", pairs.len());
+    }
     let mut by_class: FxHashMap<(usize, usize), Vec<(usize, usize)>> = FxHashMap::default();
     for &(j, i) in &pairs {
         let (ra, rb) = (sig.row_of[reps[j]], sig.row_of[reps[i]]);
@@ -572,18 +684,25 @@ pub fn type3_clusters(
     // The soft cosine of two line vectors, and the step test as two separate probes: the step test
     // is an early-exiting merge over precomputed parts sets, and it is checked first, because the
     // cosine — the only O(|a|·|b|) part of the score — is wasted on a pair that shares no step.
-    let soft_cos = |a: usize, b: usize| -> f64 {
-        let dot = soft_dot(&line_rows[a], &line_rows[b], line_parts);
-        let denom = (self_soft[a] * self_soft[b]).sqrt();
-        if denom == 0.0 { 0.0 } else { dot / denom }
-    };
     let steps_of = |a: usize, b: usize| -> bool { intersects(&body_parts[a], &body_parts[b]) };
     // The verdict — soft cosine over θ AND a shared step — decides before the null is consulted:
     // the step test and the cosine are cheap (one early-exiting merge, one sparse dot product for
     // the survivors), while the p-value is a saddlepoint tail whose every step loops the column
     // classes (the phase's single hottest block, ~⅓ of its CPU). Fitting it for a pair the verdict
-    // drops is pure waste, so each pair is weighed only once it has already survived.
-    let (reps_ref, soft_cos_ref, steps_ref) = (&reps, &soft_cos, &steps_of);
+    // drops is pure waste, so each pair is weighed only once it has already survived. The cosine
+    // itself runs through the two-phase bounded walk: pairs whose parts-weight bound cannot reach
+    // `theta` are dropped without a single line pair materialized.
+    let verdict = |j: usize, i: usize| -> Option<f64> {
+        let denom = (self_soft[j] * self_soft[i]).sqrt();
+        if denom == 0.0 {
+            return None;
+        }
+        let needed = theta * denom;
+        let dot = soft_dot_bounded(&line_rows[j], &line_rows[i], line_parts, needed)?;
+        let s = dot / denom;
+        (s > theta).then_some(s)
+    };
+    let (reps_ref, verdict_ref, steps_ref) = (&reps, &verdict, &steps_of);
     let scored: Vec<Scored> = by_class
         .into_par_iter()
         .flat_map_iter(|((ra, rb), group)| {
@@ -594,21 +713,14 @@ pub fn type3_clusters(
                     if !steps_ref(j, i) {
                         return None;
                     }
-                    let s = soft_cos_ref(j, i);
-                    (s > theta).then(|| ((j, i), sig.p_value(reps_ref[j], reps_ref[i], &law), s))
+                    let s = verdict_ref(j, i)?;
+                    Some(((j, i), sig.p_value(reps_ref[j], reps_ref[i], &law), s))
                 })
                 .collect::<Vec<_>>()
         })
         .collect();
     if std::env::var_os("FDD_TIMING").is_some() {
-        eprintln!(
-            "[type-3] functions={n} reps={} candidates={} survivors={} row classes={} fit residual={:.1e}",
-            reps.len(),
-            pairs.len(),
-            scored.len(),
-            sig.model.row_classes(),
-            sig.model.residual,
-        );
+        eprintln!("    [type3-scored] scored={}", scored.len());
     }
     // The verdict was applied above; `scored` holds exactly the pairs that passed it. The p-value
     // rides along as evidence; see the module doc for why it is not the verdict.
@@ -627,27 +739,181 @@ pub fn type3_clusters(
     // Measured against a greedy clique cover on a labelled set of real near-copies: the cover gave
     // up a tenth of them for one false pair fewer in twenty — the chains it cuts are mostly families
     // whose members sit just under the cut of each other.
-    components(reps.len(), &edges)
+    // Components → exact min soft cosine and weakest p-value over ALL intra-component pairs
+    // (single-linkage's conservative figures; a pair not directly joined is scored on the spot).
+    // Taken over the representatives: a pair of twins scores exactly 1.0 and so can never be the
+    // minimum.
+    //
+    // The values are order-independent minima/maxima of exact per-pair figures, so the loop may
+    // prune with EXACT bounds and still reproduce them bit-for-bit:
+    //   - the soft cosine is computed through the two-phase bounded walk against the running
+    //     minimum: a pair whose parts-weight bound cannot beat the minimum cannot lower it;
+    //   - the p-value is `tail(surprise)`, monotone decreasing in the surprise, so the weakest
+    //     pair is the one with the smallest surprise. Each pair gets a cheap lower bound on its
+    //     surprise (shared-line count times the smallest per-class `-ln q` of its class pair);
+    //     pairs are visited ascending by that bound, and the instant a bound reaches the running
+    //     surprise minimum, no later pair can be the weakest — every later p-value is computed
+    //     only if it could still matter. The globally weakest pair's bound never exceeds its own
+    //     surprise, so it is always computed exactly.
+    //
+    // Measured against a greedy clique cover on a labelled set of real near-copies: the cover gave
+    // up a tenth of them for one false pair fewer in twenty — the chains it cuts are mostly families
+    // whose members sit just under the cut of each other.
+    //
+    // Per-representative parts-weight maps (part → Σ weights) precomputed once: phase 1 of the
+    // bounded walk reads them instead of rebuilding the inverted map per call.
+    let parts_weight: Vec<FxHashMap<u32, f64>> = line_rows
+        .par_iter()
+        .with_min_len(64)
+        .map(|row| {
+            let mut m: FxHashMap<u32, f64> = FxHashMap::default();
+            for &(line, w) in row {
+                for &p in &line_parts[line as usize] {
+                    *m.entry(p).or_insert(0.0) += w;
+                }
+            }
+            m
+        })
+        .collect();
+    let t_minloop = std::time::Instant::now();
+    let comps = components(reps.len(), &edges);
+    if std::env::var_os("FDD_TIMING").is_some() {
+        let mut sizes: Vec<usize> = comps.iter().map(Vec::len).collect();
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        eprintln!("    [type3-components] components={} largest={:?} intra_pairs={}",
+            comps.len(),
+            &sizes[..sizes.len().min(6)],
+            comps.iter().map(|g| g.len() * (g.len() - 1) / 2).sum::<usize>(),
+        );
+    }
+    let out: Vec<Type3Cluster> = comps
         .into_par_iter()
         .map(|mut group| {
             group.sort_unstable();
+            let n = group.len();
+            // Cached (joined-edge) pairs seed both extrema.
+            let mut cached: FxHashMap<(usize, usize), (f64, f64)> = FxHashMap::default();
             let (mut min_sim, mut worst_p) = (f64::INFINITY, 0.0f64);
-            for a in 0..group.len() {
-                for b in (a + 1)..group.len() {
-                    let key = (group[a], group[b]);
-                    let (p, s) = score.get(&key).copied().unwrap_or_else(|| {
-                        let (ra, rb) = (sig.row_of[reps[key.0]], sig.row_of[reps[key.1]]);
-                        (sig.p_value(reps[key.0], reps[key.1], &sig.law(ra.min(rb), ra.max(rb))), soft_cos(key.0, key.1))
-                    });
-                    min_sim = min_sim.min(s);
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    if let Some(&(p, s)) = score.get(&(group[a], group[b])) {
+                        cached.insert((a, b), (p, s));
+                        min_sim = min_sim.min(s);
+                        worst_p = worst_p.max(p);
+                    }
+                }
+            }
+            // Uncached intra pairs, each with its cheap surprise lower bound.
+            let mut jobs: Vec<(usize, usize)> = Vec::new();
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    if !cached.contains_key(&(a, b)) {
+                        jobs.push((a, b));
+                    }
+                }
+            }
+            if !jobs.is_empty() {
+                // One merge serves both bounds: the shared-line count (for the surprise lower
+                // bound) and the diagonal weight products — every shared line contributes
+                // `w_a · w_b · 1.0` to the dot, so their sum over the denominator is an exact
+                // LOWER bound on the soft cosine: a pair whose floor sits at or above the running
+                // minimum cannot lower it, and only pairs below it need the full computation.
+                let merge_info = |pa: usize, pb: usize| -> (usize, f64) {
+                    let (ra, rb) = (&line_rows[group[pa]], &line_rows[group[pb]]);
+                    let (mut i, mut j, mut n_shared, mut diag) = (0usize, 0usize, 0usize, 0.0f64);
+                    while i < ra.len() && j < rb.len() {
+                        match ra[i].0.cmp(&rb[j].0) {
+                            std::cmp::Ordering::Less => i += 1,
+                            std::cmp::Ordering::Greater => j += 1,
+                            std::cmp::Ordering::Equal => {
+                                n_shared += 1;
+                                diag += ra[i].1 * rb[j].1;
+                                i += 1;
+                                j += 1;
+                            }
+                        }
+                    }
+                    (n_shared, diag)
+                };
+                let min_logq = |qa: usize, qb: usize| -> f64 {
+                    let (ra, rb) = (sig.row_of[reps[group[qa]]], sig.row_of[reps[group[qb]]]);
+                    let classes = sig.model.pair_classes(ra.min(rb), ra.max(rb));
+                    classes
+                        .iter()
+                        .filter(|&&(nq, q)| nq > 0 && q > 0.0 && q < 1.0)
+                        .map(|&(_, q)| -q.ln())
+                        .fold(f64::INFINITY, f64::min)
+                };
+                let soft_full = |fa: usize, fb: usize| -> f64 {
+                    let denom = (self_soft[group[fa]] * self_soft[group[fb]]).sqrt();
+                    if denom == 0.0 {
+                        return 0.0;
+                    }
+                    soft_dot_bounded_maps(
+                        &line_rows[group[fa]], &line_rows[group[fb]], &parts_weight[group[fb]],
+                        line_parts, f64::NEG_INFINITY,
+                    )
+                    .map_or(0.0, |dot| dot / denom)
+                };
+                // One merge per pair serves both bounds: the shared-line count (surprise lower
+                // bound) and the diagonal weight products — every shared line contributes
+                // `w_a · w_b · 1.0` to the dot, so their sum over the denominator is an exact
+                // LOWER bound on the soft cosine. Both are fused into the keyed tuple, so the
+                // walks below never re-merge. The comparison inflates the cap by 1e-9 — far
+                // above the floor's own ~1e-14 rounding — a pair at the boundary is computed
+                // rather than skipped, and a skipped pair is provably above the cap.
+                let mut keyed: Vec<(u64, u64, usize, usize)> = jobs
+                    .par_iter()
+                    .map(|&(ka, kb)| {
+                        let (n_shared, diag) = merge_info(ka, kb);
+                        ( (n_shared as f64 * min_logq(ka, kb)).to_bits(), diag.to_bits(), ka, kb)
+                    })
+                    .collect();
+                keyed.sort_unstable_by_key(|t| t.0);
+                // Surprise lower bounds, ascending — the weakest pair is near the front, and once
+                // a bound reaches the running surprise minimum no later pair can be the weakest.
+                let mut s_min = f64::INFINITY;
+                let mut visited = 0usize;
+                while visited < keyed.len() {
+                    let (bits, diag_bits, wa, wb) = keyed[visited];
+                    let lb = f64::from_bits(bits);
+                    if visited > 0 && lb >= s_min * MIN_MARGIN {
+                        break;
+                    }
+                    visited += 1;
+                    // The weakest-pair update: full surprise + saddlepoint tail, only while the
+                    // pair's bound admits it could still be the weakest.
+                    let (ra, rb) = (sig.row_of[reps[group[wa]]], sig.row_of[reps[group[wb]]]);
+                    let law = sig.law(ra.min(rb), ra.max(rb));
+                    let s = sig.shared_surprise(reps[group[wa]], reps[group[wb]]);
+                    let p = law.tail(s);
                     worst_p = worst_p.max(p);
+                    s_min = s_min.min(s);
+                    // The minimum update: full soft cosine only below the diagonal floor.
+                    let denom = (self_soft[group[wa]] * self_soft[group[wb]]).sqrt();
+                    let diag = f64::from_bits(diag_bits);
+                    if denom > 0.0 && diag / denom < min_sim * MIN_MARGIN {
+                        min_sim = min_sim.min(soft_full(wa, wb));
+                    }
+                }
+                // Pairs past the surprise break still compete for the minimum.
+                for &(_, diag_bits, va, vb) in &keyed[visited..] {
+                    let denom = (self_soft[group[va]] * self_soft[group[vb]]).sqrt();
+                    let diag = f64::from_bits(diag_bits);
+                    if denom > 0.0 && diag / denom < min_sim * MIN_MARGIN {
+                        min_sim = min_sim.min(soft_full(va, vb));
+                    }
                 }
             }
             let mut members: Vec<usize> = group.iter().flat_map(|&r| spoken_by[r].iter().copied()).collect();
             members.sort_unstable();
             Type3Cluster { members, min_sim: if min_sim.is_finite() { min_sim } else { 1.0 }, worst_p }
         })
-        .collect()
+        .collect();
+    if std::env::var_os("FDD_TIMING").is_some() {
+        eprintln!("    [type3-minloop] ms={}", t_minloop.elapsed().as_millis());
+    }
+    out
 }
 
 #[cfg(test)]
