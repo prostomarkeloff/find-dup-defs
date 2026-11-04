@@ -1,6 +1,6 @@
 [package]
 name = "find-dup-defs"
-version = "0.19.5"
+version = "0.19.6"
 description = "Find duplicate / near-duplicate top-level definitions across a codebase via clone clustering — Python, Rust, TypeScript, Go, C, PHP and Java frontends, plus an opt-in structural helper-extraction pass."
 keywords = ["duplicate", "clone", "refactor", "lint", "ast"]
 categories = ["command-line-utilities", "development-tools"]
