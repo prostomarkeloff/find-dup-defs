@@ -1,6 +1,6 @@
 [package]
 name = "find-dup-defs"
-version = "0.19.6"
+version = "0.19.7"
 description = "Find duplicate / near-duplicate top-level definitions across a codebase via clone clustering — Python, Rust, TypeScript, Go, C, PHP and Java frontends, plus an opt-in structural helper-extraction pass."
 keywords = ["duplicate", "clone", "refactor", "lint", "ast"]
 categories = ["command-line-utilities", "development-tools"]
@@ -16,8 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 # The frontend↔engine contract (Def / KindSpec / Frontend) the engine clusters over.
-dup-defs-core = { path = "../dup-defs-core", version = "0.4.6" }
-py-canon = { path = "../py-canon", version = "0.6.2" }
+dup-defs-core = { path = "../dup-defs-core", version = "0.4.7" }
+py-canon = { path = "../py-canon", version = "0.6.3" }
 # TypeScript frontend — same contract as `py-canon`, oxc-based parser. `0.1.4` carries the
 # arrow-const name blanking the TS patternology dialect relies on, so pin the floor there.
 ts-canon = { path = "../ts-canon", version = "0.3.2" }
@@ -33,7 +33,7 @@ php-canon = { path = "../php-canon", version = "0.1.1" }
 java-canon = { path = "../java-canon", version = "0.1.1" }
 # exact difflib Ratcliff–Obershelp ratio + clustering + exact weighted-cosine similarity join
 # (simjoin) — https://crates.io/crates/difflib-fast
-difflib-fast = "0.5"
+difflib-fast = "0.6"
 # The directive mini-language (ACTION:[<KIND>]NAME[@PATH][=NOTE]) — parsing, glob matching, the
 # `-D` overload, and the lint pack (LintAction/Severity/fold) — https://crates.io/crates/directiva
 directiva = "0.1"

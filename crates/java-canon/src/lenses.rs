@@ -221,11 +221,7 @@ impl Walk<'_> {
                 }
             }
             Stmt::Decl(items) => self.stmts(items),
-            Stmt::Assign { lhs, rhs, .. } => {
-                self.expr(lhs);
-                self.expr(rhs);
-            }
-            Stmt::Update { e, .. } | Stmt::Expr(e) | Stmt::Return(Some(e)) => self.expr(e),
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => self.expr(e),
             Stmt::Block(b) => self.stmts(b),
             Stmt::Labeled { stmt, .. } => self.stmt(stmt),
             Stmt::Return(None) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::NestedItem | Stmt::Unknown(_) => {}
@@ -313,7 +309,6 @@ fn type_shape(t: &Type, imports: &HashMap<String, Arc<str>>, erase: &[String], o
             out.push("[]".to_owned());
             type_shape(inner, imports, erase, out);
         }
-        Type::Variadic(inner) => type_shape(inner, imports, erase, out),
         Type::Wild(opt) => {
             out.push("?".to_owned());
             if let Some((_, bound)) = opt {

@@ -435,10 +435,8 @@ struct Candidate {
 fn overlaps(
     c: &Corpus,
     model: &Bicm,
-    nulls: &HashMap<(usize, usize), ClassNull>,
     row_of: &[usize],
     col_of: &[usize],
-    statistic: Statistic,
 ) -> Vec<Overlap> {
     let n = c.facts.len();
     let mut index: Vec<Vec<u32>> = vec![Vec::new(); c.df.len()];
@@ -478,14 +476,7 @@ fn overlaps(
                     count[b_at] = 0;
                     weight[b_at] = 0.0;
                     let cp = class_pair(row_of, a, b_at);
-                    let null = &nulls[&cp];
-                    let admitted = match statistic {
-                        Statistic::Count => shared >= null.count_crit,
-                        Statistic::Surprise => w >= null.surprise_crit,
-                    };
-                    if admitted {
-                        found.push(Overlap { a, b: b_at, cp, shared, surprise: w });
-                    }
+                    found.push(Overlap { a, b: b_at, cp, shared, surprise: w });
                 }
                 found
             },
@@ -688,6 +679,7 @@ fn thickness_of(p: f64, threshold: f64) -> f64 {
 /// this run: a pair one of them clusters is a copy, reported there.
 #[must_use]
 #[allow(clippy::cast_precision_loss)] // a pair count, far below 2^52
+#[allow(clippy::too_many_lines)] // the pass: corpus → null → overlap → threshold → families
 pub fn pass_decisions(defs: &[Def], already: &[Finding], opts: &DecisionOpts) -> Vec<Finding> {
     let Resolved { atoms: resolved, via } = resolved_atoms(defs, opts.closed_world);
     let c = corpus_of(defs, &resolved, &via);
@@ -710,13 +702,27 @@ pub fn pass_decisions(defs: &[Def], already: &[Finding], opts: &DecisionOpts) ->
     let model = Bicm::fit(&c.size, &c.df);
     let row_of: Vec<usize> = c.size.iter().map(|&k| model.row_class(k)).collect();
     let col_of: Vec<usize> = c.df.iter().map(|&d| model.col_class(d)).collect();
-    let class_pairs: Vec<(usize, usize)> =
-        (0..model.row_classes()).flat_map(|a| (a..model.row_classes()).map(move |b| (a, b))).collect();
-    let nulls: HashMap<(usize, usize), ClassNull> = class_pairs
+    // Every co-occurring pair first, without the null: the shared count and the surprise need only
+    // the edge probabilities. The null — an O(C) build per class pair — is then paid only for the
+    // class pairs an overlap actually sits on, not the whole row-class × row-class grid.
+    let overlaps = overlaps(&c, &model, &row_of, &col_of);
+    let mut populated: Vec<(usize, usize)> = overlaps.iter().map(|o| o.cp).collect();
+    populated.par_sort_unstable();
+    populated.dedup();
+    let nulls: HashMap<(usize, usize), ClassNull> = populated
         .par_iter()
-        .map(|&(a, b)| ((a, b), ClassNull::new(&model, a, b, opts.fdr, opts.statistic)))
+        .map(|&cp| (cp, ClassNull::new(&model, cp.0, cp.1, opts.fdr, opts.statistic)))
         .collect();
-    let admitted = overlaps(&c, &model, &nulls, &row_of, &col_of, opts.statistic);
+    let admitted: Vec<Overlap> = overlaps
+        .into_par_iter()
+        .filter(|o| {
+            let null = &nulls[&o.cp];
+            match opts.statistic {
+                Statistic::Count => o.shared >= null.count_crit,
+                Statistic::Surprise => o.surprise >= null.surprise_crit,
+            }
+        })
+        .collect();
     let admitted_count = admitted.len();
     let tests = n as f64 * (n as f64 - 1.0) / 2.0;
     let found = candidates(admitted, &nulls, opts.statistic, tests, opts.fdr);

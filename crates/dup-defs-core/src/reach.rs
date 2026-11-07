@@ -28,12 +28,18 @@ pub fn reach_path<S: AsRef<str>>(segments: &[S]) -> Arc<str> {
 /// prefix sets they meet at `a.b.c`, which is the thing they are both about. Which nodes matter is
 /// not decided here: the corpus decides, by how many definitions reach each one.
 pub fn prefixes(path: &str) -> impl Iterator<Item = &str> {
-    let mut at = Some(path.len());
+    // The dot positions in one scan, not one `rfind` per prefix: a k-segment path yields k slices
+    // and the old walk re-scanned the whole prefix for each boundary.
+    let dots: Vec<usize> = path
+        .match_indices('.')
+        .map(|(i, _)| i)
+        .filter(|&i| i > 0)
+        .rev()
+        .collect();
+    let mut ends = std::iter::once(path.len()).chain(dots);
     std::iter::from_fn(move || {
-        let end = at?;
-        let slice = &path[..end];
-        at = slice.rfind('.').filter(|dot| *dot > 0);
-        Some(slice)
+        let end = ends.next()?;
+        Some(&path[..end])
     })
 }
 

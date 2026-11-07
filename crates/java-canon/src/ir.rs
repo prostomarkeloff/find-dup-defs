@@ -26,8 +26,6 @@ pub(crate) enum Type {
     Generic(String, Vec<Type>),
     /// One array dimension: `int[]` is `Array(Named("int"))`.
     Array(Box<Type>),
-    /// `int...` — the variadic spelling, only in a parameter.
-    Variadic(Box<Type>),
     /// A wildcard type argument: `?`, `? extends X`, `? super X`.
     Wild(Option<(String, Box<Type>)>),
     /// A multi-catch union: `IOException | SQLException`.
@@ -67,10 +65,6 @@ pub(crate) enum Stmt {
     Let { ty: Option<Type>, name: String, init: Option<Expr> },
     /// Several declarations of one statement (`int a = 1, b = 2;`), flattened later or kept as a list.
     Decl(Vec<Stmt>),
-    /// `=` and the compound forms; `x += e` reads `Bin` from the dump.
-    Assign { op: String, lhs: Expr, rhs: Expr },
-    /// `x++`, `++x`, `x--`, `--x`.
-    Update { inc: bool, prefix: bool, e: Expr },
     /// A bare expression statement.
     Expr(Expr),
     Return(Option<Expr>),
@@ -946,11 +940,7 @@ fn stmt_names(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
                 }
             }
             Stmt::Decl(items) => stmt_names(items, out),
-            Stmt::Assign { lhs, rhs, .. } => {
-                expr_names(lhs, out);
-                expr_names(rhs, out);
-            }
-            Stmt::Update { e, .. } | Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Assert(e) | Stmt::Return(Some(e)) => expr_names(e, out),
+            Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Assert(e) | Stmt::Return(Some(e)) => expr_names(e, out),
             Stmt::If { cond, then, els } => {
                 expr_names(cond, out);
                 stmt_names(then, out);

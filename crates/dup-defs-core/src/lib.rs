@@ -30,7 +30,7 @@ pub mod reach;
 pub mod tree;
 pub mod uses;
 
-pub use canon::{alpha_rename, count_loc, is_upper_snake, quoted, type_slot, AnalyzedFn, TYPE_SLOT_PREFIX, UNFILED};
+pub use canon::{alpha_rename, comma_sep, count_loc, is_upper_snake, quoted, type_slot, AnalyzedFn, TYPE_SLOT_PREFIX, UNFILED};
 pub use kinds::{kind_spec, KIND_IDS};
 pub use loc::LineMap;
 pub use types::{Analysis, CanonDialect, Def, Facets, Frontend, KindSpec, ScanOpts, Statement};

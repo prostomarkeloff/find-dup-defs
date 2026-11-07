@@ -148,7 +148,6 @@ fn is_trivial(f: &Func) -> bool {
         [Stmt::Return(None)] => true,
         [Stmt::Return(Some(e))] => is_atom(e) || is_getter(f, e),
         [Stmt::Throw(Expr::New { class, .. })] => class.rsplit('.').next().unwrap_or(class) == "UnsupportedOperationException",
-        [Stmt::Assign { op, lhs, rhs }] => is_setter(f, op, lhs, rhs),
         [Stmt::Expr(Expr::AssignExpr { op, l, r })] => is_setter(f, op, l, r),
         _ => false,
     }
@@ -206,7 +205,6 @@ fn is_setter(f: &Func, op: &str, lhs: &Expr, rhs: &Expr) -> bool {
 /// A constructor's building block: `this.x = x;`, assigning a parameter to a field.
 fn assigns_param_to_field(f: &Func, s: &Stmt) -> bool {
     let (op, lhs, rhs) = match s {
-        Stmt::Assign { op, lhs, rhs } => (op.as_str(), lhs, rhs),
         Stmt::Expr(Expr::AssignExpr { op, l, r }) => (op.as_str(), l.as_ref(), r.as_ref()),
         _ => return false,
     };

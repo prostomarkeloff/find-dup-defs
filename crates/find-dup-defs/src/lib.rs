@@ -791,7 +791,7 @@ pub fn pass_name_gated(
     max_group: Option<usize>,
     rationer: &difflib_fast::Rationer,
 ) -> Vec<Finding> {
-    let mut groups: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
+    let mut groups: rustc_hash::FxHashMap<(&str, &str), Vec<usize>> = rustc_hash::FxHashMap::default();
     for (i, d) in defs.iter().enumerate() {
         groups.entry((d.kind.id, d.name.as_str())).or_default().push(i);
     }

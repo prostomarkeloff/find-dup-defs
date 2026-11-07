@@ -182,11 +182,7 @@ fn func_lits(e: &mut Expr, f: &mut dyn FnMut(&mut Vec<Stmt>)) {
 fn direct_exprs(s: &mut Stmt, f: &mut dyn FnMut(&mut Expr)) {
     match s {
         Stmt::Decl(items) => items.iter_mut().for_each(|it| direct_exprs(it, f)),
-        Stmt::Assign { lhs, rhs, .. } => {
-            f(lhs);
-            f(rhs);
-        }
-        Stmt::Let { init: Some(e), .. } | Stmt::Update { e, .. } | Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Assert(e) | Stmt::Return(Some(e)) => f(e),
+        Stmt::Let { init: Some(e), .. } | Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Assert(e) | Stmt::Return(Some(e)) => f(e),
         Stmt::If { cond, .. } => f(cond),
         Stmt::Switch { value, .. } => f(value),
         Stmt::ForEach { iter, .. } => f(iter),
@@ -415,18 +411,6 @@ impl ScopeWalk<'_> {
                 self.scope.bind(name);
             }
             Stmt::Decl(items) => self.stmts(items),
-            Stmt::Assign { op, lhs, rhs } => {
-                self.expr(rhs);
-                self.store_target(lhs);
-                // A compound assignment reads what it writes.
-                if op != "=" {
-                    self.expr(lhs);
-                }
-            }
-            Stmt::Update { e, .. } => {
-                self.store_target(e);
-                self.expr(e);
-            }
             Stmt::Expr(e) | Stmt::Return(Some(e)) | Stmt::Throw(e) | Stmt::Assert(e) => self.expr(e),
             Stmt::If { cond, then, els } => {
                 self.expr(cond);

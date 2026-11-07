@@ -175,6 +175,16 @@ pub fn type_slot(map: &mut HashMap<String, u32>, name: &str) -> String {
     format!("{TYPE_SLOT_PREFIX}{slot}")
 }
 
+/// The `, ` between two list items — the streaming form of `Vec::join(", ")`. The canons of both
+/// the engine and the frontends render comma-separated lists into a shared buffer; this helper
+/// keeps the separator logic in one place instead of one twin per crate.
+pub fn comma_sep(out: &mut String, first: &mut bool) {
+    if !*first {
+        out.push_str(", ");
+    }
+    *first = false;
+}
+
 /// The line index a Type-3 unit carries until the line it was rendered for is pushed — a frontend's
 /// walk renders a line whole before pushing it, so the units still unfiled then are exactly its own.
 pub const UNFILED: u32 = u32::MAX;

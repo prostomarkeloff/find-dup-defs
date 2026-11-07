@@ -61,7 +61,7 @@ use difflib_fast::Concurrency;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::simgraph::{components, cosine};
+use crate::simgraph::components;
 
 /// AST node-type constructors that carry no structural signal: they appear 1:1 with their parent
 /// (`Name`/`Attribute`/`Subscript` each drag a context node) and only dilute the vectors. Dropped
@@ -358,7 +358,7 @@ pub(crate) fn pattern_families(
     let idf: Vec<f64> =
         df.iter().map(|&d| if d == 0 { 0.0 } else { (n as f64 / f64::from(d)).ln() + 1.0 }).collect();
 
-    let (rows, norms) = tfidf_rows(&seqs, &idf);
+    let (rows, _) = tfidf_rows(&seqs, &idf);
 
     // Exact all-pairs weighted-cosine join.
     let corpus = Corpus::from_rows(&rows);
@@ -368,11 +368,15 @@ pub(crate) fn pattern_families(
     // here (the old patternology did): for *helper extraction* an exact-skeleton family is the
     // EASIEST, highest-value collapse — the cross-name pass reporting it as a "duplicate" is a
     // separate, weaker framing. Keeping them means the helper pass sees the full DRY surface.
-    let edges: Vec<(usize, usize)> = pairs
+    let pairs: Vec<(usize, usize, f64)> = pairs
         .into_par_iter()
         .filter(|&(_, _, cos)| cos >= theta)
-        .map(|(j, i, _)| (j, i))
         .collect();
+    // The join already scored every edge; the family's min is over a subset of them — keep the
+    // cosines instead of re-running the merge-dot for every intra-family pair.
+    let cos_of: FxHashMap<(usize, usize), f64> =
+        pairs.iter().map(|&(j, i, cos)| ((j, i), cos)).collect();
+    let edges: Vec<(usize, usize)> = pairs.iter().map(|&(j, i, _)| (j, i)).collect();
 
     // Adjacency for the clique search; symmetric, only edge-endpoints get a (non-empty) set.
     let mut adj: Vec<FxHashSet<usize>> = (0..n).map(|_| FxHashSet::default()).collect();
@@ -394,17 +398,13 @@ pub(crate) fn pattern_families(
                         return None;
                     }
                     members.sort_unstable();
-                    // Min pairwise cosine over the whole family (≥ θ — every family is a clique).
+                    // Min pairwise cosine over the whole family (≥ θ — every family is a clique,
+                    // so every intra-family pair is a join edge already scored in `cos_of`).
                     let mut min_sim = 1.0f64;
                     for a in 0..members.len() {
                         for b in (a + 1)..members.len() {
-                            let c = cosine(
-                                &rows[members[a]],
-                                &rows[members[b]],
-                                norms[members[a]],
-                                norms[members[b]],
-                            );
-                            min_sim = min_sim.min(c);
+                            let (x, y) = (members[a].min(members[b]), members[a].max(members[b]));
+                            min_sim = min_sim.min(cos_of[&(x, y)]);
                         }
                     }
                     let term = fold_lgg(dialect, &members, xname_canonicals);
@@ -4509,14 +4509,6 @@ fn is_arg_node(t: &Term) -> bool {
     matches!(t, Term::Node(tag, _) if tag == "arg")
 }
 
-/// Emit `, ` between parameters, tracking whether anything has been written yet.
-fn param_sep(first: &mut bool, out: &mut String) {
-    if !*first {
-        out.push_str(", ");
-    }
-    *first = false;
-}
-
 /// Render an `arguments(posonly, args, vararg, kwonly, kw_defaults, kwarg, defaults)` node as a
 /// flat parameter list. The canon omits any `None`-valued field (`vararg`/`kwarg`) and empty
 /// trailing lists, so `arguments` is *variable-arity* — positional `.get(k)` is unsafe. Instead we
@@ -4533,7 +4525,7 @@ fn params(t: Option<&Term>, out: &mut String, b: &mut usize) {
                 match child {
                     Term::List(items) if items.iter().any(is_arg_node) => {
                         for it in items {
-                            param_sep(&mut first, out);
+                            dup_defs_core::comma_sep(out, &mut first);
                             if *b == 0 {
                                 out.push('…');
                                 return;
@@ -4546,7 +4538,7 @@ fn params(t: Option<&Term>, out: &mut String, b: &mut usize) {
                     // non-empty one marks the boundary past which a bare `arg` is the `**kwarg`.
                     Term::List(items) => seen_defaults |= !items.is_empty(),
                     Term::Node(t2, _) if t2 == "arg" => {
-                        param_sep(&mut first, out);
+                        dup_defs_core::comma_sep(out, &mut first);
                         out.push_str(if seen_defaults { "**" } else { "*" });
                         arg_one(child, out, b);
                     }

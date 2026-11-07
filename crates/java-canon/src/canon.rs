@@ -354,25 +354,6 @@ impl<'a> Dump<'a> {
                     self.list("Decls", &items)
                 }
             }
-            Stmt::Assign { op, lhs, rhs } => {
-                let left = self.expr(lhs);
-                let right = self.expr(rhs);
-                if op == "=" {
-                    self.node("Assign", &[left, right])
-                } else {
-                    self.node("Bin", &[left, quoted(op), right])
-                }
-            }
-            Stmt::Update { inc, prefix, e } => {
-                let inner = self.expr(e);
-                let tag = match (inc, prefix) {
-                    (true, false) => "Inc",
-                    (false, false) => "Dec",
-                    (true, true) => "PreInc",
-                    (false, true) => "PreDec",
-                };
-                self.node(tag, &[inner])
-            }
             Stmt::Expr(e) => {
                 let e = self.expr(e);
                 self.node("ExprStmt", &[e])
@@ -685,10 +666,6 @@ impl<'a> Dump<'a> {
             Type::Array(inner) => {
                 let inner = self.ty(inner);
                 self.node("TyArray", &[inner])
-            }
-            Type::Variadic(inner) => {
-                let inner = self.ty(inner);
-                self.node("TyVariadic", &[inner])
             }
             Type::Wild(bound) => match bound {
                 None => self.node("TyWild", &[]),
@@ -1422,7 +1399,7 @@ fn reach_type(t: &Type, imports: &HashMap<String, Arc<str>>, out: &mut Vec<Arc<s
                 reach_type(a, imports, out);
             }
         }
-        Type::Array(inner) | Type::Variadic(inner) => reach_type(inner, imports, out),
+        Type::Array(inner) => reach_type(inner, imports, out),
         Type::Wild(Some((_, ty))) => reach_type(ty, imports, out),
         Type::Union(parts) | Type::Inter(parts) => {
             for p in parts {
@@ -1463,11 +1440,6 @@ fn reach_stmts(stmts: &[Stmt], imports: &HashMap<String, Arc<str>>, out: &mut Ve
                 }
             }
             Stmt::Decl(items) => reach_stmts(items, imports, out),
-            Stmt::Assign { lhs, rhs, .. } => {
-                reach_expr(lhs, imports, out);
-                reach_expr(rhs, imports, out);
-            }
-            Stmt::Update { e, .. } => reach_expr(e, imports, out),
             Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Assert(e) => reach_expr(e, imports, out),
             Stmt::Return(Some(e)) => reach_expr(e, imports, out),
             Stmt::If { cond, then, els } => {

@@ -310,11 +310,7 @@ fn each_part<'s>(s: &'s Stmt, f: &mut dyn FnMut(Part<'s>)) {
             }
         }
         Stmt::Decl(items) => items.iter().for_each(|s| f(Part::Stmt(s))),
-        Stmt::Assign { lhs, rhs, .. } => {
-            f(Part::Expr(lhs));
-            f(Part::Expr(rhs));
-        }
-        Stmt::Update { e, .. } | Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Assert(e) | Stmt::Return(Some(e)) => f(Part::Expr(e)),
+        Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Assert(e) | Stmt::Return(Some(e)) => f(Part::Expr(e)),
         Stmt::If { cond, then, els } => {
             f(Part::Expr(cond));
             f(Part::Stmts(then));
@@ -830,9 +826,6 @@ impl Refs<'_, '_> {
     }
 
     fn stmt(&mut self, s: &Stmt) {
-        if let Stmt::Assign { lhs: Expr::Field { name, .. }, .. } = s {
-            self.loose.push(Arc::from(name.as_str()));
-        }
         each_part(s, &mut |part| match part {
             Part::Stmt(inner) => self.stmt(inner),
             Part::Stmts(list) => self.stmts(list),
