@@ -28,7 +28,7 @@ becomes the default.
 - 🎯 **Grades** each cluster by how much a refactor would actually pay off, so the biggest win is
   on top — not a flat wall of hits.
 - 🎛️ **Calibrates its own noise filters** to your tree and hands you the config to commit.
-- ⚡ **2–5× faster than PMD CPD** and **8–18× faster than jscpd** while doing strictly more
+- ⚡ **2–9× faster than PMD CPD** and **14–36× faster than jscpd** while doing strictly more
   semantic work than either.
 
 ## Install
@@ -331,84 +331,31 @@ hidden unless you ask (`--show-info`, or `--json` where it's always present).
 
 ### Speed
 
-`hyperfine --warmup 1 --runs 3`, macOS arm64, against [jscpd@4](https://github.com/kucherenko/jscpd)
-and [PMD CPD 7.24](https://pmd.github.io/), both in Python mode on the same trees:
+`hyperfine --warmup 1 --runs 3`, macOS arm64, against [jscpd](https://github.com/kucherenko/jscpd)
+4.3.0 and [PMD CPD](https://pmd.github.io/) 7.29.0, each in Python mode on the same default-branch
+trees (jscpd on its defaults, CPD with `--minimum-tokens 100`):
 
 | repo (Python files) | find-dup-defs | PMD CPD | jscpd |
 |---|---|---|---|
-| `pip` (633) | **0.18 s** | 0.87 s (4.9×) | 3.21 s (18.2×) |
-| `mypy` (155) | **0.18 s** | 0.81 s (4.6×) | 1.47 s (8.4×) |
-| `sympy` (1 589) | **1.22 s** | 4.29 s (3.5×) | 15.18 s (12.4×) |
-| `django` (2 910) | **1.01 s** | 2.08 s (2.1×) | 9.67 s (9.6×) |
+| `pip` (700) | **0.12 s** | 1.06 s (9.0×) | 4.27 s (36.5×) |
+| `mypy` (449) | **0.14 s** | 0.97 s (6.7×) | 2.64 s (18.3×) |
+| `sympy` (1 610) | **1.23 s** | 2.45 s (2.0×) | 18.17 s (14.7×) |
+| `django` (2 943) | **0.58 s** | 1.61 s (2.8×) | 10.85 s (18.7×) |
 
 It does more semantic work than either — alpha-renamed canonicals, an exact IDF cosine join,
 severity grading, calibration — and is still faster, because it's Rust + rayon over single-parse
-frontends with no JVM or Node startup to amortize. Throughput on `django` (426K SLOC) is ~422K
-SLOC/s, against PMD's ~205K and jscpd's ~44K.
+frontends with no JVM or Node startup to amortize. Throughput on `django` (532k lines of Python)
+is ~916k lines/s, against PMD's ~329k and jscpd's ~49k.
 
-<details>
-<summary><b>The 13.8× that came from not trusting the profiler</b> (v0.12.0)</summary>
+Scale the tree and the gap stops being a ratio. On `home-assistant/core` (20 429 files, 4.2M lines
+of Python): **~21 s** for find-dup-defs. PMD CPD dies with a Java `OutOfMemoryError` even with a
+10 GB heap — no small allocation. jscpd doesn't finish: at its default heap it dies of a
+JavaScript OOM at the 449 s mark, and with a 12 GB heap it passes that point only to grind at
+~2% CPU with no end in sight.
 
-The profile pointed at exact Ratcliff–Obershelp — suffix-automaton construction 28% of CPU,
-matching-stats 17%, longest-common-block 15% — which reads as the floor of an exact algorithm. It
-isn't. A profile says where time goes; it does not say that **the inputs are overwhelmingly repeats
-of each other**:
-
-| | measured on a real tree |
-|---|---|
-| files | 51 550 → **7 543 distinct** (85% duplicated) |
-| definitions in a name group | 368 962 → **47 733 distinct canonicals** (87%) |
-| converge bodies | 217 980 → **29 788 distinct** (86%) |
-| type-3 functions | 214 040 → **29 519 distinct** (86%) |
-
-Every pass paid for that redundancy, and paid quadratically. Each now works over the distinct
-inputs and expands the answer back — exactly, not approximately. On a 371k-definition tree:
-**13.8× less CPU** (365 s → 26.5 s) and **4.6× wall**, with every report byte-identical to the
-previous release.
-
-Wall time improves less than CPU because the pipeline was already ~8× parallel: removing parallel
-work leaves the serial remainder exposed.
-</details>
-
-<details>
-<summary><b>The 5× that was hiding on one thread</b> (v0.13.0)</summary>
-
-Converge took 12% of the run's CPU and 55% of its wall time. The profile *by function* said
-nothing dominates; the profile *by thread* said the main thread held 16% of all CPU, three times
-any worker. The pass was not compute-bound. It was glue — a `&str`-keyed statement index, a set
-deduplicating eight million seeds, a hash map of two million pairs, a string lookup for every
-rarity, and four hundred thousand findings built and sorted so that the cap could keep a hundred —
-and all of it on one thread.
-
-The pass now runs over bodies rather than definitions (86% of definitions repeat a body), over
-integer ids with precomputed rarities rather than strings, sorts and decides per pair rather than
-filling hash tables, anti-unifies each distinct fork once over already-lexed tokens, and builds
-only the findings that can survive the cap. On a 371k-definition tree the pass went **3.9 s →
-0.8 s**; on a mixed standard-library tree **1.25 s → 0.37 s**. Every report is byte-identical,
-the uncapped ranking included.
-
-`--kinds lenses` got two levers of its own. The Python frontend parses one file per distinct
-content and **counts** the copies for the use-site lens instead of walking them — 28 763 files
-became 4 796 parses. And 79% of the characters handed to the exact clusterer never needed a suffix
-automaton: the clusterer's own length and character-multiset bounds are applied first, and a
-string with no possible partner stays out. A lens run on that tree: **16.2 s → 7.7 s**; what
-remains is inside the exact clustering itself.
-</details>
-
-<details>
-<summary><b>GPU acceleration</b> (optional, macOS / Metal) — and why it rarely matters</summary>
-
-[`difflib-fast`](https://crates.io/crates/difflib-fast) can offload the name-gated Ratcliff–Obershelp
-clustering to the Apple-Silicon GPU via its `Rationer` handle. It's off by default and gated twice:
-build with `--features gpu`, enable with `-D 'settings:gpu=on'` (`on` / `gpu+cpu` / `gpu` / `off`).
-Only large all-ASCII same-name groups (≥ ~300 members) route to Metal; everything else stays on
-CPU, and the output is byte-for-byte identical in every mode.
-
-In practice it rarely helps end-to-end. The GPU accelerates clustering of a *single* large group
-(1.1–1.4× in `difflib-fast`'s own bench), but this tool's real workload is many mostly-small
-groups. On `rustc/tests/ui` (20 425 files, with `fn main` × 12 678): `gpu=off` 33.97 s,
-`gpu=on` 33.62 s. A tie. Keep CPU for everyday runs.
-</details>
+An optional Metal offload for the name-gated pass exists (`--features gpu`, `-D settings:gpu=on`)
+and measures a tie on this workload — it's in the [settings table](#directives-tuning-you-can-commit),
+which is where it belongs.
 
 ### Signal, on real repos
 
@@ -424,7 +371,7 @@ balanced thickness cut — **raw ERROR count drops 90% on average**:
 | angular/angular | 1.0M | 752 | 68 | 91% | `SECURITY_SCHEMA` 99 LOC |
 | prisma/prisma | 222k | 337 | 71 | 79% | `Model` 377 LOC |
 
-Class methods take part in every pass since 0.15.0, which raised both columns. 644 of vscode's 989 are
+644 of vscode's 989 are
 the Copilot extension's vendored copy of the editor's base library (`extensions/copilot/src/util/vs/`)
 — duplication by design, one `suppress` directive away.
 
